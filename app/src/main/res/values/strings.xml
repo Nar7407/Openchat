@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">AllChat</string>
+    <string name="nav_chat">Chat</string>
+    <string name="nav_summarize">Summarize</string>
+    <string name="nav_image">Image</string>
+    <string name="nav_video">Video</string>
+    <string name="nav_settings">Settings</string>
+    <string name="security_banner_title">Device-Only Key Storage</string>
+    <string name="security_banner_body">API keys are encrypted with Android Keystore and stored only on this device. Anyone with unlocked access to this device or app backup could inspect active sessions; keep device lock enabled.</string>
+</resources>

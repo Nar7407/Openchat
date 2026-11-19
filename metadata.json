@@ -1,0 +1,6 @@
+{
+  "name": "AllChat",
+  "description": "Universal BYOK multi-provider AI chat, summarization, image, and video client for Android.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
