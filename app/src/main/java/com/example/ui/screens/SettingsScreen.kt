@@ -1,9 +1,19 @@
 package com.example.ui.screens
 
+import android.appwidget.AppWidgetManager
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import com.example.widget.AllChatWidgetProvider
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -25,12 +35,15 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.outlined.CloudDownload
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material.icons.outlined.Key
 import androidx.compose.material.icons.outlined.NetworkCheck
+import androidx.compose.material.icons.outlined.UploadFile
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material3.AlertDialog
@@ -46,24 +59,35 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.launch
+import java.util.Locale
 import com.example.R
 import com.example.data.remote.ConnectionTestResult
+import com.example.domain.model.AutoRouterConfig
 import com.example.domain.model.ModelCapability
 import com.example.domain.model.ModelInfo
 import com.example.domain.model.ProviderCatalog
 import com.example.domain.model.ProviderConfig
 import com.example.domain.model.ProviderType
+import com.example.domain.model.SelectableModel
+import com.example.domain.model.WebSearchProvider
+import com.example.ui.components.ModelPickerButton
+import com.example.ui.components.ModelPricingDialog
+import com.example.ui.components.PasswordPromptDialog
 import com.example.ui.components.ProviderCatalogSheet
 import com.example.ui.components.SwissBadge
 import com.example.ui.components.SwissButton
@@ -74,6 +98,7 @@ import com.example.ui.components.SwissPanelHeader
 import com.example.ui.components.SwissRuleDivider
 import com.example.ui.components.SwissToggleCell
 import com.example.ui.components.SwissUtilityHeader
+import com.example.ui.components.VaultSecurityAndBackupPanel
 import com.example.ui.components.swissGraphPaper
 import com.example.ui.components.swissRegistrationMarks
 import com.example.ui.components.swissTextFieldColors
@@ -101,6 +126,62 @@ fun SettingsScreen(
     modifier: Modifier = Modifier
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    var showPinSetupDialog by remember { mutableStateOf(false) }
+    var showExportPwdDialog by remember { mutableStateOf(false) }
+    var pendingExportJson by remember { mutableStateOf<String?>(null) }
+    var pendingImportRawJson by remember { mutableStateOf<String?>(null) }
+
+    val createBackupLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json"),
+        onResult = { uri: Uri? ->
+            val payload = pendingExportJson
+            pendingExportJson = null
+            if (uri != null && payload != null) {
+                runCatching {
+                    context.contentResolver.openOutputStream(uri)?.use { os ->
+                        os.write(payload.toByteArray(Charsets.UTF_8))
+                    } ?: error("Unable to open output stream.")
+                }.onFailure { err ->
+                    viewModel.reportVaultError(err.message ?: "Failed to save vault file.")
+                }
+            }
+        }
+    )
+
+    val openBackupLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+        onResult = { uri: Uri? ->
+            if (uri != null) {
+                runCatching {
+                    context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+                        ?: error("Unable to read selected file.")
+                }.onSuccess { raw ->
+                    pendingImportRawJson = raw
+                }.onFailure { err ->
+                    viewModel.reportVaultError(err.message ?: "Failed to read backup file.")
+                }
+            }
+        }
+    )
+
+    val importHistoryLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+        onResult = { uri: Uri? ->
+            if (uri != null) {
+                runCatching {
+                    context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+                        ?: error("Unable to read conversations.json.")
+                }.onSuccess { raw ->
+                    viewModel.importExternalConversations(raw)
+                }.onFailure { err ->
+                    viewModel.reportVaultError(err.message ?: "Failed to read selected JSON file.")
+                }
+            }
+        }
+    )
 
     Column(
         modifier = modifier
@@ -163,6 +244,134 @@ fun SettingsScreen(
                                     style = MaterialTheme.typography.bodySmall,
                                     color = SwissMuted
                                 )
+                            }
+                        }
+                    }
+                }
+
+                // Vault Security (PIN Lock), Currency & Encrypted .allchat Backup/Restore
+                item {
+                    VaultSecurityAndBackupPanel(
+                        displayCurrency = state.displayCurrency,
+                        isPinEnabled = state.isPinEnabled,
+                        statusMessage = state.vaultStatusMessage,
+                        errorMessage = state.vaultErrorMessage,
+                        onSelectCurrency = viewModel::setDisplayCurrency,
+                        onRequestSetPin = { showPinSetupDialog = true },
+                        onDisablePin = viewModel::disablePin,
+                        onLockNow = viewModel::lockVaultNow,
+                        onRequestExportBackup = { showExportPwdDialog = true },
+                        onRequestImportBackup = {
+                            openBackupLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
+                        },
+                        onDismissNotices = viewModel::clearVaultNotices
+                    )
+                }
+
+                // Web Search Grounding (Tavily / Brave / Exa / Native Gemini)
+                item {
+                    WebSearchGroundingPanel(
+                        selectedProvider = state.searchProvider,
+                        hasApiKey = state.hasSearchApiKey,
+                        onSelectProvider = viewModel::setSearchProvider,
+                        onSaveApiKey = viewModel::saveSearchApiKey,
+                        onOpenWebsite = { url -> openProviderWebsite(context, url) }
+                    )
+                }
+
+                // Smart Auto-Router Specialist Model Assignment
+                if (state.textChatModels.isNotEmpty()) {
+                    item {
+                        AutoRouterSettingsPanel(
+                            config = state.autoRouterConfig,
+                            availableModels = state.textChatModels,
+                            onUpdateConfig = viewModel::updateAutoRouterConfig
+                        )
+                    }
+                }
+
+                // ChatGPT / Claude Conversation History Importer
+                item {
+                    SwissPanel(modifier = Modifier.fillMaxWidth()) {
+                        Column {
+                            SwissPanelHeader(
+                                leftLabel = "MIGRATE // CHATGPT & CLAUDE IMPORTER",
+                                rightLabel = "CONVERSATIONS.JSON"
+                            )
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text(
+                                    text = "Import your exported conversations.json from ChatGPT or Claude directly into AllChat's local encrypted database without sending data to any server.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = SwissMuted
+                                )
+                                SwissButton(
+                                    text = if (state.isImportingHistory) "Importing…" else "Import conversations.json",
+                                    leadingIcon = Icons.Outlined.UploadFile,
+                                    variant = SwissButtonVariant.INK,
+                                    enabled = !state.isImportingHistory,
+                                    minHeight = 42.dp,
+                                    onClick = {
+                                        importHistoryLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
+                                    },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("import_external_history_button")
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Native Android Home Screen Widget & App Shortcuts Launcher
+                item {
+                    var widgetPinStatus by remember { mutableStateOf<String?>(null) }
+                    SwissPanel(modifier = Modifier.fillMaxWidth()) {
+                        Column {
+                            SwissPanelHeader(
+                                leftLabel = "ANDROID // HOME WIDGET & SHORTCUTS",
+                                rightLabel = "QUICK LAUNCH"
+                            )
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text(
+                                    text = "Pin the AllChat Quick Ask & Camera Search widget to your Android Home Screen, or long-press the AllChat launcher icon for instant New Chat, Voice Prompt, Summarize Clipboard, and Image Studio shortcuts.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = SwissMuted
+                                )
+                                SwissButton(
+                                    text = "Pin Quick Ask Widget to Home Screen",
+                                    variant = SwissButtonVariant.PRIMARY,
+                                    minHeight = 42.dp,
+                                    onClick = {
+                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                            val appWidgetManager = AppWidgetManager.getInstance(context)
+                                            val provider = ComponentName(context, AllChatWidgetProvider::class.java)
+                                            if (appWidgetManager.isRequestPinAppWidgetSupported) {
+                                                appWidgetManager.requestPinAppWidget(provider, null, null)
+                                                widgetPinStatus = "WIDGET // Pin prompt sent to Android Launcher."
+                                            } else {
+                                                widgetPinStatus = "INFO // Long-press your Home Screen -> Widgets -> AllChat Quick Ask."
+                                            }
+                                        } else {
+                                            widgetPinStatus = "INFO // Long-press your Home Screen -> Widgets -> AllChat Quick Ask."
+                                        }
+                                    },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("pin_home_widget_button")
+                                )
+                                widgetPinStatus?.let { notice ->
+                                    Text(
+                                        text = notice,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = SwissSignalRed
+                                    )
+                                }
                             }
                         }
                     }
@@ -280,6 +489,7 @@ fun SettingsScreen(
                             onFetchModels = { viewModel.fetchModels(provider) },
                             onAddManualModel = { modelId -> viewModel.addManualModel(provider.id, modelId) },
                             onToggleCapability = viewModel::toggleCapability,
+                            onEditPricing = viewModel::openModelPricing,
                             onDeleteModel = viewModel::deleteModel
                         )
                     }
@@ -307,6 +517,66 @@ fun SettingsScreen(
             onUpdateFields = viewModel::updateEditorFields,
             onDismiss = viewModel::dismissEditor,
             onSave = viewModel::saveEditorProvider
+        )
+    }
+
+    if (showPinSetupDialog) {
+        PasswordPromptDialog(
+            eyebrow = "SEC // VAULT LOCK",
+            title = if (state.isPinEnabled) "Update Vault PIN" else "Enable Vault PIN Lock",
+            description = "Set a 4+ character PIN or master passphrase. All API keys will be encrypted with PBKDF2-HMAC-SHA256 + AES-256-GCM and decrypted only in memory after unlocking.",
+            confirmLabel = "Enable Lock",
+            requireConfirmation = true,
+            onDismiss = { showPinSetupDialog = false },
+            onConfirm = { pin ->
+                showPinSetupDialog = false
+                viewModel.enableOrUpdatePin(pin)
+            }
+        )
+    }
+
+    if (showExportPwdDialog) {
+        PasswordPromptDialog(
+            eyebrow = "BACKUP // ENCRYPT .ALLCHAT",
+            title = "Encrypt Vault Backup",
+            description = "Choose a backup password (min 4 chars) to encrypt all providers, API keys, models, pricing, personas, and chat branches into a portable .allchat JSON file.",
+            confirmLabel = "Export File",
+            requireConfirmation = true,
+            onDismiss = { showExportPwdDialog = false },
+            onConfirm = { password ->
+                showExportPwdDialog = false
+                scope.launch {
+                    viewModel.exportEncryptedVault(password).onSuccess { encryptedJson ->
+                        pendingExportJson = encryptedJson
+                        createBackupLauncher.launch("allchat_vault_${System.currentTimeMillis()}.allchat.json")
+                    }
+                }
+            }
+        )
+    }
+
+    pendingImportRawJson?.let { rawJson ->
+        PasswordPromptDialog(
+            eyebrow = "RESTORE // DECRYPT .ALLCHAT",
+            title = "Decrypt & Restore Vault",
+            description = "Enter the backup password used to encrypt this .allchat vault archive. Restoring replaces local providers, personas, and chats.",
+            confirmLabel = "Restore Now",
+            requireConfirmation = false,
+            onDismiss = { pendingImportRawJson = null },
+            onConfirm = { password ->
+                pendingImportRawJson = null
+                viewModel.importEncryptedVault(rawJson, password)
+            }
+        )
+    }
+
+    state.pricingTargetModel?.let { targetModel ->
+        ModelPricingDialog(
+            model = targetModel,
+            onDismiss = viewModel::dismissModelPricing,
+            onSave = { inputPrice, outputPrice ->
+                viewModel.saveModelPricing(targetModel.id, inputPrice, outputPrice)
+            }
         )
     }
 
@@ -387,6 +657,7 @@ private fun ProviderPanel(
     onFetchModels: () -> Unit,
     onAddManualModel: (String) -> Unit,
     onToggleCapability: (ModelInfo, ModelCapability) -> Unit,
+    onEditPricing: (ModelInfo) -> Unit,
     onDeleteModel: (Long) -> Unit
 ) {
     var manualModelInput by remember { mutableStateOf("") }
@@ -448,7 +719,12 @@ private fun ProviderPanel(
                 modifier = Modifier.padding(12.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                val context = LocalContext.current
+                val apiKeyUrl = remember(provider.name, provider.baseUrl) {
+                    ProviderCatalog.resolveWebsiteUrl(provider.name, provider.baseUrl)
+                }
+
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text(
                         text = provider.name,
                         style = MaterialTheme.typography.titleLarge,
@@ -456,6 +732,13 @@ private fun ProviderPanel(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
+                    if (apiKeyUrl != null) {
+                        GetApiKeyLinkRow(
+                            url = apiKeyUrl,
+                            onClick = { openProviderWebsite(context, apiKeyUrl) },
+                            modifier = Modifier.testTag("provider_get_api_key_${provider.id}")
+                        )
+                    }
                     Text(
                         text = provider.effectiveBaseUrl,
                         style = MaterialTheme.typography.labelSmall,
@@ -616,13 +899,35 @@ private fun ProviderPanel(
                                                 )
                                             }
                                         }
-                                        SwissIconCell(
-                                            icon = Icons.Outlined.DeleteOutline,
-                                            contentDescription = "Remove model",
-                                            onClick = { onDeleteModel(model.id) },
-                                            bordered = false,
-                                            cellSize = 32.dp
-                                        )
+                                        Row(
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            val priceLabel = if (model.hasPricing) {
+                                                String.format(
+                                                    Locale.US,
+                                                    "$%.2f/$%.2f",
+                                                    model.inputPricePerMillion,
+                                                    model.outputPricePerMillion
+                                                )
+                                            } else {
+                                                "$ / 1M"
+                                            }
+                                            SwissToggleCell(
+                                                label = priceLabel,
+                                                selected = model.hasPricing,
+                                                useSignalRedWhenSelected = false,
+                                                onClick = { onEditPricing(model) },
+                                                modifier = Modifier.testTag("model_pricing_${model.id}")
+                                            )
+                                            SwissIconCell(
+                                                icon = Icons.Outlined.DeleteOutline,
+                                                contentDescription = "Remove model",
+                                                onClick = { onDeleteModel(model.id) },
+                                                bordered = false,
+                                                cellSize = 32.dp
+                                            )
+                                        }
                                     }
 
                                     FlowRow(
@@ -742,6 +1047,11 @@ private fun ProviderEditorDialog(
                     }
                 }
 
+                val context = LocalContext.current
+                val apiKeyUrl = remember(editor.name, editor.baseUrl) {
+                    ProviderCatalog.resolveWebsiteUrl(editor.name, editor.baseUrl)
+                }
+
                 OutlinedTextField(
                     value = editor.name,
                     onValueChange = { onUpdateFields(it, null, null, null, null) },
@@ -753,6 +1063,17 @@ private fun ProviderEditorDialog(
                         .fillMaxWidth()
                         .testTag("editor_provider_name")
                 )
+
+                if (apiKeyUrl != null) {
+                    GetApiKeyLinkRow(
+                        url = apiKeyUrl,
+                        onClick = { openProviderWebsite(context, apiKeyUrl) },
+                        showHostHint = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("editor_get_api_key_link")
+                    )
+                }
 
                 Text(
                     text = "PROTOCOL // TYPE",
@@ -804,10 +1125,17 @@ private fun ProviderEditorDialog(
                     label = {
                         Text(
                             if (editor.requiresApiKey) {
-                                "API Key (Stored on device only)"
+                                "API Key(s) — Comma-separated for 429 rotation"
                             } else {
                                 "API Key (Optional for local server)"
                             }
+                        )
+                    },
+                    supportingText = {
+                        Text(
+                            "Add multiple comma-separated keys (key1, key2) to auto-rotate on HTTP 429 rate limits.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SwissMuted
                         )
                     },
                     singleLine = true,
@@ -849,3 +1177,246 @@ private fun ProviderEditorDialog(
         }
     )
 }
+
+@Composable
+private fun GetApiKeyLinkRow(
+    url: String,
+    onClick: () -> Unit,
+    showHostHint: Boolean = false,
+    modifier: Modifier = Modifier
+) {
+    val hostLabel = remember(url) {
+        runCatching { Uri.parse(url).host?.removePrefix("www.") }.getOrNull().orEmpty()
+    }
+    Row(
+        modifier = modifier
+            .background(SwissSignalRedTint, RectangleShape)
+            .border(1.dp, SwissSignalRed, RectangleShape)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 7.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            imageVector = Icons.Outlined.Key,
+            contentDescription = null,
+            tint = SwissSignalRed,
+            modifier = Modifier.size(15.dp)
+        )
+        Text(
+            text = "Get an API key",
+            style = MaterialTheme.typography.labelLarge.copy(textDecoration = TextDecoration.Underline),
+            color = SwissSignalRed
+        )
+        if (showHostHint && hostLabel.isNotBlank()) {
+            Text(
+                text = "// $hostLabel",
+                style = MaterialTheme.typography.labelSmall,
+                color = SwissMuted,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
+        }
+        Icon(
+            imageVector = Icons.AutoMirrored.Outlined.OpenInNew,
+            contentDescription = "Open provider website",
+            tint = SwissSignalRed,
+            modifier = Modifier.size(14.dp)
+        )
+    }
+}
+
+@Composable
+private fun WebSearchGroundingPanel(
+    selectedProvider: WebSearchProvider,
+    hasApiKey: Boolean,
+    onSelectProvider: (WebSearchProvider) -> Unit,
+    onSaveApiKey: (String) -> Unit,
+    onOpenWebsite: (String) -> Unit
+) {
+    var apiKeyDraft by remember { mutableStateOf("") }
+    var showKey by remember { mutableStateOf(false) }
+
+    SwissPanel(modifier = Modifier.fillMaxWidth()) {
+        Column {
+            SwissPanelHeader(
+                leftLabel = "GROUNDING // BYOK WEB SEARCH",
+                rightLabel = if (selectedProvider == WebSearchProvider.GEMINI_NATIVE) "NATIVE" else if (hasApiKey) "KEY SAVED" else "NO KEY",
+                rightAccent = selectedProvider != WebSearchProvider.GEMINI_NATIVE && !hasApiKey
+            )
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "Toggle the WEB icon in Chat to inject top 5 live search snippets with clickable [1] [2] citation pills.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = SwissMuted
+                )
+
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    WebSearchProvider.entries.forEach { provider ->
+                        SwissToggleCell(
+                            label = provider.label,
+                            selected = selectedProvider == provider,
+                            useSignalRedWhenSelected = true,
+                            onClick = { onSelectProvider(provider) },
+                            modifier = Modifier.testTag("search_provider_${provider.name.lowercase()}")
+                        )
+                    }
+                }
+
+                if (selectedProvider != WebSearchProvider.GEMINI_NATIVE) {
+                    val websiteUrl = when (selectedProvider) {
+                        WebSearchProvider.TAVILY -> "https://app.tavily.com/home"
+                        WebSearchProvider.BRAVE -> "https://api.search.brave.com/app/keys"
+                        WebSearchProvider.EXA -> "https://dashboard.exa.ai/api-keys"
+                        WebSearchProvider.GEMINI_NATIVE -> ""
+                    }
+                    if (websiteUrl.isNotBlank()) {
+                        GetApiKeyLinkRow(
+                            url = websiteUrl,
+                            onClick = { onOpenWebsite(websiteUrl) },
+                            showHostHint = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedTextField(
+                            value = apiKeyDraft,
+                            onValueChange = { apiKeyDraft = it },
+                            label = {
+                                Text(
+                                    if (hasApiKey) "${selectedProvider.label} Key (Saved — enter new to replace)"
+                                    else "${selectedProvider.label} API Key"
+                                )
+                            },
+                            singleLine = true,
+                            shape = RectangleShape,
+                            colors = swissTextFieldColors(),
+                            visualTransformation = if (showKey) VisualTransformation.None else PasswordVisualTransformation(),
+                            trailingIcon = {
+                                IconButton(onClick = { showKey = !showKey }) {
+                                    Icon(
+                                        if (showKey) Icons.Outlined.VisibilityOff else Icons.Outlined.Visibility,
+                                        contentDescription = "Toggle visibility",
+                                        tint = SwissInk
+                                    )
+                                }
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("search_api_key_input")
+                        )
+                        SwissButton(
+                            text = "Save",
+                            variant = SwissButtonVariant.PRIMARY,
+                            minHeight = 52.dp,
+                            onClick = {
+                                onSaveApiKey(apiKeyDraft)
+                                apiKeyDraft = ""
+                            },
+                            modifier = Modifier.testTag("save_search_api_key_button")
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AutoRouterSettingsPanel(
+    config: AutoRouterConfig,
+    availableModels: List<SelectableModel>,
+    onUpdateConfig: (AutoRouterConfig) -> Unit
+) {
+    fun resolve(id: Long?) = id?.let { target -> availableModels.firstOrNull { it.model.id == target } }
+
+    SwissPanel(modifier = Modifier.fillMaxWidth()) {
+        Column {
+            SwissPanelHeader(
+                leftLabel = "ROUTER // SMART AUTO-ROUTING",
+                rightLabel = "AUTO MODE"
+            )
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = "Assign specialist models for each task type, then select AUTO in Chat's model picker to route prompts automatically.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = SwissMuted
+                )
+
+                AutoRouteSlotRow(
+                    label = "FAST CHAT",
+                    selected = resolve(config.fastChatModelId),
+                    models = availableModels,
+                    onSelect = { onUpdateConfig(config.copy(fastChatModelId = it.model.id)) }
+                )
+                AutoRouteSlotRow(
+                    label = "HEAVY CODING",
+                    selected = resolve(config.heavyCodingModelId),
+                    models = availableModels,
+                    onSelect = { onUpdateConfig(config.copy(heavyCodingModelId = it.model.id)) }
+                )
+                AutoRouteSlotRow(
+                    label = "VISION (IMAGES)",
+                    selected = resolve(config.visionModelId),
+                    models = availableModels,
+                    onSelect = { onUpdateConfig(config.copy(visionModelId = it.model.id)) }
+                )
+                AutoRouteSlotRow(
+                    label = "LONG CONTEXT (>10K TOK)",
+                    selected = resolve(config.longContextModelId),
+                    models = availableModels,
+                    onSelect = { onUpdateConfig(config.copy(longContextModelId = it.model.id)) }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AutoRouteSlotRow(
+    label: String,
+    selected: SelectableModel?,
+    models: List<SelectableModel>,
+    onSelect: (SelectableModel) -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(
+            text = "SPECIALIST // $label",
+            style = MaterialTheme.typography.labelSmall,
+            color = SwissInk
+        )
+        ModelPickerButton(
+            selectedModel = selected,
+            availableModels = models,
+            requiredCapability = ModelCapability.TEXT_CHAT,
+            onSelectModel = onSelect,
+            onOpenSettings = {},
+            modifier = Modifier.fillMaxWidth()
+        )
+    }
+}
+
+private fun openProviderWebsite(context: Context, url: String) {
+    runCatching {
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+    }
+}
+

@@ -14,9 +14,16 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
+enum class ImageStudioMode(val label: String) {
+    GENERATE("Text to Image"),
+    INPAINT("Inpaint & Edit")
+}
+
 data class ImageUiState(
     val availableModels: List<SelectableModel> = emptyList(),
     val selectedModel: SelectableModel? = null,
+    val studioMode: ImageStudioMode = ImageStudioMode.GENERATE,
+    val editSourceUri: String? = null,
     val prompt: String = "",
     val aspectRatio: String = "1:1",
     val isGenerating: Boolean = false,
@@ -33,6 +40,8 @@ class ImageViewModel(
 ) : ViewModel() {
 
     private val selectedModelId = MutableStateFlow<Long?>(null)
+    private val studioMode = MutableStateFlow(ImageStudioMode.GENERATE)
+    private val editSourceUri = MutableStateFlow<String?>(null)
     private val prompt = MutableStateFlow("")
     private val aspectRatio = MutableStateFlow("1:1")
     private val isGenerating = MutableStateFlow(false)
@@ -59,6 +68,10 @@ class ImageViewModel(
             isGenerating = generating,
             images = images
         )
+    }.combine(studioMode) { state, mode ->
+        state.copy(studioMode = mode)
+    }.combine(editSourceUri) { state, uri ->
+        state.copy(editSourceUri = uri)
     }.combine(previewItem) { state, preview ->
         state.copy(previewItem = preview)
     }.combine(errorState) { state, err ->
@@ -74,6 +87,15 @@ class ImageViewModel(
         started = SharingStarted.WhileSubscribed(5000),
         initialValue = ImageUiState()
     )
+
+    fun setStudioMode(mode: ImageStudioMode) {
+        studioMode.value = mode
+        errorState.value = Triple(null, false, null)
+    }
+
+    fun setEditSourceUri(uriString: String?) {
+        editSourceUri.value = uriString
+    }
 
     fun updatePrompt(value: String) {
         prompt.value = value
@@ -126,6 +148,47 @@ class ImageViewModel(
                 val aiEx = t as? AiException
                 errorState.value = Triple(
                     t.message ?: "Image generation failed.",
+                    aiEx?.suggestProxySetting == true,
+                    model.provider.id
+                )
+            } finally {
+                isGenerating.value = false
+            }
+        }
+    }
+
+    fun editImageWithMask(
+        sourcePngBytes: ByteArray,
+        openAiTransparentMaskPng: ByteArray?,
+        geminiRedOverlayMaskPng: ByteArray?
+    ) {
+        val model = uiState.value.selectedModel
+        if (model == null) {
+            errorState.value = Triple("Configure an Image Generation / Editing model in Settings first.", false, null)
+            return
+        }
+        val cleanPrompt = prompt.value.trim()
+        if (cleanPrompt.isEmpty()) {
+            errorState.value = Triple("Describe what you want to change inside the masked area.", false, null)
+            return
+        }
+        viewModelScope.launch {
+            isGenerating.value = true
+            errorState.value = Triple(null, false, null)
+            try {
+                repository.editImageWithMask(
+                    prompt = cleanPrompt,
+                    sourcePngBytes = sourcePngBytes,
+                    openAiMaskPngBytes = openAiTransparentMaskPng,
+                    geminiOverlayMaskPngBytes = geminiRedOverlayMaskPng,
+                    selectableModel = model
+                )
+                prompt.value = ""
+                statusMessage.value = "INPAINT // Edited image plate saved."
+            } catch (t: Throwable) {
+                val aiEx = t as? AiException
+                errorState.value = Triple(
+                    t.message ?: "Image edit failed.",
                     aiEx?.suggestProxySetting == true,
                     model.provider.id
                 )

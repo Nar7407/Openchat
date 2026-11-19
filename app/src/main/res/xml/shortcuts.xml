@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:enabled="true"
+        android:icon="@drawable/ic_shortcut_chat"
+        android:shortcutId="shortcut_new_chat"
+        android:shortcutLongLabel="@string/shortcut_new_chat_long"
+        android:shortcutShortLabel="@string/shortcut_new_chat_short">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetClass="com.example.MainActivity"
+            android:targetPackage="com.aistudio.allchat.kxmpzq">
+            <extra
+                android:name="allchat_action"
+                android:value="new" />
+        </intent>
+    </shortcut>
+
+    <shortcut
+        android:enabled="true"
+        android:icon="@drawable/ic_shortcut_voice"
+        android:shortcutId="shortcut_voice"
+        android:shortcutLongLabel="@string/shortcut_voice_long"
+        android:shortcutShortLabel="@string/shortcut_voice_short">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetClass="com.example.MainActivity"
+            android:targetPackage="com.aistudio.allchat.kxmpzq">
+            <extra
+                android:name="allchat_action"
+                android:value="voice" />
+        </intent>
+    </shortcut>
+
+    <shortcut
+        android:enabled="true"
+        android:icon="@drawable/ic_shortcut_clipboard"
+        android:shortcutId="shortcut_clipboard"
+        android:shortcutLongLabel="@string/shortcut_clipboard_long"
+        android:shortcutShortLabel="@string/shortcut_clipboard_short">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetClass="com.example.MainActivity"
+            android:targetPackage="com.aistudio.allchat.kxmpzq">
+            <extra
+                android:name="allchat_action"
+                android:value="clipboard" />
+        </intent>
+    </shortcut>
+
+    <shortcut
+        android:enabled="true"
+        android:icon="@drawable/ic_shortcut_image"
+        android:shortcutId="shortcut_image"
+        android:shortcutLongLabel="@string/shortcut_image_long"
+        android:shortcutShortLabel="@string/shortcut_image_short">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetClass="com.example.MainActivity"
+            android:targetPackage="com.aistudio.allchat.kxmpzq">
+            <extra
+                android:name="allchat_action"
+                android:value="image" />
+        </intent>
+    </shortcut>
+</shortcuts>

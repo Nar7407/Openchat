@@ -1,5 +1,9 @@
 package com.example.ui.screens
 
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -20,14 +24,18 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.outlined.BrokenImage
+import androidx.compose.material.icons.outlined.Brush
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.Share
+import androidx.compose.material.icons.outlined.UploadFile
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
@@ -41,8 +49,10 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.RectangleShape
@@ -58,6 +68,9 @@ import coil.compose.AsyncImage
 import com.example.data.local.GeneratedMediaEntity
 import com.example.domain.model.ModelCapability
 import com.example.ui.components.ErrorBanner
+import com.example.ui.components.InpaintingMaskCanvas
+import com.example.ui.components.InpaintingMaskRenderer
+import com.example.ui.components.MaskStroke
 import com.example.ui.components.ModelPickerButton
 import com.example.ui.components.SwissButton
 import com.example.ui.components.SwissButtonVariant
@@ -76,6 +89,7 @@ import com.example.ui.theme.SwissMuted
 import com.example.ui.theme.SwissPaper
 import com.example.ui.theme.SwissSignalRed
 import com.example.ui.theme.SwissSubtleFill
+import com.example.ui.viewmodel.ImageStudioMode
 import com.example.ui.viewmodel.ImageViewModel
 import com.example.util.MediaStoreSaver
 import kotlinx.coroutines.launch
@@ -92,6 +106,16 @@ fun ImageScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
+    var maskStrokes by remember { mutableStateOf<List<MaskStroke>>(emptyList()) }
+
+    val editPhotoPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) {
+            maskStrokes = emptyList()
+            viewModel.setEditSourceUri(uri.toString())
+        }
+    }
 
     LaunchedEffect(state.statusMessage) {
         state.statusMessage?.let { msg ->
@@ -154,21 +178,87 @@ fun ImageScreen(
                         modifier = Modifier.fillMaxWidth()
                     )
 
-                    // Prompt + Ratio + Generate Bento Module
+                    // Mode Switcher: Text-to-Image vs Inpaint & Edit
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        ImageStudioMode.entries.forEach { mode ->
+                            SwissToggleCell(
+                                label = mode.label,
+                                selected = state.studioMode == mode,
+                                onClick = { viewModel.setStudioMode(mode) },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("image_mode_${mode.name.lowercase()}")
+                            )
+                        }
+                    }
+
+                    // Prompt + Ratio / Inpaint Canvas Bento Module
                     SwissPanel(modifier = Modifier.fillMaxWidth()) {
-                        Column {
+                        Column(
+                            modifier = if (state.studioMode == ImageStudioMode.INPAINT) {
+                                Modifier.verticalScroll(rememberScrollState())
+                            } else {
+                                Modifier
+                            }
+                        ) {
                             SwissPanelHeader(
-                                leftLabel = "01 // GENERATION PROMPT",
-                                rightLabel = "RATIO ${state.aspectRatio}"
+                                leftLabel = if (state.studioMode == ImageStudioMode.INPAINT) "01 // INPAINTING & MASK BRUSH" else "01 // GENERATION PROMPT",
+                                rightLabel = if (state.studioMode == ImageStudioMode.INPAINT) "${maskStrokes.size} STROKES" else "RATIO ${state.aspectRatio}"
                             )
                             Column(
                                 modifier = Modifier.padding(10.dp),
                                 verticalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
+                                if (state.studioMode == ImageStudioMode.INPAINT) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = "Paint over an area to edit via OpenAI /images/edits or Gemini Image Edit.",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = SwissMuted,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        SwissButton(
+                                            text = if (state.editSourceUri != null) "Change Photo" else "Pick Photo",
+                                            leadingIcon = Icons.Outlined.UploadFile,
+                                            variant = SwissButtonVariant.INK,
+                                            minHeight = 38.dp,
+                                            onClick = {
+                                                editPhotoPicker.launch(
+                                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                                )
+                                            },
+                                            modifier = Modifier.testTag("inpaint_pick_photo")
+                                        )
+                                    }
+
+                                    state.editSourceUri?.let { uriStr ->
+                                        InpaintingMaskCanvas(
+                                            imageUri = Uri.parse(uriStr),
+                                            strokes = maskStrokes,
+                                            onStrokesChanged = { maskStrokes = it }
+                                        )
+                                    }
+                                }
+
                                 OutlinedTextField(
                                     value = state.prompt,
                                     onValueChange = viewModel::updatePrompt,
-                                    placeholder = { Text("Describe the image plate to synthesize…") },
+                                    placeholder = {
+                                        Text(
+                                            if (state.studioMode == ImageStudioMode.INPAINT) {
+                                                "Describe what to replace or add in the red masked region…"
+                                            } else {
+                                                "Describe the image plate to synthesize…"
+                                            }
+                                        )
+                                    },
                                     minLines = 2,
                                     maxLines = 4,
                                     shape = RectangleShape,
@@ -183,25 +273,60 @@ fun ImageScreen(
                                     horizontalArrangement = Arrangement.SpaceBetween,
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                        listOf("1:1", "16:9", "9:16").forEach { ratio ->
-                                            SwissToggleCell(
-                                                label = ratio,
-                                                selected = state.aspectRatio == ratio,
-                                                onClick = { viewModel.setAspectRatio(ratio) }
-                                            )
+                                    if (state.studioMode == ImageStudioMode.GENERATE) {
+                                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                            listOf("1:1", "16:9", "9:16").forEach { ratio ->
+                                                SwissToggleCell(
+                                                    label = ratio,
+                                                    selected = state.aspectRatio == ratio,
+                                                    onClick = { viewModel.setAspectRatio(ratio) }
+                                                )
+                                            }
                                         }
+                                        SwissButton(
+                                            text = if (state.isGenerating) "Rendering…" else "Generate",
+                                            leadingIcon = if (state.isGenerating) null else Icons.Outlined.Image,
+                                            variant = SwissButtonVariant.PRIMARY,
+                                            enabled = !state.isGenerating && state.prompt.isNotBlank() && state.selectedModel != null,
+                                            minHeight = 42.dp,
+                                            onClick = viewModel::generateImage,
+                                            modifier = Modifier.testTag("generate_image_button")
+                                        )
+                                    } else {
+                                        Text(
+                                            text = if (state.editSourceUri == null) "Select a source photo first" else "Ready to inpaint",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = SwissMuted
+                                        )
+                                        SwissButton(
+                                            text = if (state.isGenerating) "Inpainting…" else "Apply Edit",
+                                            leadingIcon = if (state.isGenerating) null else Icons.Outlined.Brush,
+                                            variant = SwissButtonVariant.PRIMARY,
+                                            enabled = !state.isGenerating && state.prompt.isNotBlank() && state.editSourceUri != null && state.selectedModel != null,
+                                            minHeight = 42.dp,
+                                            onClick = {
+                                                val uriStr = state.editSourceUri ?: return@SwissButton
+                                                scope.launch {
+                                                    runCatching {
+                                                        InpaintingMaskRenderer.renderPayloads(
+                                                            context = context,
+                                                            sourceUri = Uri.parse(uriStr),
+                                                            strokes = maskStrokes
+                                                        )
+                                                    }.onSuccess { payloads ->
+                                                        viewModel.editImageWithMask(
+                                                            sourcePngBytes = payloads.sourcePngBytes,
+                                                            openAiTransparentMaskPng = payloads.openAiTransparentMaskPng,
+                                                            geminiRedOverlayMaskPng = payloads.geminiRedOverlayMaskPng
+                                                        )
+                                                    }.onFailure { err ->
+                                                        viewModel.setStatusMessage(err.message ?: "Mask encoding failed")
+                                                    }
+                                                }
+                                            },
+                                            modifier = Modifier.testTag("apply_inpaint_button")
+                                        )
                                     }
-
-                                    SwissButton(
-                                        text = if (state.isGenerating) "Rendering…" else "Generate",
-                                        leadingIcon = if (state.isGenerating) null else Icons.Outlined.Image,
-                                        variant = SwissButtonVariant.PRIMARY,
-                                        enabled = !state.isGenerating && state.prompt.isNotBlank() && state.selectedModel != null,
-                                        minHeight = 42.dp,
-                                        onClick = viewModel::generateImage,
-                                        modifier = Modifier.testTag("generate_image_button")
-                                    )
                                 }
                             }
 

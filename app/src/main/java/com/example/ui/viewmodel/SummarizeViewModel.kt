@@ -6,8 +6,10 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.repository.AllChatRepository
 import com.example.data.repository.SummaryProgress
 import com.example.domain.model.AiException
+import com.example.domain.model.MindMapNode
 import com.example.domain.model.ModelCapability
 import com.example.domain.model.SelectableModel
+import com.example.domain.model.StudyPack
 import com.example.domain.model.SummaryLength
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -36,7 +38,11 @@ data class SummarizeUiState(
     val progress: SummaryProgress = SummaryProgress(),
     val errorMessage: String? = null,
     val suggestProxySetting: Boolean = false,
-    val errorProviderId: Long? = null
+    val errorProviderId: Long? = null,
+    val isGeneratingStudy: Boolean = false,
+    val isGeneratingMindMap: Boolean = false,
+    val activeStudyPack: StudyPack? = null,
+    val activeMindMap: MindMapNode? = null
 )
 
 class SummarizeViewModel(
@@ -53,6 +59,10 @@ class SummarizeViewModel(
     private val isSummarizing = MutableStateFlow(false)
     private val progress = MutableStateFlow(SummaryProgress())
     private val errorState = MutableStateFlow<Triple<String?, Boolean, Long?>>(Triple(null, false, null))
+    private val isGeneratingStudy = MutableStateFlow(false)
+    private val isGeneratingMindMap = MutableStateFlow(false)
+    private val activeStudyPack = MutableStateFlow<StudyPack?>(null)
+    private val activeMindMap = MutableStateFlow<MindMapNode?>(null)
 
     private var summarizeJob: Job? = null
 
@@ -89,6 +99,14 @@ class SummarizeViewModel(
             suggestProxySetting = err.second,
             errorProviderId = err.third
         )
+    }.combine(isGeneratingStudy) { state, gen ->
+        state.copy(isGeneratingStudy = gen)
+    }.combine(isGeneratingMindMap) { state, gen ->
+        state.copy(isGeneratingMindMap = gen)
+    }.combine(activeStudyPack) { state, pack ->
+        state.copy(activeStudyPack = pack)
+    }.combine(activeMindMap) { state, map ->
+        state.copy(activeMindMap = map)
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5000),
@@ -215,5 +233,41 @@ class SummarizeViewModel(
         summarizeJob?.cancel()
         summarizeJob = null
         isSummarizing.value = false
+    }
+
+    fun dismissStudyPack() {
+        activeStudyPack.value = null
+    }
+
+    fun dismissMindMap() {
+        activeMindMap.value = null
+    }
+
+    fun generateStudyPack() {
+        val model = uiState.value.selectedModel ?: return
+        val source = uiState.value.progress.partialOutput.ifBlank { rawTextInput.value }.trim()
+        if (source.isEmpty()) return
+        viewModelScope.launch {
+            isGeneratingStudy.value = true
+            errorState.value = Triple(null, false, null)
+            runCatching { repository.generateStudyPack(source, model) }
+                .onSuccess { activeStudyPack.value = it }
+                .onFailure { err -> errorState.value = Triple(err.message ?: "Failed to build study pack.", false, model.provider.id) }
+            isGeneratingStudy.value = false
+        }
+    }
+
+    fun generateMindMap() {
+        val model = uiState.value.selectedModel ?: return
+        val source = uiState.value.progress.partialOutput.ifBlank { rawTextInput.value }.trim()
+        if (source.isEmpty()) return
+        viewModelScope.launch {
+            isGeneratingMindMap.value = true
+            errorState.value = Triple(null, false, null)
+            runCatching { repository.generateMindMap(source, model) }
+                .onSuccess { activeMindMap.value = it }
+                .onFailure { err -> errorState.value = Triple(err.message ?: "Failed to build mind map.", false, model.provider.id) }
+            isGeneratingMindMap.value = false
+        }
     }
 }

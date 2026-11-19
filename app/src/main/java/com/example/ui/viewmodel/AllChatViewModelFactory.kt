@@ -15,6 +15,9 @@ class AllChatViewModelFactory(
             modelClass.isAssignableFrom(SummarizeViewModel::class.java) -> SummarizeViewModel(repository) as T
             modelClass.isAssignableFrom(ImageViewModel::class.java) -> ImageViewModel(repository) as T
             modelClass.isAssignableFrom(VideoViewModel::class.java) -> VideoViewModel(repository) as T
+            modelClass.isAssignableFrom(ArenaViewModel::class.java) -> ArenaViewModel(repository) as T
+            modelClass.isAssignableFrom(KnowledgeViewModel::class.java) -> KnowledgeViewModel(repository) as T
+            modelClass.isAssignableFrom(PipelineViewModel::class.java) -> PipelineViewModel(repository) as T
             else -> throw IllegalArgumentException("Unknown ViewModel class: ${modelClass.name}")
         }
     }

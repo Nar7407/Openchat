@@ -7,4 +7,13 @@
     <string name="nav_settings">Settings</string>
     <string name="security_banner_title">Device-Only Key Storage</string>
     <string name="security_banner_body">API keys are encrypted with Android Keystore and stored only on this device. Anyone with unlocked access to this device or app backup could inspect active sessions; keep device lock enabled.</string>
+    <string name="widget_description">AllChat Swiss Quick Ask bar for instant chat, voice prompt, camera vision, and image generation.</string>
+    <string name="shortcut_new_chat_short">New Chat</string>
+    <string name="shortcut_new_chat_long">Start a New Chat</string>
+    <string name="shortcut_voice_short">Voice Prompt</string>
+    <string name="shortcut_voice_long">Dictate Voice Prompt</string>
+    <string name="shortcut_clipboard_short">Summarize Clip</string>
+    <string name="shortcut_clipboard_long">Summarize Clipboard Text</string>
+    <string name="shortcut_image_short">Generate Image</string>
+    <string name="shortcut_image_long">Open Image Studio</string>
 </resources>

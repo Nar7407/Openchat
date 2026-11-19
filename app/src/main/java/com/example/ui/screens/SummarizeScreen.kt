@@ -47,7 +47,9 @@ import com.example.domain.model.ModelCapability
 import com.example.domain.model.SummaryLength
 import com.example.ui.components.ErrorBanner
 import com.example.ui.components.MarkdownText
+import com.example.ui.components.MindMapDialog
 import com.example.ui.components.ModelPickerButton
+import com.example.ui.components.StudyQuizDialog
 import com.example.ui.components.SwissButton
 import com.example.ui.components.SwissButtonVariant
 import com.example.ui.components.SwissIconCell
@@ -405,6 +407,32 @@ fun SummarizeScreen(
                                             modifier = Modifier.weight(1f)
                                         )
                                     }
+
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        SwissButton(
+                                            text = if (state.isGeneratingStudy) "Building Quiz…" else "Study / Quiz",
+                                            variant = SwissButtonVariant.PRIMARY,
+                                            enabled = !state.isSummarizing && !state.isGeneratingStudy && state.selectedModel != null,
+                                            minHeight = 40.dp,
+                                            onClick = viewModel::generateStudyPack,
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .testTag("summarize_study_quiz_btn")
+                                        )
+                                        SwissButton(
+                                            text = if (state.isGeneratingMindMap) "Mapping…" else "Mind Map",
+                                            variant = SwissButtonVariant.OUTLINE,
+                                            enabled = !state.isSummarizing && !state.isGeneratingMindMap && state.selectedModel != null,
+                                            minHeight = 40.dp,
+                                            onClick = viewModel::generateMindMap,
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .testTag("summarize_mindmap_btn")
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -414,5 +442,19 @@ fun SummarizeScreen(
                 Spacer(Modifier.height(12.dp))
             }
         }
+    }
+
+    state.activeStudyPack?.let { pack ->
+        StudyQuizDialog(
+            studyPack = pack,
+            onDismiss = viewModel::dismissStudyPack
+        )
+    }
+
+    state.activeMindMap?.let { root ->
+        MindMapDialog(
+            rootNode = root,
+            onDismiss = viewModel::dismissMindMap
+        )
     }
 }

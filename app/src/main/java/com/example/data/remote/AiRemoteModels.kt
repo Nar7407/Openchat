@@ -2,16 +2,29 @@ package com.example.data.remote
 
 import com.example.domain.model.ModelInfo
 
+data class ToolCallInvocation(
+    val id: String,
+    val name: String,
+    val argumentsJson: String
+)
+
 data class ChatInputMessage(
-    val role: String, // "USER" or "ASSISTANT"
+    val role: String, // "USER", "ASSISTANT", or "TOOL"
     val text: String,
     val imageBase64: String? = null,
-    val imageMimeType: String? = null
+    val imageMimeType: String? = null,
+    val toolCalls: List<ToolCallInvocation> = emptyList(),
+    val toolCallId: String? = null,
+    val toolName: String? = null
 )
 
 sealed interface StreamEvent {
     data class TextDelta(val text: String) : StreamEvent
     data class Usage(val promptTokens: Int, val completionTokens: Int) : StreamEvent
+    data class DebugRequest(val endpointUrl: String, val requestJson: String) : StreamEvent
+    data class RawResponseChunk(val rawJson: String) : StreamEvent
+    data class GroundingCitations(val citations: List<com.example.domain.model.SearchCitation>) : StreamEvent
+    data class ToolCallRequest(val calls: List<ToolCallInvocation>) : StreamEvent
     data object Completed : StreamEvent
 }
 

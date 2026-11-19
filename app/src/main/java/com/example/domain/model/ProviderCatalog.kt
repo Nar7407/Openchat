@@ -971,6 +971,160 @@ object ProviderCatalog {
 
     val customPreset: ProviderPreset = all.first { it.id == "custom" }
 
+    private val apiKeyUrls: Map<String, String> = mapOf(
+        "302ai" to "https://302.ai",
+        "abacus" to "https://abacus.ai",
+        "aihubmix" to "https://aihubmix.com",
+        "alibaba" to "https://modelstudio.console.alibabacloud.com",
+        "alibaba-cn" to "https://bailian.console.aliyun.com",
+        "alibaba-coding-plan" to "https://modelstudio.console.alibabacloud.com",
+        "alibaba-coding-plan-cn" to "https://bailian.console.aliyun.com",
+        "amazon-bedrock" to "https://console.aws.amazon.com/bedrock/",
+        "anthropic" to "https://console.anthropic.com/settings/keys",
+        "azure" to "https://ai.azure.com",
+        "azure-cognitive-services" to "https://ai.azure.com",
+        "bailing" to "https://www.tbox.cn",
+        "baseten" to "https://app.baseten.co/settings/api_keys",
+        "berget-ai" to "https://berget.ai",
+        "cerebras" to "https://cloud.cerebras.ai",
+        "chutes" to "https://chutes.ai",
+        "clarifai" to "https://clarifai.com/settings/security",
+        "cloudferro-sherlock" to "https://cloudferro.com",
+        "cloudflare-ai-gateway" to "https://dash.cloudflare.com",
+        "cloudflare-workers-ai" to "https://dash.cloudflare.com",
+        "cohere" to "https://dashboard.cohere.com/api-keys",
+        "cortecs" to "https://cortecs.ai",
+        "d-run-cn" to "https://d.run",
+        "deep-infra" to "https://deepinfra.com/dash/api_keys",
+        "deepseek" to "https://platform.deepseek.com/api_keys",
+        "digitalocean" to "https://cloud.digitalocean.com/gen-ai",
+        "dinference" to "https://dinference.com",
+        "evroc" to "https://evroc.com",
+        "fastrouter" to "https://fastrouter.ai",
+        "fireworks-ai" to "https://fireworks.ai/account/api-keys",
+        "firmware" to "https://firmware.ai",
+        "friendli" to "https://suite.friendli.ai",
+        "github-copilot" to "https://github.com/features/copilot",
+        "github-models" to "https://github.com/marketplace/models",
+        "gitlab-duo" to "https://about.gitlab.com/gitlab-duo/",
+        "google" to "https://aistudio.google.com/apikey",
+        "groq" to "https://console.groq.com/keys",
+        "helicone" to "https://us.helicone.ai/settings/api-keys",
+        "hpc-ai" to "https://hpcaitech.com",
+        "hugging-face" to "https://huggingface.co/settings/tokens",
+        "iflow" to "https://iflow.cn",
+        "inception" to "https://platform.inceptionlabs.ai",
+        "inference" to "https://inference.net",
+        "io-net" to "https://intelligence.io.solutions",
+        "jiekou-ai" to "https://jiekou.ai",
+        "kilo-gateway" to "https://kilo.ai",
+        "kimi-for-coding" to "https://www.kimi.com",
+        "kuae-cloud-coding-plan" to "https://kuaecloud.net",
+        "llama-llm-gateway" to "https://llama.developer.meta.com",
+        "lmstudio" to "https://lmstudio.ai/docs/app/api",
+        "lucidquery-ai" to "https://lucidquery.com",
+        "meganova" to "https://meganova.ai",
+        "minimax-io" to "https://platform.minimax.io",
+        "minimax-cn" to "https://platform.minimaxi.com",
+        "minimax-coding-plan-io" to "https://platform.minimax.io",
+        "minimax-coding-plan-cn" to "https://platform.minimaxi.com",
+        "mistral" to "https://console.mistral.ai/api-keys",
+        "mixlayer" to "https://mixlayer.ai",
+        "moark" to "https://moark.com",
+        "modelscope" to "https://modelscope.cn/my/myaccesstoken",
+        "moonshot-ai" to "https://platform.moonshot.ai/console/api-keys",
+        "moonshot-ai-cn" to "https://platform.moonshot.cn/console/api-keys",
+        "morph" to "https://morphllm.com",
+        "nanogpt" to "https://nano-gpt.com/api",
+        "nebius-token-factory" to "https://studio.nebius.com/settings/api-keys",
+        "nova" to "https://nova.amazon.com/dev/api",
+        "novitaai" to "https://novita.ai/settings/key-management",
+        "nvidia" to "https://build.nvidia.com/explore/discover",
+        "ollama-local" to "https://ollama.com",
+        "ollama-cloud" to "https://ollama.com/settings/keys",
+        "openai" to "https://platform.openai.com/api-keys",
+        "opencode-go" to "https://opencode.ai",
+        "opencode-zen" to "https://opencode.ai",
+        "openrouter" to "https://openrouter.ai/keys",
+        "ovhcloud-ai-endpoints" to "https://endpoints.ai.cloud.ovh.net",
+        "perplexity" to "https://www.perplexity.ai/settings/api",
+        "perplexity-agent" to "https://www.perplexity.ai/settings/api",
+        "poe" to "https://poe.com/api_key",
+        "privatemode-ai" to "https://privatemode.ai",
+        "qihang" to "https://qihang.ai",
+        "qiniu" to "https://portal.qiniu.com",
+        "regolo-ai" to "https://regolo.ai",
+        "requesty" to "https://app.requesty.ai/api-keys",
+        "sap-ai-core" to "https://discovery-center.cloud.sap/serviceCatalog/sap-ai-core",
+        "scaleway" to "https://console.scaleway.com/generative-apis",
+        "siliconflow" to "https://cloud.siliconflow.com/account/ak",
+        "siliconflow-cn" to "https://cloud.siliconflow.cn/account/ak",
+        "stackit" to "https://www.stackit.de",
+        "stepfun" to "https://platform.stepfun.com/interface-key",
+        "submodel" to "https://submodel.ai",
+        "synthetic" to "https://synthetic.new",
+        "tencent-coding-plan-cn" to "https://console.cloud.tencent.com/lkeap",
+        "tencent-tokenhub" to "https://console.cloud.tencent.com/lkeap",
+        "the-grid-ai" to "https://thegrid.ai",
+        "together-ai" to "https://api.together.xyz/settings/api-keys",
+        "upstage" to "https://console.upstage.ai/api-keys",
+        "v0" to "https://v0.dev/chat/settings/keys",
+        "venice-ai" to "https://venice.ai/settings/api",
+        "vercel-ai-gateway" to "https://vercel.com/ai-gateway",
+        "vertex" to "https://console.cloud.google.com/vertex-ai",
+        "vertex-anthropic" to "https://console.cloud.google.com/vertex-ai",
+        "vivgrid" to "https://vivgrid.com",
+        "vultr" to "https://my.vultr.com/settings/#settingsapi",
+        "wafer" to "https://wafer.ai",
+        "weights-and-biases" to "https://wandb.ai/authorize",
+        "xai" to "https://console.x.ai",
+        "xiaomi" to "https://platform.xiaomimimo.com",
+        "xiaomi-token-plan-cn" to "https://platform.xiaomimimo.com",
+        "xiaomi-token-plan-eu" to "https://platform.xiaomimimo.com",
+        "xiaomi-token-plan-sg" to "https://platform.xiaomimimo.com",
+        "z-ai" to "https://z.ai",
+        "z-ai-coding-plan" to "https://z.ai",
+        "zenmux" to "https://zenmux.ai",
+        "zhipu-ai" to "https://open.bigmodel.cn/usercenter/apikeys",
+        "zhipu-ai-coding-plan" to "https://open.bigmodel.cn/usercenter/apikeys"
+    )
+
+    fun resolveWebsiteUrl(name: String, baseUrl: String): String? {
+        val cleanName = name.trim()
+        val cleanBase = baseUrl.trim().trimEnd('/')
+
+        val matchedPreset = all.firstOrNull { preset ->
+            cleanName.isNotEmpty() && preset.title.equals(cleanName, ignoreCase = true)
+        } ?: all.firstOrNull { preset ->
+            cleanBase.isNotEmpty() && preset.baseUrl.trimEnd('/').equals(cleanBase, ignoreCase = true)
+        } ?: all.firstOrNull { preset ->
+            preset.id != "custom" && cleanName.isNotEmpty() &&
+                (cleanName.contains(preset.title, ignoreCase = true) || preset.title.contains(cleanName, ignoreCase = true))
+        }
+
+        matchedPreset?.let { preset ->
+            apiKeyUrls[preset.id]?.let { return it }
+        }
+
+        if (cleanBase.isNotEmpty() && !cleanBase.contains('<') && !cleanBase.contains('>')) {
+            val host = runCatching { java.net.URI(cleanBase).host }.getOrNull()?.lowercase()
+            if (!host.isNullOrBlank() &&
+                host != "localhost" &&
+                host != "127.0.0.1" &&
+                host != "10.0.2.2"
+            ) {
+                val stripped = host
+                    .removePrefix("api.")
+                    .removePrefix("inference.")
+                    .removePrefix("models.")
+                    .removePrefix("router.")
+                    .removePrefix("llm.")
+                return "https://$stripped"
+            }
+        }
+        return null
+    }
+
     fun filter(query: String, category: ProviderCategory): List<ProviderPreset> {
         val q = query.trim()
         val byCategory = when (category) {

@@ -35,6 +35,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -64,10 +65,20 @@ fun ModelPickerButton(
     onSelectModel: (SelectableModel) -> Unit,
     onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
-    bordered: Boolean = true
+    bordered: Boolean = true,
+    openTrigger: Int = 0,
+    supportsAutoRoute: Boolean = false,
+    isAutoRouteEnabled: Boolean = false,
+    onSelectAutoRoute: (() -> Unit)? = null
 ) {
     var showSheet by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf("") }
+    LaunchedEffect(openTrigger) {
+        if (openTrigger > 0) {
+            searchQuery = ""
+            showSheet = true
+        }
+    }
     val interactionSource = remember { MutableInteractionSource() }
     val isPressed by interactionSource.collectIsPressedAsState()
 
@@ -100,22 +111,26 @@ fun ModelPickerButton(
             Box(
                 modifier = Modifier
                     .size(8.dp)
-                    .background(if (selectedModel != null) SwissSignalRed else SwissMuted)
+                    .background(if (isAutoRouteEnabled || selectedModel != null) SwissSignalRed else SwissMuted)
             )
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = if (selectedModel != null) {
-                        "MODEL // ${selectedModel.provider.name.uppercase()}"
-                    } else {
-                        "NO ${requiredCapability.label.uppercase()} MODEL"
+                    text = when {
+                        isAutoRouteEnabled && supportsAutoRoute -> "AUTO // SMART ROUTER"
+                        selectedModel != null -> "MODEL // ${selectedModel.provider.name.uppercase()}"
+                        else -> "NO ${requiredCapability.label.uppercase()} MODEL"
                     },
                     style = MaterialTheme.typography.labelSmall,
-                    color = subFg,
+                    color = if (isAutoRouteEnabled && supportsAutoRoute && !isPressed) SwissSignalRed else subFg,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
                 Text(
-                    text = selectedModel?.model?.displayName ?: "Select ${requiredCapability.label} model",
+                    text = when {
+                        isAutoRouteEnabled && supportsAutoRoute -> "Auto-Route Specialist"
+                        selectedModel != null -> selectedModel.model.displayName
+                        else -> "Select ${requiredCapability.label} model"
+                    },
                     style = MaterialTheme.typography.titleSmall,
                     color = fg,
                     maxLines = 1,
@@ -315,8 +330,60 @@ fun ModelPickerButton(
                                     .fillMaxWidth()
                                     .border(1.dp, SwissInk, RectangleShape)
                             ) {
+                                if (supportsAutoRoute && onSelectAutoRoute != null && searchQuery.isBlank()) {
+                                    item(key = "auto_router_option") {
+                                        val autoBg = if (isAutoRouteEnabled) SwissInk else SwissPaper
+                                        val autoFg = if (isAutoRouteEnabled) SwissWhite else SwissInk
+                                        val autoSub = if (isAutoRouteEnabled) SwissConcrete else SwissMuted
+                                        Column(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .background(autoBg)
+                                                .clickable {
+                                                    onSelectAutoRoute()
+                                                    showSheet = false
+                                                }
+                                                .testTag("model_option_auto_router")
+                                        ) {
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.SpaceBetween
+                                            ) {
+                                                Column(modifier = Modifier.weight(1f)) {
+                                                    Text(
+                                                        text = "AUTO // Smart Task Router",
+                                                        style = MaterialTheme.typography.titleSmall,
+                                                        color = autoFg
+                                                    )
+                                                    Text(
+                                                        text = "Auto-picks Fast Chat, Heavy Coding, Vision, or Long Context",
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        color = autoSub,
+                                                        maxLines = 2,
+                                                        overflow = TextOverflow.Ellipsis
+                                                    )
+                                                }
+                                                SwissBadge(
+                                                    text = if (isAutoRouteEnabled) "ACTIVE" else "AUTO",
+                                                    containerColor = SwissSignalRed,
+                                                    contentColor = SwissWhite,
+                                                    borderColor = SwissSignalRed
+                                                )
+                                            }
+                                            Box(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .height(1.dp)
+                                                    .background(SwissInk)
+                                            )
+                                        }
+                                    }
+                                }
                                 items(filteredModels, key = { it.model.id }) { item ->
-                                    val isSelected = item.model.id == selectedModel?.model?.id
+                                    val isSelected = !isAutoRouteEnabled && item.model.id == selectedModel?.model?.id
                                     val rowBg = if (isSelected) SwissInk else SwissPaper
                                     val rowFg = if (isSelected) SwissWhite else SwissInk
                                     val rowSub = if (isSelected) SwissConcrete else SwissMuted

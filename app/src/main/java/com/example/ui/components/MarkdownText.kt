@@ -2,11 +2,14 @@ package com.example.ui.components
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -34,33 +37,107 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.domain.model.SearchCitation
 import com.example.ui.theme.JetBrainsMonoFamily
 import com.example.ui.theme.SwissCanvas
 import com.example.ui.theme.SwissConcrete
 import com.example.ui.theme.SwissInk
 import com.example.ui.theme.SwissMuted
+import com.example.ui.theme.SwissPaper
 import com.example.ui.theme.SwissSignalRed
+import com.example.ui.theme.SwissSignalRedTint
 import com.example.ui.theme.SwissSubtleFill
 import com.example.ui.theme.SwissWhite
 import com.example.util.MarkdownBlock
 import com.example.util.MarkdownParser
 import kotlinx.coroutines.delay
 
+private sealed interface MarkdownSegment {
+    data class Content(val markdown: String) : MarkdownSegment
+    data class Thinking(val text: String, val isUnclosed: Boolean) : MarkdownSegment
+}
+
+private fun splitThinkingSegments(raw: String): List<MarkdownSegment> {
+    if (!raw.contains("<think>", ignoreCase = true) && !raw.contains("<reasoning>", ignoreCase = true)) {
+        return listOf(MarkdownSegment.Content(raw))
+    }
+    val segments = mutableListOf<MarkdownSegment>()
+    var cursor = 0
+    val lower = raw.lowercase()
+    while (cursor < raw.length) {
+        val thinkStart = lower.indexOf("<think>", cursor)
+        val reasonStart = lower.indexOf("<reasoning>", cursor)
+        val nextStart = listOf(thinkStart, reasonStart).filter { it >= 0 }.minOrNull()
+        if (nextStart == null) {
+            val tail = raw.substring(cursor).trim()
+            if (tail.isNotEmpty()) segments += MarkdownSegment.Content(tail)
+            break
+        }
+        if (nextStart > cursor) {
+            val before = raw.substring(cursor, nextStart).trim()
+            if (before.isNotEmpty()) segments += MarkdownSegment.Content(before)
+        }
+        val isReasonTag = (nextStart == reasonStart)
+        val openLen = if (isReasonTag) "<reasoning>".length else "<think>".length
+        val closeTag = if (isReasonTag) "</reasoning>" else "</think>"
+        val closeIdx = lower.indexOf(closeTag, nextStart + openLen)
+        if (closeIdx >= 0) {
+            val inner = raw.substring(nextStart + openLen, closeIdx).trim()
+            if (inner.isNotEmpty()) segments += MarkdownSegment.Thinking(inner, isUnclosed = false)
+            cursor = closeIdx + closeTag.length
+        } else {
+            val inner = raw.substring(nextStart + openLen).trim()
+            if (inner.isNotEmpty()) segments += MarkdownSegment.Thinking(inner, isUnclosed = true)
+            break
+        }
+    }
+    return segments
+}
+
 @Composable
 fun MarkdownText(
     markdown: String,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    showThinking: Boolean = true,
+    thinkingDurationSec: Int? = null
 ) {
-    val blocks = remember(markdown) { MarkdownParser.parse(markdown) }
+    val segments = remember(markdown) { splitThinkingSegments(markdown) }
 
     Column(
         modifier = modifier,
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        blocks.forEach { block ->
+        segments.forEach { seg ->
+            when (seg) {
+                is MarkdownSegment.Thinking -> {
+                    if (showThinking) {
+                        ThinkingTraceBlock(
+                            thoughtText = seg.text,
+                            isStreaming = seg.isUnclosed,
+                            durationSec = thinkingDurationSec
+                        )
+                    } else {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(SwissSubtleFill)
+                                .padding(horizontal = 10.dp, vertical = 6.dp)
+                        ) {
+                            Text(
+                                text = "THOUGHT TRACE HIDDEN // RUN /thinking TO SHOW",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissMuted
+                            )
+                        }
+                    }
+                }
+                is MarkdownSegment.Content -> {
+                    val blocks = remember(seg.markdown) { MarkdownParser.parse(seg.markdown) }
+                    blocks.forEach { block ->
             when (block) {
                 is MarkdownBlock.Heading -> {
                     val style = when (block.level) {
@@ -152,6 +229,121 @@ fun MarkdownText(
                     )
                 }
             }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ThinkingTraceBlock(
+    thoughtText: String,
+    isStreaming: Boolean,
+    durationSec: Int? = null
+) {
+    // Open while actively streaming; automatically collapses once finished!
+    var expanded by remember(isStreaming) { mutableStateOf(isStreaming) }
+    val headerLabel = when {
+        isStreaming -> "THINKING // LIVE REASONING…"
+        durationSec != null && durationSec > 0 -> "THOUGHT FOR ${durationSec}S"
+        else -> "THOUGHT FOR <1S // REASONING TRACE"
+    }
+
+    Surface(
+        color = SwissSubtleFill,
+        shape = RectangleShape,
+        border = BorderStroke(1.dp, SwissInk),
+        shadowElevation = 0.dp,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(SwissConcrete)
+                    .clickable { expanded = !expanded }
+                    .padding(horizontal = 10.dp, vertical = 7.dp)
+                    .testTag("thinking_accordion_header"),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = headerLabel,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (isStreaming) SwissSignalRed else SwissInk
+                )
+                Text(
+                    text = if (expanded) "[ HIDE ]" else "[ EXPAND ]",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = SwissMuted
+                )
+            }
+            if (expanded) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(1.dp)
+                        .background(SwissInk)
+                )
+                Text(
+                    text = thoughtText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = SwissMuted,
+                    modifier = Modifier.padding(10.dp)
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun CitationPillsRow(
+    citations: List<SearchCitation>,
+    onOpenUrl: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    if (citations.isEmpty()) return
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Text(
+            text = "SOURCES // ${citations.size} GROUNDED CITATION${if (citations.size == 1) "" else "S"}",
+            style = MaterialTheme.typography.labelSmall,
+            color = SwissMuted
+        )
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            citations.forEach { cite ->
+                Row(
+                    modifier = Modifier
+                        .background(SwissSignalRedTint, RectangleShape)
+                        .border(1.dp, SwissSignalRed, RectangleShape)
+                        .clickable { onOpenUrl(cite.url) }
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                        .testTag("citation_pill_${cite.index}"),
+                    horizontalArrangement = Arrangement.spacedBy(5.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "[${cite.index}]",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = SwissSignalRed
+                    )
+                    Text(
+                        text = cite.title.take(30),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = SwissInk,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
         }
     }
 }
@@ -163,12 +355,40 @@ private fun CodeBlockCard(
 ) {
     val clipboard = LocalClipboardManager.current
     var copied by remember { mutableStateOf(false) }
+    var showPreview by remember { mutableStateOf(false) }
+    var showRunner by remember { mutableStateOf(false) }
+    var showChart by remember { mutableStateOf(false) }
+    val canPreview = remember(language, code) { ArtifactDetector.isPreviewable(language, code) }
+    val canRun = remember(language) { CodeSandboxDetector.isRunnableCode(language) }
+    val isChartOrMermaid = remember(language) { CodeSandboxDetector.isChartOrDiagram(language) }
 
     LaunchedEffect(copied) {
         if (copied) {
             delay(1800L)
             copied = false
         }
+    }
+
+    if (showPreview) {
+        HtmlArtifactPreviewDialog(
+            language = language,
+            code = code,
+            onDismiss = { showPreview = false }
+        )
+    }
+    if (showRunner) {
+        CodeInterpreterDialog(
+            language = language,
+            code = code,
+            onDismiss = { showRunner = false }
+        )
+    }
+    if (showChart) {
+        ChartDiagramDialog(
+            language = language,
+            code = code,
+            onDismiss = { showChart = false }
+        )
     }
 
     Surface(
@@ -179,7 +399,7 @@ private fun CodeBlockCard(
         modifier = Modifier.fillMaxWidth()
     ) {
         Column {
-            // Stark obsidian header bar with instant-invert copy cell
+            // Stark obsidian header bar with instant-invert run / chart / preview & copy cells
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -191,23 +411,70 @@ private fun CodeBlockCard(
                     text = "SRC // ${(language.ifBlank { "PLAIN" }).uppercase()}",
                     style = MaterialTheme.typography.labelSmall,
                     color = SwissCanvas,
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                )
-                Box(
                     modifier = Modifier
-                        .background(if (copied) SwissSignalRed else SwissInk)
-                        .clickable {
-                            clipboard.setText(AnnotatedString(code))
-                            copied = true
+                        .weight(1f)
+                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (isChartOrMermaid) {
+                        Box(
+                            modifier = Modifier
+                                .background(SwissSignalRed)
+                                .clickable { showChart = true }
+                                .padding(horizontal = 10.dp, vertical = 6.dp)
+                                .testTag("render_chart_button")
+                        ) {
+                            Text(
+                                text = if (language.equals("mermaid", ignoreCase = true)) "[ DIAGRAM ]" else "[ CHART ]",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissWhite
+                            )
                         }
-                        .padding(horizontal = 12.dp, vertical = 6.dp)
-                        .testTag("copy_code_button")
-                ) {
-                    Text(
-                        text = if (copied) "[ COPIED ]" else "[ COPY ]",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = SwissWhite
-                    )
+                    } else if (canRun) {
+                        Box(
+                            modifier = Modifier
+                                .background(SwissSignalRed)
+                                .clickable { showRunner = true }
+                                .padding(horizontal = 10.dp, vertical = 6.dp)
+                                .testTag("run_code_button")
+                        ) {
+                            Text(
+                                text = "[ RUN ]",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissWhite
+                            )
+                        }
+                    } else if (canPreview) {
+                        Box(
+                            modifier = Modifier
+                                .background(SwissSignalRed)
+                                .clickable { showPreview = true }
+                                .padding(horizontal = 10.dp, vertical = 6.dp)
+                                .testTag("preview_code_button")
+                        ) {
+                            Text(
+                                text = "[ PREVIEW ]",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissWhite
+                            )
+                        }
+                    }
+                    Box(
+                        modifier = Modifier
+                            .background(if (copied) SwissSignalRed else SwissInk)
+                            .clickable {
+                                clipboard.setText(AnnotatedString(code))
+                                copied = true
+                            }
+                            .padding(horizontal = 12.dp, vertical = 6.dp)
+                            .testTag("copy_code_button")
+                    ) {
+                        Text(
+                            text = if (copied) "[ COPIED ]" else "[ COPY ]",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SwissWhite
+                        )
+                    }
                 }
             }
             Box(
