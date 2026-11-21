@@ -99,7 +99,7 @@ class AllChatWidgetProvider : AppWidgetProvider() {
             // 4. Render status badge & inline Q&A response right on the widget
             val badgeText = when {
                 state.isLoading -> "STREAMING…"
-                state.isError -> "ERROR"
+                state.isError -> state.modelLabel.ifBlank { "ERROR" }.uppercase().take(18)
                 state.modelLabel.isNotBlank() -> state.modelLabel.uppercase().take(18)
                 else -> "BYOK"
             }
@@ -117,12 +117,39 @@ class AllChatWidgetProvider : AppWidgetProvider() {
                     R.id.widget_btn_ask,
                     if (state.isLoading) "ASKING…" else "FOLLOW UP…"
                 )
+                if (state.isError && state.question.isNotBlank() && !state.isLoading) {
+                    views.setViewVisibility(R.id.widget_btn_retry, View.VISIBLE)
+                    views.setOnClickPendingIntent(
+                        R.id.widget_btn_retry,
+                        buildRetryPendingIntent(context, state.question, 2003)
+                    )
+                } else {
+                    views.setViewVisibility(R.id.widget_btn_retry, View.GONE)
+                }
             } else {
                 views.setViewVisibility(R.id.widget_answer_container, View.GONE)
+                views.setViewVisibility(R.id.widget_btn_retry, View.GONE)
                 views.setTextViewText(R.id.widget_btn_ask, "ASK ANYTHING…")
             }
 
             appWidgetManager.updateAppWidget(appWidgetId, views)
+        }
+
+        private fun buildRetryPendingIntent(
+            context: Context,
+            question: String,
+            requestCode: Int
+        ): PendingIntent {
+            val intent = Intent(context, WidgetPromptActivity::class.java).apply {
+                action = "com.example.widget.OVERLAY_RETRY"
+                putExtra(WidgetPromptActivity.EXTRA_RETRY_QUESTION, question)
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TASK or
+                    Intent.FLAG_ACTIVITY_NO_ANIMATION or
+                    Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
+            }
+            val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            return PendingIntent.getActivity(context, requestCode, intent, flags)
         }
 
         private fun buildOverlayPendingIntent(

@@ -2362,35 +2362,59 @@ class AllChatRepository(
             add(ChatInputMessage(role = "USER", text = prompt.trim()))
         }
 
-        val apiKey = apiKeyVault.getApiKey(selectedModel.provider.id)
+        val apiKey = getProviderApiKey(selectedModel.provider.id)
         val modelLabel = selectedModel.model.displayName
         val buffer = StringBuilder()
         var lastEmitMs = 0L
 
-        try {
-            withTimeout(25_000L) {
-                aiRouter.streamChat(
-                    provider = selectedModel.provider,
-                    apiKey = apiKey,
-                    modelId = selectedModel.model.modelId,
-                    messages = fullInputMessages,
-                    options = ChatOptions(systemPrompt = systemPrompt, maxTokens = 512)
-                ).collect { event ->
-                    if (event is StreamEvent.TextDelta) {
-                        buffer.append(event.text)
-                        val now = System.currentTimeMillis()
-                        if (now - lastEmitMs >= 350L) {
-                            lastEmitMs = now
-                            val cleaned = cleanWidgetAnswerText(buffer.toString())
-                            if (cleaned.isNotBlank()) {
-                                onPartialUpdate(modelLabel, cleaned)
+        var attempt = 0
+        var lastNetworkError: Throwable? = null
+        while (attempt < 2) {
+            attempt++
+            buffer.setLength(0)
+            lastEmitMs = 0L
+            try {
+                withTimeout(25_000L) {
+                    aiRouter.streamChat(
+                        provider = selectedModel.provider,
+                        apiKey = apiKey,
+                        modelId = selectedModel.model.modelId,
+                        messages = fullInputMessages,
+                        options = ChatOptions(systemPrompt = systemPrompt, maxTokens = 512)
+                    ).collect { event ->
+                        if (event is StreamEvent.TextDelta) {
+                            buffer.append(event.text)
+                            val now = System.currentTimeMillis()
+                            if (now - lastEmitMs >= 350L) {
+                                lastEmitMs = now
+                                val cleaned = cleanWidgetAnswerText(buffer.toString())
+                                if (cleaned.isNotBlank()) {
+                                    onPartialUpdate(modelLabel, cleaned)
+                                }
                             }
                         }
                     }
                 }
+                lastNetworkError = null
+                break
+            } catch (tce: TimeoutCancellationException) {
+                throw IllegalStateException("Request timed out after 25s on $modelLabel. Tap RETRY to try again.")
+            } catch (ex: AiException) {
+                val isTransientNetwork = ex.category == AiErrorCategory.NETWORK_PROXY &&
+                    buffer.isEmpty() &&
+                    attempt < 2
+                if (isTransientNetwork) {
+                    lastNetworkError = ex
+                    // Evict stale sockets after Wi-Fi/idle handoff and retry once cleanly
+                    runCatching { okHttpClient.connectionPool.evictAll() }
+                    delay(450L)
+                    continue
+                }
+                throw ex
             }
-        } catch (tce: TimeoutCancellationException) {
-            throw IllegalStateException("Request timed out after 25s on $modelLabel. Tap Ask to retry.")
+        }
+        if (lastNetworkError != null) {
+            throw lastNetworkError
         }
 
         val finalAnswer = cleanWidgetAnswerText(buffer.toString())

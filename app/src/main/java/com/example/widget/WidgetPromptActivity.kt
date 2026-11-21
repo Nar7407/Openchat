@@ -71,12 +71,20 @@ class WidgetPromptActivity : ComponentActivity() {
 
     companion object {
         const val EXTRA_MODE = "widget_prompt_mode"
+        const val EXTRA_RETRY_QUESTION = "widget_retry_question"
         const val MODE_TEXT = "text"
         const val MODE_VOICE = "voice"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        val retryQuestion = intent?.getStringExtra(EXTRA_RETRY_QUESTION)?.trim().orEmpty()
+        if (retryQuestion.isNotEmpty()) {
+            WidgetQuickAskRunner.submitQuestion(applicationContext, retryQuestion)
+            finishNoAnim()
+            return
+        }
 
         val initialMode = intent?.getStringExtra(EXTRA_MODE) ?: MODE_TEXT
         if (initialMode == MODE_VOICE) {

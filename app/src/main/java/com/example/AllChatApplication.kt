@@ -4,6 +4,7 @@ import android.app.Application
 import com.example.data.local.AllChatDatabase
 import com.example.data.local.ApiKeyVault
 import com.example.data.remote.AiRouter
+import com.example.data.remote.ResilientNetworkDns
 import com.example.data.remote.WebSearchClient
 import com.example.data.repository.AllChatRepository
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
@@ -28,9 +29,11 @@ class AllChatApplication : Application() {
         PDFBoxResourceLoader.init(applicationContext)
 
         okHttpClient = OkHttpClient.Builder()
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(120, TimeUnit.SECONDS)
-            .writeTimeout(60, TimeUnit.SECONDS)
+            .dns(ResilientNetworkDns(applicationContext))
+            .retryOnConnectionFailure(true)
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .writeTimeout(30, TimeUnit.SECONDS)
             .build()
 
         val database = AllChatDatabase.getInstance(applicationContext)

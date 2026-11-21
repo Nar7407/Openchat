@@ -148,6 +148,23 @@
             android:orientation="horizontal">
 
             <TextView
+                android:id="@+id/widget_btn_retry"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="6dp"
+                android:background="@drawable/widget_btn_accent"
+                android:fontFamily="monospace"
+                android:paddingStart="8dp"
+                android:paddingTop="3dp"
+                android:paddingEnd="8dp"
+                android:paddingBottom="3dp"
+                android:text="RETRY"
+                android:textColor="#FFFFFF"
+                android:textSize="10sp"
+                android:textStyle="bold"
+                android:visibility="gone" />
+
+            <TextView
                 android:id="@+id/widget_btn_copy"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
