@@ -4,8 +4,20 @@ import android.content.Context
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import androidx.room.TypeConverter
+import androidx.room.TypeConverters
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
+import com.example.domain.model.ProviderType
+
+class AllChatRoomConverters {
+    @TypeConverter
+    fun fromProviderType(type: ProviderType): String = type.name
+
+    @TypeConverter
+    fun toProviderType(value: String): ProviderType =
+        runCatching { ProviderType.valueOf(value) }.getOrDefault(ProviderType.OPENAI_COMPATIBLE)
+}
 
 @Database(
     entities = [
@@ -18,9 +30,10 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         GeneratedMediaEntity::class,
         UserMemoryEntity::class
     ],
-    version = 4,
+    version = 5,
     exportSchema = false
 )
+@TypeConverters(AllChatRoomConverters::class)
 abstract class AllChatDatabase : RoomDatabase() {
     abstract fun providerDao(): ProviderDao
     abstract fun modelDao(): ModelDao
@@ -100,6 +113,27 @@ abstract class AllChatDatabase : RoomDatabase() {
             }
         }
 
+        internal val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE providers ADD COLUMN encryptedApiKey TEXT")
+                db.execSQL("ALTER TABLE providers ADD COLUMN defaultModelId TEXT")
+                db.execSQL("ALTER TABLE providers ADD COLUMN isEnabled INTEGER NOT NULL DEFAULT 1")
+                db.execSQL("ALTER TABLE providers ADD COLUMN updatedAt INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("UPDATE providers SET updatedAt = createdAt WHERE updatedAt = 0")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_providers_name ON providers(name)")
+                // Remove any duplicate (providerId, modelId) rows before creating the unique index
+                db.execSQL(
+                    """
+                    DELETE FROM models
+                    WHERE id NOT IN (
+                        SELECT MIN(id) FROM models GROUP BY providerId, modelId
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS index_models_providerId_modelId ON models(providerId, modelId)")
+            }
+        }
+
         fun getInstance(context: Context): AllChatDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
@@ -107,7 +141,7 @@ abstract class AllChatDatabase : RoomDatabase() {
                     AllChatDatabase::class.java,
                     "allchat_local.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
                     .fallbackToDestructiveMigrationOnDowngrade()
                     .build()
                     .also { INSTANCE = it }

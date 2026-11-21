@@ -6,6 +6,7 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
 
     <uses-feature
         android:name="android.hardware.camera"
@@ -21,6 +22,41 @@
         <intent>
             <action android:name="android.intent.action.TTS_SERVICE" />
         </intent>
+        <intent>
+            <action android:name="android.intent.action.DIAL" />
+            <data android:scheme="tel" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SET_ALARM" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SET_TIMER" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.PICK" />
+            <data android:mimeType="vnd.android.cursor.dir/phone_v2" />
+        </intent>
+        <package android:name="com.whatsapp" />
+        <package android:name="com.google.android.youtube" />
+        <package android:name="com.android.chrome" />
+        <package android:name="com.google.android.gm" />
+        <package android:name="com.google.android.apps.maps" />
+        <package android:name="org.telegram.messenger" />
+        <package android:name="com.instagram.android" />
+        <package android:name="com.spotify.music" />
+        <package android:name="com.google.android.deskclock" />
+        <package android:name="com.google.android.calendar" />
+        <package android:name="com.google.android.calculator" />
+        <package android:name="com.linkedin.android" />
+        <package android:name="com.twitter.android" />
+        <package android:name="com.Slack" />
+        <package android:name="com.discord" />
+        <package android:name="com.github.android" />
+        <package android:name="com.phonepe.app" />
+        <package android:name="com.google.android.apps.nbu.paisa.user" />
+        <package android:name="net.one97.paytm" />
+        <package android:name="in.swiggy.android" />
+        <package android:name="com.application.zomato" />
     </queries>
 
     <application
@@ -101,6 +137,30 @@
             android:taskAffinity=""
             android:theme="@style/Theme.AllChat.WidgetOverlay"
             android:windowSoftInputMode="adjustResize" />
+
+        <!-- Google-Assistant-Style Floating Voice & Lens Overlay Activity (Deep-Link / ASSIST / Key Mapper) -->
+        <activity
+            android:name=".ui.assistant.AssistantOverlayActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:launchMode="singleInstance"
+            android:resizeableActivity="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.AllChat.WidgetOverlay"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.ASSIST" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:host="assistant"
+                    android:scheme="allchat" />
+            </intent-filter>
+        </activity>
 
         <receiver
             android:name=".widget.AllChatWidgetProvider"

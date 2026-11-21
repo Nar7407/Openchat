@@ -22,6 +22,7 @@ import com.example.data.local.UserMemoryDao
 import com.example.data.local.UserMemoryEntity
 import com.example.data.local.VaultBackupManager
 import com.example.data.local.VaultSnapshot
+import android.graphics.Bitmap
 import com.example.data.remote.AiRouter
 import com.example.data.remote.ChatInputMessage
 import com.example.data.remote.ConnectionTestResult
@@ -29,16 +30,21 @@ import com.example.data.remote.FetchedModel
 import com.example.data.remote.StreamEvent
 import com.example.data.remote.ToolCallInvocation
 import com.example.data.remote.WebSearchClient
+import com.example.data.remote.YouTubeExtractorClient
 import com.example.domain.model.AiErrorCategory
 import com.example.domain.model.AiException
 import com.example.domain.model.AutoRouterConfig
 import com.example.domain.model.ChatOptions
 import com.example.domain.model.ClientToolEngine
+import com.example.domain.model.CodeDebugResult
 import com.example.domain.model.ConversationTree
 import com.example.domain.model.CostEstimator
+import com.example.domain.model.CustomAppEntry
 import com.example.domain.model.CustomSlashCommand
 import com.example.domain.model.DisplayCurrency
 import com.example.domain.model.KnowledgeDocInfo
+import com.example.domain.model.LiveLensAnalysisResult
+import com.example.domain.model.LiveLensMode
 import com.example.domain.model.LocalRagEngine
 import com.example.domain.model.McpCheckResult
 import com.example.domain.model.McpServerConfig
@@ -48,7 +54,9 @@ import com.example.domain.model.ModelInfo
 import com.example.domain.model.PersonaInfo
 import com.example.domain.model.ProviderConfig
 import com.example.domain.model.ProviderType
+import com.example.domain.model.QuickContact
 import com.example.domain.model.QuizQuestion
+import com.example.domain.model.RewritePreset
 import com.example.domain.model.SearchCitation
 import com.example.domain.model.SelectableModel
 import com.example.domain.model.StudyCard
@@ -56,6 +64,11 @@ import com.example.domain.model.StudyPack
 import com.example.domain.model.SummaryLength
 import com.example.domain.model.UserMemoryInfo
 import com.example.domain.model.WebSearchProvider
+import com.example.util.DeviceAction
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withTimeout
+import java.util.concurrent.ConcurrentHashMap
+import com.example.domain.model.YouTubeStudyResult
 import com.example.util.DocumentExtractor
 import com.example.util.ImageEncoder
 import kotlinx.coroutines.Dispatchers
@@ -100,6 +113,17 @@ class AllChatRepository(
     private val webSearchClient: WebSearchClient,
     private val okHttpClient: OkHttpClient
 ) {
+    private val youtubeExtractorClient = YouTubeExtractorClient(okHttpClient, webSearchClient)
+
+    val providerConfigRepository: ProviderConfigRepository = ProviderConfigRepository(
+        providerDao = providerDao,
+        modelDao = modelDao,
+        apiKeyVault = apiKeyVault,
+        aiRouter = aiRouter
+    )
+
+    // 60-second cooldown tracker per modelDbId when HTTP 429 / RESOURCE_EXHAUSTED is encountered
+    private val modelCooldownUntilMs = ConcurrentHashMap<Long, Long>()
 
     // --- Vault Lock, Themes & Command Preferences ---
 
@@ -118,11 +142,117 @@ class AllChatRepository(
     val autoRouterConfigFlow: Flow<AutoRouterConfig> = apiKeyVault.autoRouterConfigFlow
     val autoRouteEnabledFlow: Flow<Boolean> = apiKeyVault.autoRouteEnabledFlow
     val autoExtractMemoriesFlow: Flow<Boolean> = apiKeyVault.autoExtractMemoriesFlow
+    val activeConversationIdFlow: Flow<Long?> = apiKeyVault.activeConversationIdFlow
+    val activeModelDbIdFlow: Flow<Long?> = apiKeyVault.activeModelDbIdFlow
+    val quickContactsFlow: Flow<List<QuickContact>> = apiKeyVault.quickContactsFlow
+    val customAppsFlow: Flow<List<CustomAppEntry>> = apiKeyVault.customAppsFlow
+    val visionFallbackModelIdsFlow: Flow<List<Long>> = apiKeyVault.visionFallbackModelIdsFlow
+    val liveLensIntervalSecFlow: Flow<Int> = apiKeyVault.liveLensIntervalSecFlow
     val knowledgeDocsFlow: Flow<List<KnowledgeDocInfo>> = knowledgeDocDao.observeDocs().map { list ->
         list.map { it.toDomain() }
     }
     val memoriesFlow: Flow<List<UserMemoryInfo>> = userMemoryDao.observeAll().map { list ->
         list.map { it.toDomain() }
+    }
+
+    suspend fun setActiveConversationId(conversationId: Long?) =
+        apiKeyVault.setActiveConversationId(conversationId)
+
+    suspend fun setActiveModelDbId(modelDbId: Long?) =
+        apiKeyVault.setActiveModelDbId(modelDbId)
+
+    suspend fun saveQuickContact(contact: QuickContact) =
+        apiKeyVault.saveQuickContact(contact)
+
+    suspend fun deleteQuickContact(id: String) =
+        apiKeyVault.deleteQuickContact(id)
+
+    suspend fun saveCustomApp(entry: CustomAppEntry) =
+        apiKeyVault.saveCustomApp(entry)
+
+    suspend fun deleteCustomApp(id: String) =
+        apiKeyVault.deleteCustomApp(id)
+
+    suspend fun setVisionFallbackModelIds(ids: List<Long>) =
+        apiKeyVault.setVisionFallbackModelIds(ids)
+
+    suspend fun setLiveLensIntervalSec(seconds: Int) =
+        apiKeyVault.setLiveLensIntervalSec(seconds)
+
+    /**
+     * Reads a fresh [SelectableModel] (with up-to-date provider baseUrl, proxyUrl, and modelId)
+     * directly from Room right before sending so idle gaps never hold stale closure values.
+     */
+    suspend fun resolveFreshModel(modelDbId: Long? = null): SelectableModel? = withContext(Dispatchers.IO) {
+        val available = observeModelsForCapability(ModelCapability.TEXT_CHAT).first()
+        if (available.isEmpty()) return@withContext null
+        val targetId = modelDbId ?: activeModelDbIdFlow.first()
+        available.firstOrNull { it.model.id == targetId } ?: resolvePreferredChatModel()
+    }
+
+    /**
+     * Resolves the currently active persisted conversation ID (shared across Main Chat,
+     * Mini-Window mode, Assistant Overlay, and Widget), falling back to the latest existing
+     * conversation or creating a new one if none exist yet.
+     */
+    suspend fun getOrCreateActiveConversationId(
+        defaultTitle: String = "New Chat",
+        modelDbId: Long? = null,
+        personaId: Long? = null
+    ): Long {
+        val allConvs = conversationsFlow.first()
+        val storedId = activeConversationIdFlow.first()
+        if (storedId != null && allConvs.any { it.id == storedId }) {
+            return storedId
+        }
+        val latestExisting = allConvs.firstOrNull()?.id
+        if (latestExisting != null) {
+            apiKeyVault.setActiveConversationId(latestExisting)
+            return latestExisting
+        }
+        val created = createConversation(defaultTitle, modelDbId, personaId)
+        apiKeyVault.setActiveConversationId(created)
+        return created
+    }
+
+    /**
+     * Appends a local user+assistant exchange (e.g., confirmed Device Action) directly to the
+     * active leaf of [conversationId] so multi-turn history is never lost.
+     */
+    suspend fun appendInstantExchange(
+        conversationId: Long,
+        userText: String,
+        assistantText: String,
+        modelLabel: String = "DEVICE ACTION"
+    ) {
+        val existingMessages = messageDao.getMessages(conversationId)
+        val shouldAutoTitle = existingMessages.isEmpty() && userText.isNotBlank()
+        val leafParentId = ConversationTree
+            .resolveActiveBranch(existingMessages, emptyMap())
+            .lastOrNull()?.message?.id
+
+        val userId = messageDao.insert(
+            MessageEntity(
+                conversationId = conversationId,
+                parentMessageId = leafParentId,
+                role = "USER",
+                content = userText.trim()
+            )
+        )
+        messageDao.insert(
+            MessageEntity(
+                conversationId = conversationId,
+                parentMessageId = userId,
+                role = "ASSISTANT",
+                content = assistantText.trim(),
+                modelLabel = modelLabel
+            )
+        )
+        if (shouldAutoTitle) {
+            conversationDao.rename(conversationId, userText.trim().replace("\n", " ").take(40))
+        } else {
+            conversationDao.touch(conversationId)
+        }
     }
 
     suspend fun initializeLockState() = apiKeyVault.initializeLockState()
@@ -605,19 +735,7 @@ class AllChatRepository(
 
     // --- Providers, Models & Personas ---
 
-    val providersFlow: Flow<List<ProviderConfig>> = combine(
-        providerDao.observeProviders(),
-        modelDao.observeAllModels(),
-        apiKeyVault.observeConfiguredProviderIds()
-    ) { providers, models, configuredKeyIds ->
-        val modelsByProvider = models.groupBy { it.providerId }
-        providers.map { p ->
-            p.toDomain(
-                hasApiKey = p.id in configuredKeyIds,
-                models = modelsByProvider[p.id].orEmpty().map { it.toDomain() }
-            )
-        }
-    }
+    val providersFlow: Flow<List<ProviderConfig>> = providerConfigRepository.providersFlow
 
     val personasFlow: Flow<List<PersonaInfo>> = personaDao.observePersonas().map { list ->
         list.map { it.toDomain() }
@@ -686,11 +804,13 @@ class AllChatRepository(
 
     fun observeModelsForCapability(capability: ModelCapability): Flow<List<SelectableModel>> =
         providersFlow.combine(kotlinx.coroutines.flow.flowOf(capability)) { providers, cap ->
-            providers.flatMap { provider ->
-                provider.models
-                    .filter { it.supports(cap) }
-                    .map { SelectableModel(it, provider) }
-            }
+            providers
+                .filter { it.isEnabled }
+                .flatMap { provider ->
+                    provider.models
+                        .filter { it.supports(cap) }
+                        .map { SelectableModel(it, provider) }
+                }
         }
 
     val conversationsFlow: Flow<List<ConversationEntity>> = conversationDao.observeConversations()
@@ -715,47 +835,36 @@ class AllChatRepository(
         type: ProviderType,
         baseUrl: String,
         proxyUrl: String?,
-        apiKey: String?
+        apiKey: String?,
+        defaultModelId: String? = null,
+        isEnabled: Boolean = true,
+        modelIds: List<String>? = null
     ): Long {
-        val cleanProxy = proxyUrl?.trim()?.takeIf { it.isNotEmpty() }
-        val cleanBase = baseUrl.trim().ifEmpty { type.defaultBaseUrl }
-        val id = if (existingId == null || existingId <= 0L) {
-            providerDao.insert(
-                ProviderEntity(
-                    name = name.trim(),
-                    type = type.name,
-                    baseUrl = cleanBase,
-                    proxyUrl = cleanProxy
-                )
-            )
-        } else {
-            val existing = providerDao.getById(existingId)
-            providerDao.update(
-                ProviderEntity(
-                    id = existingId,
-                    name = name.trim(),
-                    type = type.name,
-                    baseUrl = cleanBase,
-                    proxyUrl = cleanProxy,
-                    createdAt = existing?.createdAt ?: System.currentTimeMillis()
-                )
-            )
-            existingId
-        }
-        if (apiKey != null && apiKey.isNotBlank()) {
-            apiKeyVault.saveApiKey(id, apiKey)
-        } else if (existingId == null && apiKey != null && apiKey.isBlank()) {
-            apiKeyVault.deleteApiKey(id)
-        }
-        return id
+        return providerConfigRepository.upsertProvider(
+            existingId = existingId,
+            name = name,
+            type = type,
+            baseUrl = baseUrl,
+            proxyUrl = proxyUrl,
+            apiKey = apiKey,
+            clearApiKey = existingId == null && apiKey != null && apiKey.isBlank(),
+            defaultModelId = defaultModelId,
+            isEnabled = isEnabled,
+            modelIds = modelIds
+        )
     }
 
-    suspend fun getProviderApiKey(providerId: Long): String = apiKeyVault.getApiKey(providerId)
+    suspend fun getProviderApiKey(providerId: Long): String =
+        providerConfigRepository.getDecryptedApiKey(providerId)
 
-    suspend fun deleteProvider(providerId: Long) {
-        apiKeyVault.deleteApiKey(providerId)
-        providerDao.deleteById(providerId)
-    }
+    suspend fun setProviderEnabled(providerId: Long, enabled: Boolean) =
+        providerConfigRepository.setProviderEnabled(providerId, enabled)
+
+    suspend fun setProviderDefaultModel(providerId: Long, modelId: String?) =
+        providerConfigRepository.setDefaultModel(providerId, modelId)
+
+    suspend fun deleteProvider(providerId: Long) =
+        providerConfigRepository.deleteProvider(providerId)
 
     suspend fun testProviderConnection(provider: ProviderConfig): ConnectionTestResult {
         val apiKey = apiKeyVault.getApiKey(provider.id)
@@ -988,21 +1097,32 @@ class AllChatRepository(
         enableWebSearch: Boolean = false,
         autoRouteLabel: String? = null,
         onGroundingStatus: ((String) -> Unit)? = null,
-        onBranchCreated: ((parentKey: Long, newChildId: Long) -> Unit)? = null
+        onBranchCreated: ((parentKey: Long, newChildId: Long) -> Unit)? = null,
+        onSentenceReady: ((String) -> Unit)? = null,
+        onDeviceActionTriggered: ((DeviceAction) -> Unit)? = null,
+        onRequestError: ((String) -> Unit)? = null
     ) {
+        // Re-hydrate fresh provider/baseUrl/proxyUrl right at send time (prevents stale idle state)
+        val freshModel = resolveFreshModel(selectableModel.model.id) ?: selectableModel
         val existingMessages = messageDao.getMessages(conversationId)
         val shouldAutoTitle = existingMessages.isEmpty() && promptText.isNotBlank()
+        // CRITICAL: Always append to the current active leaf if parentMessageId was omitted or stale,
+        // so sending a follow-up never creates a sibling root that hides previous turns.
+        val validExistingIds = existingMessages.map { it.id }.toSet()
+        val effectiveParentId = parentMessageId?.takeIf { it in validExistingIds }
+            ?: ConversationTree.resolveActiveBranch(existingMessages, emptyMap())
+                .lastOrNull()?.message?.id
 
         val userMsgId = messageDao.insert(
             MessageEntity(
                 conversationId = conversationId,
-                parentMessageId = parentMessageId,
+                parentMessageId = effectiveParentId,
                 role = "USER",
                 content = promptText.trim(),
                 attachmentUri = attachmentLocalUri
             )
         )
-        onBranchCreated?.invoke(parentMessageId ?: ConversationTree.ROOT_PARENT_KEY, userMsgId)
+        onBranchCreated?.invoke(effectiveParentId ?: ConversationTree.ROOT_PARENT_KEY, userMsgId)
 
         if (shouldAutoTitle) {
             val autoTitle = promptText.trim().replace("\n", " ").take(40)
@@ -1011,15 +1131,20 @@ class AllChatRepository(
             conversationDao.touch(conversationId)
         }
 
+        val timeoutMs = if (!attachmentLocalUri.isNullOrBlank()) 35_000L else 25_000L
         streamAssistantReply(
             conversationId = conversationId,
             parentUserMessageId = userMsgId,
-            selectableModel = selectableModel,
+            selectableModel = freshModel,
             options = options,
             enableWebSearch = enableWebSearch,
             autoRouteLabel = autoRouteLabel,
             onGroundingStatus = onGroundingStatus,
-            onBranchCreated = onBranchCreated
+            onBranchCreated = onBranchCreated,
+            onSentenceReady = onSentenceReady,
+            onDeviceActionTriggered = onDeviceActionTriggered,
+            onRequestError = onRequestError,
+            timeoutMs = timeoutMs
         )
     }
 
@@ -1095,11 +1220,15 @@ class AllChatRepository(
         enableWebSearch: Boolean = false,
         autoRouteLabel: String? = null,
         onGroundingStatus: ((String) -> Unit)? = null,
-        onBranchCreated: ((parentKey: Long, newChildId: Long) -> Unit)? = null
+        onBranchCreated: ((parentKey: Long, newChildId: Long) -> Unit)? = null,
+        onSentenceReady: ((String) -> Unit)? = null,
+        onDeviceActionTriggered: ((DeviceAction) -> Unit)? = null,
+        onRequestError: ((String) -> Unit)? = null,
+        timeoutMs: Long = 25_000L
     ) {
         val allMessages = messageDao.getMessages(conversationId)
         val branchHistory = ConversationTree.getAncestorChain(allMessages, parentUserMessageId)
-            .filter { !it.isError }
+            .filter { !it.isError && !(it.role == "ASSISTANT" && it.content.isBlank()) }
 
         val latestUserText = branchHistory.lastOrNull { it.role == "USER" }?.content.orEmpty()
         val collectedCitations = mutableListOf<SearchCitation>()
@@ -1247,6 +1376,7 @@ class AllChatRepository(
 
         val apiKey = apiKeyVault.getApiKey(selectableModel.provider.id)
         val buffer = StringBuilder()
+        val ttsSentenceBuffer = StringBuilder()
         val pendingArtifacts = mutableListOf<String>()
         var promptTokens = 0
         var completionTokens = 0
@@ -1263,13 +1393,14 @@ class AllChatRepository(
                 var requestedToolCalls: List<ToolCallInvocation> = emptyList()
                 val roundTextBuffer = StringBuilder()
 
-                aiRouter.streamChat(
-                    provider = selectableModel.provider,
-                    apiKey = apiKey,
-                    modelId = selectableModel.model.modelId,
-                    messages = inputMessages.toList(),
-                    options = effectiveOptions
-                ).collect { event ->
+                withTimeout(timeoutMs) {
+                    aiRouter.streamChat(
+                        provider = selectableModel.provider,
+                        apiKey = apiKey,
+                        modelId = selectableModel.model.modelId,
+                        messages = inputMessages.toList(),
+                        options = effectiveOptions
+                    ).collect { event ->
                     when (event) {
                         is StreamEvent.DebugRequest -> {
                             capturedRequestJson = "// POST ${event.endpointUrl}\n${event.requestJson}"
@@ -1307,6 +1438,24 @@ class AllChatRepository(
                                 val elapsedSec = ((System.currentTimeMillis() - thinkingStartMs!!) / 1000L).toInt().coerceAtLeast(1)
                                 thinkingDurationSec = elapsedSec
                             }
+                            if (onSentenceReady != null) {
+                                val insideThinkBlock = (curText.contains("<think>") && !curText.contains("</think>")) ||
+                                    (curText.contains("<reasoning>") && !curText.contains("</reasoning>"))
+                                if (!insideThinkBlock) {
+                                    ttsSentenceBuffer.append(event.text)
+                                    val currentChunk = ttsSentenceBuffer.toString()
+                                    val breakIdx = findSentenceBreak(currentChunk)
+                                    if (breakIdx > 0) {
+                                        val ready = cleanWidgetAnswerText(currentChunk.substring(0, breakIdx))
+                                        val rem = currentChunk.substring(breakIdx)
+                                        ttsSentenceBuffer.clear()
+                                        ttsSentenceBuffer.append(rem)
+                                        if (ready.length >= 6) {
+                                            onSentenceReady(ready)
+                                        }
+                                    }
+                                }
+                            }
                             val costUsd = CostEstimator.calculateUsd(
                                 promptTokens,
                                 completionTokens,
@@ -1341,6 +1490,7 @@ class AllChatRepository(
                         StreamEvent.Completed -> Unit
                     }
                 }
+                }
 
                 if (requestedToolCalls.isEmpty() || toolRound >= maxToolRounds) {
                     break
@@ -1353,11 +1503,22 @@ class AllChatRepository(
                     toolCalls = requestedToolCalls
                 )
 
+                val savedContacts = quickContactsFlow.first()
+                val savedCustomApps = customAppsFlow.first()
                 val traceLines = mutableListOf<String>()
                 for (tc in requestedToolCalls) {
                     onGroundingStatus?.invoke("TOOL // Executing ${tc.name}…")
-                    val outcome = ClientToolEngine.executeTool(tc.name, tc.argumentsJson, webSearchClient)
+                    val outcome = ClientToolEngine.executeTool(
+                        name = tc.name,
+                        argumentsJson = tc.argumentsJson,
+                        webSearchClient = webSearchClient,
+                        contacts = savedContacts,
+                        customApps = savedCustomApps
+                    )
                     onGroundingStatus?.invoke(outcome.displaySummary)
+                    outcome.triggeredDeviceAction?.let { triggered ->
+                        onDeviceActionTriggered?.invoke(triggered)
+                    }
                     traceLines += "> **${outcome.displaySummary}**"
                     outcome.inlineArtifactMarkdown?.let { pendingArtifacts += it }
                     inputMessages += ChatInputMessage(
@@ -1398,6 +1559,13 @@ class AllChatRepository(
                 )
             }
 
+            if (onSentenceReady != null) {
+                val tail = cleanWidgetAnswerText(ttsSentenceBuffer.toString())
+                if (tail.isNotBlank()) {
+                    onSentenceReady(tail)
+                }
+            }
+
             if (thinkingStartMs != null && thinkingDurationSec == null) {
                 thinkingDurationSec = ((System.currentTimeMillis() - thinkingStartMs!!) / 1000L).toInt().coerceAtLeast(1)
             }
@@ -1426,6 +1594,31 @@ class AllChatRepository(
             } else {
                 conversationDao.touch(conversationId)
             }
+        } catch (tce: TimeoutCancellationException) {
+            val timeoutSec = (timeoutMs / 1000L).toInt()
+            val timeoutMsg = "Request timed out after ${timeoutSec}s on ${selectableModel.model.displayName}. Check your network/Base URL or tap Retry."
+            val errContent = if (buffer.isNotEmpty()) {
+                "${buffer}\n\n---\n**Timeout:** $timeoutMsg"
+            } else {
+                timeoutMsg
+            }
+            messageDao.updateStreamingMessage(
+                id = assistantId,
+                content = errContent,
+                promptTokens = promptTokens.takeIf { it > 0 },
+                completionTokens = completionTokens.takeIf { it > 0 },
+                isError = true,
+                suggestProxySetting = true,
+                providerIdForError = selectableModel.provider.id
+            )
+            messageDao.updateMessageExtras(
+                id = assistantId,
+                citationsJson = WebSearchClient.citationsToJson(collectedCitations),
+                thinkingDurationSec = thinkingDurationSec,
+                rawRequestJson = capturedRequestJson,
+                rawResponseJson = rawResponseSamples.toString().takeIf { it.isNotBlank() }
+            )
+            onRequestError?.invoke(timeoutMsg)
         } catch (ce: kotlinx.coroutines.CancellationException) {
             if (buffer.isEmpty()) {
                 messageDao.updateStreamingMessage(
@@ -1448,6 +1641,9 @@ class AllChatRepository(
                 AiErrorCategory.UNKNOWN,
                 t.message ?: "Request failed."
             )
+            if (isRateLimitError(aiEx)) {
+                modelCooldownUntilMs[selectableModel.model.id] = System.currentTimeMillis() + 60_000L
+            }
             val errContent = if (buffer.isNotEmpty()) {
                 "${buffer}\n\n---\n**Error:** ${aiEx.message}"
             } else {
@@ -1469,6 +1665,7 @@ class AllChatRepository(
                 rawRequestJson = capturedRequestJson,
                 rawResponseJson = rawResponseSamples.toString().takeIf { it.isNotBlank() }
             )
+            onRequestError?.invoke(aiEx.message)
         }
     }
 
@@ -2114,6 +2311,7 @@ class AllChatRepository(
 
     suspend fun quickAskForWidget(
         prompt: String,
+        history: List<Pair<String, String>> = emptyList(),
         onPartialUpdate: (modelLabel: String, partialText: String) -> Unit
     ): Pair<String, String> = withContext(Dispatchers.IO) {
         val available = observeModelsForCapability(ModelCapability.TEXT_CHAT).first()
@@ -2121,7 +2319,11 @@ class AllChatRepository(
             throw IllegalStateException("No Text Chat model configured. Open AllChat → Settings to add an API key.")
         }
 
-        val latestConvModelId = conversationsFlow.first().firstOrNull()?.selectedModelDbId
+        val activeConvId = getOrCreateActiveConversationId(
+            defaultTitle = prompt.trim().replace("\n", " ").take(40).ifBlank { "Widget Chat" }
+        )
+        val latestConvModelId = conversationsFlow.first().firstOrNull { it.id == activeConvId }?.selectedModelDbId
+            ?: conversationsFlow.first().firstOrNull()?.selectedModelDbId
         val preferredKeywords = listOf(
             "gemini-2.5", "gemini-2.0", "gpt-4o", "gpt-4.1", "claude-3", "claude-sonnet",
             "llama-3.3", "llama-3.1", "deepseek", "qwen", "instruct", "chat"
@@ -2143,33 +2345,66 @@ class AllChatRepository(
             }
         }.trim()
 
+        // Build full conversation context from accumulated widget history (or active Room thread)
+        val priorMessages = if (history.isNotEmpty()) {
+            history.map { (role, text) -> ChatInputMessage(role = role, text = text) }
+        } else {
+            val dbMsgs = messageDao.getMessages(activeConvId)
+            ConversationTree.resolveActiveBranch(dbMsgs, emptyMap())
+                .map { it.message }
+                .filter { !it.isError && it.content.isNotBlank() }
+                .takeLast(16)
+                .map { ChatInputMessage(role = it.role, text = it.content) }
+        }
+
+        val fullInputMessages = buildList {
+            addAll(priorMessages)
+            add(ChatInputMessage(role = "USER", text = prompt.trim()))
+        }
+
         val apiKey = apiKeyVault.getApiKey(selectedModel.provider.id)
         val modelLabel = selectedModel.model.displayName
         val buffer = StringBuilder()
         var lastEmitMs = 0L
 
-        aiRouter.streamChat(
-            provider = selectedModel.provider,
-            apiKey = apiKey,
-            modelId = selectedModel.model.modelId,
-            messages = listOf(ChatInputMessage(role = "USER", text = prompt.trim())),
-            options = ChatOptions(systemPrompt = systemPrompt, maxTokens = 512)
-        ).collect { event ->
-            if (event is StreamEvent.TextDelta) {
-                buffer.append(event.text)
-                val now = System.currentTimeMillis()
-                if (now - lastEmitMs >= 350L) {
-                    lastEmitMs = now
-                    val cleaned = cleanWidgetAnswerText(buffer.toString())
-                    if (cleaned.isNotBlank()) {
-                        onPartialUpdate(modelLabel, cleaned)
+        try {
+            withTimeout(25_000L) {
+                aiRouter.streamChat(
+                    provider = selectedModel.provider,
+                    apiKey = apiKey,
+                    modelId = selectedModel.model.modelId,
+                    messages = fullInputMessages,
+                    options = ChatOptions(systemPrompt = systemPrompt, maxTokens = 512)
+                ).collect { event ->
+                    if (event is StreamEvent.TextDelta) {
+                        buffer.append(event.text)
+                        val now = System.currentTimeMillis()
+                        if (now - lastEmitMs >= 350L) {
+                            lastEmitMs = now
+                            val cleaned = cleanWidgetAnswerText(buffer.toString())
+                            if (cleaned.isNotBlank()) {
+                                onPartialUpdate(modelLabel, cleaned)
+                            }
+                        }
                     }
                 }
             }
+        } catch (tce: TimeoutCancellationException) {
+            throw IllegalStateException("Request timed out after 25s on $modelLabel. Tap Ask to retry.")
         }
 
         val finalAnswer = cleanWidgetAnswerText(buffer.toString())
             .ifBlank { "No response received from $modelLabel." }
+
+        // Persist the widget Q&A turn into the shared active conversation in Room
+        runCatching {
+            appendInstantExchange(
+                conversationId = activeConvId,
+                userText = prompt.trim(),
+                assistantText = finalAnswer,
+                modelLabel = modelLabel
+            )
+        }
         modelLabel to finalAnswer
     }
 
@@ -2183,5 +2418,435 @@ class AllChatRepository(
             .replace(Regex("""`([^`]+)`"""), "$1")
             .replace(Regex("""^#+\s*""", RegexOption.MULTILINE), "")
             .trim()
+    }
+
+    // --- Smart Follow-Up Suggestion Chips ---
+
+    suspend fun generateFollowUpChips(
+        userPrompt: String,
+        assistantReply: String,
+        selectableModel: SelectableModel
+    ): List<String> = withContext(Dispatchers.IO) {
+        if (assistantReply.length < 40) return@withContext emptyList()
+        val apiKey = apiKeyVault.getApiKey(selectableModel.provider.id)
+        val prompt = """
+            Based on this Q&A turn, suggest exactly 3 concise, high-value follow-up prompts the user might tap next on mobile (3 to 7 words each, no numbering, no quotes).
+            Return STRICTLY a JSON array of 3 strings, e.g. ["Show a working code example", "Explain the trade-offs", "Convert to a checklist"].
+
+            User: ${userPrompt.take(500)}
+            Assistant: ${assistantReply.take(1500)}
+        """.trimIndent()
+        val raw = runCatching {
+            collectSingleCompletion(selectableModel, apiKey, prompt) {}
+        }.getOrDefault("")
+        val arrStr = extractJsonArray(raw) ?: return@withContext emptyList()
+        runCatching {
+            val arr = JSONArray(arrStr)
+            buildList {
+                for (i in 0 until arr.length().coerceAtMost(3)) {
+                    val item = arr.optString(i).trim()
+                    if (item.length in 3..64) add(item)
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    // --- Hands-Free Live Voice Conversation Loop (Sentence-by-Sentence Streaming) ---
+
+    suspend fun streamLiveVoiceReply(
+        history: List<Pair<String, String>>,
+        userText: String,
+        selectableModel: SelectableModel,
+        onPartialFullText: (String) -> Unit,
+        onSentenceReady: (String) -> Unit
+    ): String = withContext(Dispatchers.IO) {
+        val apiKey = apiKeyVault.getApiKey(selectableModel.provider.id)
+        val enabledMemories = userMemoryDao.getEnabled()
+        val sysPrompt = buildString {
+            appendLine("You are AllChat in Hands-Free Live Voice Conversation mode.")
+            appendLine("Respond naturally in spoken conversational sentences (2-4 sentences unless asked for more). Avoid markdown formatting, code fences, or bullet symbols so text-to-speech reads smoothly.")
+            if (enabledMemories.isNotEmpty()) {
+                appendLine("User Memory:")
+                enabledMemories.forEach { appendLine("- ${it.fact}") }
+            }
+        }.trim()
+
+        val messages = buildList {
+            history.takeLast(8).forEach { (role, content) ->
+                add(ChatInputMessage(role = role, text = content))
+            }
+            add(ChatInputMessage(role = "USER", text = userText.trim()))
+        }
+
+        val fullBuffer = StringBuilder()
+        val sentenceBuffer = StringBuilder()
+
+        aiRouter.streamChat(
+            provider = selectableModel.provider,
+            apiKey = apiKey,
+            modelId = selectableModel.model.modelId,
+            messages = messages,
+            options = ChatOptions(systemPrompt = sysPrompt, maxTokens = 512)
+        ).collect { event ->
+            if (event is StreamEvent.TextDelta) {
+                fullBuffer.append(event.text)
+                sentenceBuffer.append(event.text)
+                onPartialFullText(cleanWidgetAnswerText(fullBuffer.toString()))
+
+                // Flush completed sentences immediately to TTS for low-latency conversation
+                val current = sentenceBuffer.toString()
+                val breakIdx = findSentenceBreak(current)
+                if (breakIdx > 0) {
+                    val readySentence = current.substring(0, breakIdx).trim()
+                    val remainder = current.substring(breakIdx)
+                    sentenceBuffer.clear()
+                    sentenceBuffer.append(remainder)
+                    if (readySentence.length >= 6) {
+                        onSentenceReady(cleanWidgetAnswerText(readySentence))
+                    }
+                }
+            }
+        }
+
+        val tail = cleanWidgetAnswerText(sentenceBuffer.toString())
+        if (tail.isNotBlank()) {
+            onSentenceReady(tail)
+        }
+        cleanWidgetAnswerText(fullBuffer.toString())
+    }
+
+    private fun findSentenceBreak(text: String): Int {
+        for (i in text.indices) {
+            val ch = text[i]
+            if ((ch == '.' || ch == '!' || ch == '?' || ch == '\n') && i >= 18) {
+                val nextIsBoundary = i == text.lastIndex || text[i + 1].isWhitespace()
+                if (nextIsBoundary) return i + 1
+            }
+        }
+        return -1
+    }
+
+    // --- Save Bitmap (Region Snip / Live Camera Viewfinder Frame) as Local Attachment ---
+
+    suspend fun saveBitmapAsAttachment(bitmap: Bitmap, prefix: String = "snip"): String = withContext(Dispatchers.IO) {
+        val dir = File(context.filesDir, "attachments").apply { mkdirs() }
+        val file = File(dir, "${prefix}_${System.currentTimeMillis()}.jpg")
+        FileOutputStream(file).use { out ->
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 88, out)
+        }
+        Uri.fromFile(file).toString()
+    }
+
+    // --- Batch Multi-Document Extraction (5-10 PDFs/TXT/MD at once) ---
+
+    suspend fun extractMultipleDocuments(uris: List<Uri>): List<Pair<String, String>> = withContext(Dispatchers.IO) {
+        val capped = uris.take(10)
+        val perDocLimit = if (capped.size >= 5) 5500 else 10_000
+        capped.mapNotNull { uri ->
+            runCatching {
+                val doc = DocumentExtractor.extractFromUri(context, uri)
+                doc.title to doc.text.take(perDocLimit)
+            }.getOrNull()
+        }
+    }
+
+    // --- Tone & Rewrite Studio ---
+
+    suspend fun rewriteText(
+        inputText: String,
+        preset: RewritePreset,
+        customInstruction: String,
+        selectableModel: SelectableModel
+    ): String = withContext(Dispatchers.IO) {
+        val apiKey = apiKeyVault.getApiKey(selectableModel.provider.id)
+        val extra = customInstruction.trim().takeIf { it.isNotEmpty() }?.let { "\nAdditional instruction: $it" } ?: ""
+        val prompt = """
+            ${preset.instruction}$extra
+            Return ONLY the rewritten final text with zero preamble, no quotes around the whole message, and no commentary.
+
+            Original text:
+            ${inputText.trim()}
+        """.trimIndent()
+        collectSingleCompletion(selectableModel, apiKey, prompt) {}.trim()
+    }
+
+    // --- Code & Error Debugger Mode ---
+
+    suspend fun debugCodeAndError(
+        codeOrTrace: String,
+        language: String,
+        contextNote: String,
+        selectableModel: SelectableModel
+    ): CodeDebugResult = withContext(Dispatchers.IO) {
+        val apiKey = apiKeyVault.getApiKey(selectableModel.provider.id)
+        val extraCtx = contextNote.trim().takeIf { it.isNotEmpty() }?.let { "\nExtra context: $it" } ?: ""
+        val prompt = """
+            You are a senior Staff Software Engineer debugging an error or broken code snippet ($language).$extraCtx
+            Analyze the root cause and produce a clean, complete fixed code patch.
+            Return STRICTLY valid JSON (no markdown fences, no commentary outside JSON) with this exact schema:
+            {
+              "rootCause": "One crisp headline naming the exact root cause",
+              "severity": "CRITICAL | HIGH | MEDIUM | LOW",
+              "explanation": "Concise 2-4 sentence technical breakdown of why this happens",
+              "fixedCode": "Complete corrected code / patch ready to paste",
+              "patchSummary": "One-line summary of the exact diff/fix applied",
+              "verificationSteps": ["Step 1 to verify fix", "Step 2 to verify edge case"]
+            }
+
+            Stack Trace / Broken Code:
+            ${codeOrTrace.take(14_000)}
+        """.trimIndent()
+        val raw = collectSingleCompletion(selectableModel, apiKey, prompt) {}
+        val jsonStr = extractJsonObject(raw)
+            ?: throw IllegalStateException("Model did not return structured JSON for Code Debugger.")
+        val obj = JSONObject(jsonStr)
+        val stepsArr = obj.optJSONArray("verificationSteps") ?: JSONArray()
+        val steps = buildList {
+            for (i in 0 until stepsArr.length()) {
+                val s = stepsArr.optString(i).trim()
+                if (s.isNotEmpty()) add(s)
+            }
+        }
+        CodeDebugResult(
+            rootCause = obj.optString("rootCause").ifBlank { "Root Cause Identified" },
+            severity = obj.optString("severity", "HIGH").uppercase(),
+            explanation = obj.optString("explanation").ifBlank { "See fixed patch below." },
+            fixedCode = obj.optString("fixedCode").ifBlank { raw },
+            patchSummary = obj.optString("patchSummary").ifBlank { "Applied fix for reported error." },
+            verificationSteps = steps
+        )
+    }
+
+    // --- YouTube Video / Lecture Extractor ---
+
+    suspend fun extractYouTubeStudyNotes(
+        rawUrl: String,
+        selectableModel: SelectableModel,
+        onStatus: (String) -> Unit
+    ): YouTubeStudyResult = withContext(Dispatchers.IO) {
+        onStatus("YOUTUBE // Fetching video metadata & timed captions…")
+        val extracted = youtubeExtractorClient.fetchVideoAndTranscript(rawUrl)
+        onStatus(
+            if (extracted.hasTimestampedCaptions) {
+                "YOUTUBE // Captions extracted (${extracted.transcriptText.length} chars). Generating study notes…"
+            } else {
+                "YOUTUBE // Metadata fetched. Generating chapters & takeaways with ${selectableModel.model.displayName}…"
+            }
+        )
+        val apiKey = apiKeyVault.getApiKey(selectableModel.provider.id)
+        val transcriptSection = if (extracted.transcriptText.isNotBlank()) {
+            """
+            Transcript / Page Content:
+            ${extracted.transcriptText.take(22_000)}
+            """.trimIndent()
+        } else {
+            "No public captions were exposed; analyze this YouTube video URL and title carefully using your knowledge and grounding: ${extracted.canonicalUrl}"
+        }
+
+        val prompt = """
+            Analyze this YouTube video/lecture and generate comprehensive, cleanly structured Markdown study notes.
+            Video Title: ${extracted.title}
+            Channel: ${extracted.author}
+            URL: ${extracted.canonicalUrl}
+
+            Produce these exact sections in Markdown:
+            ## 1. Executive Overview
+            (2-3 concise sentences)
+
+            ## 2. Timestamped Chapters
+            (Bulleted chapters with `[MM:SS]` timestamps where available from the transcript, each with a crisp summary)
+
+            ## 3. Key Takeaways
+            (5-8 high-signal actionable takeaways)
+
+            ## 4. Structured Study Notes & Definitions
+            (Organized concepts, formulas, code/steps, or mental models taught in the video)
+
+            $transcriptSection
+        """.trimIndent()
+
+        val options = ChatOptions(
+            enableGeminiGoogleSearch = selectableModel.provider.type == ProviderType.GEMINI && !extracted.hasTimestampedCaptions
+        )
+        val buffer = StringBuilder()
+        aiRouter.streamChat(
+            provider = selectableModel.provider,
+            apiKey = apiKey,
+            modelId = selectableModel.model.modelId,
+            messages = listOf(ChatInputMessage(role = "USER", text = prompt)),
+            options = options
+        ).collect { event ->
+            if (event is StreamEvent.TextDelta) {
+                buffer.append(event.text)
+            }
+        }
+
+        YouTubeStudyResult(
+            videoId = extracted.videoId,
+            canonicalUrl = extracted.canonicalUrl,
+            title = extracted.title,
+            author = extracted.author,
+            hasTimestampedCaptions = extracted.hasTimestampedCaptions,
+            markdownNotes = buffer.toString().trim().ifBlank { "No notes generated." }
+        )
+    }
+
+    // --- Live Lens Zero-Prompt Camera Auto-Explainer & Live Translator (with 429 Auto-Failover) ---
+
+    private fun isRateLimitError(t: Throwable): Boolean {
+        if (t is AiException && t.category == AiErrorCategory.RATE_LIMIT) return true
+        val msg = t.message.orEmpty().lowercase()
+        return msg.contains("429") ||
+            msg.contains("resource_exhausted") ||
+            msg.contains("rate limit") ||
+            msg.contains("rate_limit") ||
+            msg.contains("too many requests") ||
+            msg.contains("quota exceeded") ||
+            msg.contains("requests per minute")
+    }
+
+    suspend fun analyzeLiveLensFrame(
+        bitmap: Bitmap,
+        mode: LiveLensMode,
+        targetLanguage: String,
+        preferredModel: SelectableModel?,
+        onModelFailover: ((String) -> Unit)? = null
+    ): LiveLensAnalysisResult = withContext(Dispatchers.IO) {
+        val available = observeModelsForCapability(ModelCapability.TEXT_CHAT).first()
+        val visionModels = available.filter { it.model.supportsImageInput }.ifEmpty { available }
+        if (visionModels.isEmpty()) {
+            throw IllegalStateException("No Vision-capable model configured. Open Settings to add Gemini, GPT-4o, or Claude.")
+        }
+
+        // Build priority fallback queue:
+        // 1. User-configured Vision Fallback Queue in Settings / Live Lens
+        // 2. Currently selected / preferred model (if vision-capable)
+        // 3. Remaining vision-capable models across all configured providers
+        val configuredPriorityIds = visionFallbackModelIdsFlow.first()
+        val orderedCandidates = buildList {
+            val addedIds = hashSetOf<Long>()
+            configuredPriorityIds.forEach { id ->
+                visionModels.firstOrNull { it.model.id == id }?.let { m ->
+                    if (addedIds.add(m.model.id)) add(m)
+                }
+            }
+            if (preferredModel != null) {
+                visionModels.firstOrNull { it.model.id == preferredModel.model.id }?.let { freshPref ->
+                    if (addedIds.add(freshPref.model.id)) add(freshPref)
+                }
+            }
+            visionModels.forEach { m ->
+                if (addedIds.add(m.model.id)) add(m)
+            }
+        }
+
+        val nowMs = System.currentTimeMillis()
+        val readyModels = orderedCandidates.filter { (modelCooldownUntilMs[it.model.id] ?: 0L) <= nowMs }
+        val coolingModels = orderedCandidates
+            .filter { (modelCooldownUntilMs[it.model.id] ?: 0L) > nowMs }
+            .sortedBy { modelCooldownUntilMs[it.model.id] ?: 0L }
+        val attemptOrder = (readyModels + coolingModels)
+
+        val savedUri = saveBitmapAsAttachment(bitmap, prefix = "lens")
+        val (imgBase64, imgMime) = ImageEncoder.encodeFromStoredUri(context, savedUri)
+            ?: throw IllegalStateException("Could not encode live camera frame.")
+
+        val systemInstruction = when (mode) {
+            LiveLensMode.AUTO_EXPLAIN ->
+                "Identify, explain, and summarize what is shown in this image clearly and concisely without waiting for further questions."
+            LiveLensMode.LIVE_TRANSLATOR ->
+                "Extract all visible text in this image and translate it cleanly into $targetLanguage, preserving layout context."
+        }
+        val userPrompt = when (mode) {
+            LiveLensMode.AUTO_EXPLAIN ->
+                "Analyze this live camera view right now."
+            LiveLensMode.LIVE_TRANSLATOR ->
+                "Read all visible text in this camera frame and translate it cleanly into $targetLanguage."
+        }
+
+        var lastError: Throwable? = null
+        var lastFailoverNotice: String? = null
+
+        for (index in attemptOrder.indices) {
+            val candidate = attemptOrder[index]
+            val apiKey = apiKeyVault.getApiKey(candidate.provider.id)
+            val buffer = StringBuilder()
+            try {
+                withTimeout(35_000L) {
+                    aiRouter.streamChat(
+                        provider = candidate.provider,
+                        apiKey = apiKey,
+                        modelId = candidate.model.modelId,
+                        messages = listOf(
+                            ChatInputMessage(
+                                role = "USER",
+                                text = userPrompt,
+                                imageBase64 = imgBase64,
+                                imageMimeType = imgMime
+                            )
+                        ),
+                        options = ChatOptions(systemPrompt = systemInstruction, maxTokens = 700)
+                    ).collect { event ->
+                        if (event is StreamEvent.TextDelta) {
+                            buffer.append(event.text)
+                        }
+                    }
+                }
+                val resultText = cleanWidgetAnswerText(buffer.toString())
+                    .ifBlank { "Could not read details from this frame. Hold steady and try again." }
+                return@withContext LiveLensAnalysisResult(
+                    modelLabel = "${candidate.model.displayName} · ${candidate.provider.name}",
+                    answer = resultText,
+                    failoverNotice = lastFailoverNotice
+                )
+            } catch (tce: TimeoutCancellationException) {
+                lastError = IllegalStateException("Vision request timed out after 35s on ${candidate.model.displayName}.")
+                if (index + 1 < attemptOrder.size) {
+                    val next = attemptOrder[index + 1]
+                    val notice = "Timeout on ${candidate.model.displayName} — auto-switched to ${next.model.displayName}"
+                    lastFailoverNotice = notice
+                    onModelFailover?.invoke(notice)
+                    continue
+                }
+            } catch (t: Throwable) {
+                if (t is kotlinx.coroutines.CancellationException) throw t
+                lastError = t
+                if (isRateLimitError(t)) {
+                    // Put rate-limited model on 60-second cooldown and auto-switch immediately!
+                    modelCooldownUntilMs[candidate.model.id] = System.currentTimeMillis() + 60_000L
+                    if (index + 1 < attemptOrder.size) {
+                        val next = attemptOrder[index + 1]
+                        val notice = "Rate limit hit on ${candidate.model.displayName} — auto-switched to ${next.model.displayName}"
+                        lastFailoverNotice = notice
+                        onModelFailover?.invoke(notice)
+                        continue
+                    }
+                } else {
+                    throw t
+                }
+            }
+        }
+
+        throw lastError ?: IllegalStateException("All configured vision models are currently rate-limited. Wait 60s or add another provider in Settings.")
+    }
+
+    suspend fun resolvePreferredChatModel(): SelectableModel? = withContext(Dispatchers.IO) {
+        val available = observeModelsForCapability(ModelCapability.TEXT_CHAT).first()
+        if (available.isEmpty()) return@withContext null
+        val persistedModelId = activeModelDbIdFlow.first()
+        val activeConvId = activeConversationIdFlow.first()
+        val allConvs = conversationsFlow.first()
+        val activeConvModelId = allConvs.firstOrNull { it.id == activeConvId }?.selectedModelDbId
+            ?: allConvs.firstOrNull()?.selectedModelDbId
+        val preferredKeywords = listOf(
+            "gemini-2.5", "gemini-2.0", "gpt-4o", "gpt-4.1", "claude-3", "claude-sonnet",
+            "llama-3.3", "llama-3.1", "deepseek", "qwen", "instruct", "chat"
+        )
+        available.firstOrNull { it.model.id == persistedModelId }
+            ?: available.firstOrNull { it.model.id == activeConvModelId }
+            ?: preferredKeywords.firstNotNullOfOrNull { kw ->
+                available.firstOrNull { it.model.modelId.contains(kw, ignoreCase = true) }
+            }
+            ?: available.first()
     }
 }

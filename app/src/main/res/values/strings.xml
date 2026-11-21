@@ -16,4 +16,8 @@
     <string name="shortcut_clipboard_long">Summarize Clipboard Text</string>
     <string name="shortcut_image_short">Generate Image</string>
     <string name="shortcut_image_long">Open Image Studio</string>
+    <string name="shortcut_assistant_short">Assistant</string>
+    <string name="shortcut_assistant_long">Open Voice &amp; Lens Assistant</string>
+    <string name="shortcut_lens_short">Live Lens</string>
+    <string name="shortcut_lens_long">Live Camera Explainer &amp; Translator</string>
 </resources>

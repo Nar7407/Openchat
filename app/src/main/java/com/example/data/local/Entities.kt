@@ -1,22 +1,31 @@
 package com.example.data.local
 
+import androidx.room.Embedded
 import androidx.room.Entity
 import androidx.room.ForeignKey
 import androidx.room.Index
 import androidx.room.PrimaryKey
+import androidx.room.Relation
 import com.example.domain.model.ModelInfo
 import com.example.domain.model.PersonaInfo
 import com.example.domain.model.ProviderConfig
 import com.example.domain.model.ProviderType
 
-@Entity(tableName = "providers")
+@Entity(
+    tableName = "providers",
+    indices = [Index("name")]
+)
 data class ProviderEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val name: String,
     val type: String,
     val baseUrl: String,
     val proxyUrl: String? = null,
-    val createdAt: Long = System.currentTimeMillis()
+    val encryptedApiKey: String? = null,
+    val defaultModelId: String? = null,
+    val isEnabled: Boolean = true,
+    val createdAt: Long = System.currentTimeMillis(),
+    val updatedAt: Long = createdAt
 ) {
     fun toDomain(hasApiKey: Boolean, models: List<ModelInfo>): ProviderConfig {
         val parsedType = runCatching { ProviderType.valueOf(type) }.getOrDefault(ProviderType.OPENAI_COMPATIBLE)
@@ -26,9 +35,12 @@ data class ProviderEntity(
             type = parsedType,
             baseUrl = baseUrl,
             proxyUrl = proxyUrl,
-            hasApiKey = hasApiKey,
+            hasApiKey = hasApiKey || !encryptedApiKey.isNullOrBlank(),
             models = models,
-            createdAt = createdAt
+            createdAt = createdAt,
+            defaultModelId = defaultModelId,
+            isEnabled = isEnabled,
+            updatedAt = updatedAt
         )
     }
 }
@@ -43,7 +55,7 @@ data class ProviderEntity(
             onDelete = ForeignKey.CASCADE
         )
     ],
-    indices = [Index("providerId")]
+    indices = [Index("providerId"), Index(value = ["providerId", "modelId"], unique = true)]
 )
 data class ModelEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
@@ -70,6 +82,23 @@ data class ModelEntity(
         supportsSummarization = supportsSummarization,
         inputPricePerMillion = inputPricePerMillion,
         outputPricePerMillion = outputPricePerMillion
+    )
+}
+
+/**
+ * One-to-many Room relation pairing a custom AI [ProviderEntity] with its persisted [ModelEntity] list.
+ */
+data class ProviderWithModels(
+    @Embedded val provider: ProviderEntity,
+    @Relation(
+        parentColumn = "id",
+        entityColumn = "providerId"
+    )
+    val models: List<ModelEntity>
+) {
+    fun toDomain(hasVaultKey: Boolean = false): ProviderConfig = provider.toDomain(
+        hasApiKey = hasVaultKey || !provider.encryptedApiKey.isNullOrBlank(),
+        models = models.sortedBy { it.displayName.lowercase() }.map { it.toDomain() }
     )
 }
 

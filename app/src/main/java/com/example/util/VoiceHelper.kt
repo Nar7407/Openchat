@@ -3,6 +3,8 @@ package com.example.util
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -16,7 +18,8 @@ class VoiceInputController(
     private val onPartialText: (String) -> Unit,
     private val onFinalText: (String) -> Unit,
     private val onListeningChanged: (Boolean) -> Unit,
-    private val onFailure: (String) -> Unit
+    private val onFailure: (String) -> Unit,
+    private val onRmsChanged: (Float) -> Unit = {}
 ) {
     private var recognizer: SpeechRecognizer? = null
     private var active = false
@@ -40,7 +43,10 @@ class VoiceInputController(
             }
 
             override fun onBeginningOfSpeech() = Unit
-            override fun onRmsChanged(rmsdB: Float) = Unit
+            override fun onRmsChanged(rmsdB: Float) {
+                this@VoiceInputController.onRmsChanged.invoke(rmsdB)
+            }
+
             override fun onBufferReceived(buffer: ByteArray?) = Unit
             override fun onEndOfSpeech() {
                 active = false
@@ -111,10 +117,13 @@ class VoiceInputController(
 
 class ReadAloudController(
     context: Context,
-    private val onSpeakingIdChanged: (Long?) -> Unit
+    private val onSpeakingIdChanged: (Long?) -> Unit,
+    private val onQueueDrained: () -> Unit = {}
 ) {
     private var ready = false
     private var pendingSpeech: Pair<Long, String>? = null
+    private val pendingQueue = mutableListOf<String>()
+    private val activeUtteranceIds = java.util.Collections.synchronizedSet(mutableSetOf<String>())
     private var currentId: Long? = null
 
     private val tts: TextToSpeech = TextToSpeech(context.applicationContext) { status ->
@@ -125,28 +134,42 @@ class ReadAloudController(
                 pendingSpeech = null
                 speak(id, text)
             }
+            if (pendingQueue.isNotEmpty()) {
+                val queued = pendingQueue.toList()
+                pendingQueue.clear()
+                queued.forEach { enqueueSentence(it) }
+            }
         }
     }
 
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val ttsRef: TextToSpeech? get() = tts
+
+    private fun handleUtteranceFinished(utteranceId: String?) {
+        if (utteranceId != null) activeUtteranceIds.remove(utteranceId)
+        if (activeUtteranceIds.isEmpty()) {
+            currentId = null
+            mainHandler.post {
+                onSpeakingIdChanged(null)
+                onQueueDrained()
+            }
+        }
+    }
 
     init {
         tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) = Unit
             override fun onDone(utteranceId: String?) {
-                currentId = null
-                onSpeakingIdChanged(null)
+                handleUtteranceFinished(utteranceId)
             }
 
             @Deprecated("Deprecated in Android API")
             override fun onError(utteranceId: String?) {
-                currentId = null
-                onSpeakingIdChanged(null)
+                handleUtteranceFinished(utteranceId)
             }
 
             override fun onError(utteranceId: String?, errorCode: Int) {
-                currentId = null
-                onSpeakingIdChanged(null)
+                handleUtteranceFinished(utteranceId)
             }
         })
     }
@@ -166,15 +189,35 @@ class ReadAloudController(
             pendingSpeech = messageId to clean
             return
         }
+        activeUtteranceIds.clear()
         currentId = messageId
         onSpeakingIdChanged(messageId)
         val utteranceId = UUID.randomUUID().toString()
+        activeUtteranceIds.add(utteranceId)
         tts.speak(clean.take(3800), TextToSpeech.QUEUE_FLUSH, null, utteranceId)
     }
+
+    fun enqueueSentence(rawSentence: String) {
+        val clean = stripMarkdownForSpeech(rawSentence)
+        if (clean.isBlank()) return
+        if (!ready) {
+            pendingQueue += clean
+            return
+        }
+        val utteranceId = UUID.randomUUID().toString()
+        activeUtteranceIds.add(utteranceId)
+        currentId = -1L
+        onSpeakingIdChanged(-1L)
+        tts.speak(clean.take(1500), TextToSpeech.QUEUE_ADD, null, utteranceId)
+    }
+
+    fun hasActiveSpeech(): Boolean = activeUtteranceIds.isNotEmpty() || pendingQueue.isNotEmpty()
 
     fun stop() {
         currentId = null
         pendingSpeech = null
+        pendingQueue.clear()
+        activeUtteranceIds.clear()
         onSpeakingIdChanged(null)
         runCatching { tts.stop() }
     }
@@ -186,6 +229,7 @@ class ReadAloudController(
 
     private fun stripMarkdownForSpeech(input: String): String {
         return input
+            .replace(Regex("<think>[\\s\\S]*?</think>", RegexOption.IGNORE_CASE), "")
             .replace(Regex("```[\\s\\S]*?```"), " code block omitted. ")
             .replace(Regex("`([^`]*)`"), "$1")
             .replace(Regex("!\\[[^\\]]*\\]\\([^)]*\\)"), "")

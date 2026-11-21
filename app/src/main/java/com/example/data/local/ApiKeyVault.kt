@@ -6,12 +6,16 @@ import android.security.keystore.KeyProperties
 import android.util.Base64
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.example.domain.model.AutoRouterConfig
+import com.example.domain.model.CustomAppEntry
 import com.example.domain.model.CustomSlashCommand
 import com.example.domain.model.DisplayCurrency
 import com.example.domain.model.McpServerConfig
+import com.example.domain.model.QuickContact
 import com.example.domain.model.WebSearchProvider
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -67,6 +71,12 @@ class ApiKeyVault(private val context: Context) {
         val KEY_AUTO_ROUTER_CONFIG = stringPreferencesKey("auto_router_config_json")
         val KEY_AUTO_ROUTE_ENABLED = booleanPreferencesKey("auto_route_enabled")
         val KEY_AUTO_EXTRACT_MEMORIES = booleanPreferencesKey("auto_extract_memories")
+        val KEY_ACTIVE_CONVERSATION_ID = longPreferencesKey("active_conversation_id")
+        val KEY_ACTIVE_MODEL_ID = longPreferencesKey("active_model_db_id")
+        val KEY_QUICK_CONTACTS = stringPreferencesKey("quick_contacts_json")
+        val KEY_CUSTOM_APPS = stringPreferencesKey("custom_apps_json")
+        val KEY_VISION_FALLBACK_IDS = stringPreferencesKey("vision_fallback_model_ids_json")
+        val KEY_LENS_INTERVAL_SEC = intPreferencesKey("live_lens_interval_sec")
     }
 
     private val sessionPinKey = MutableStateFlow<SecretKey?>(null)
@@ -152,6 +162,144 @@ class ApiKeyVault(private val context: Context) {
 
     val autoExtractMemoriesFlow: Flow<Boolean> = context.keyVaultDataStore.data.map { prefs ->
         prefs[KEY_AUTO_EXTRACT_MEMORIES] ?: false
+    }
+
+    val activeConversationIdFlow: Flow<Long?> = context.keyVaultDataStore.data.map { prefs ->
+        prefs[KEY_ACTIVE_CONVERSATION_ID]?.takeIf { it > 0L }
+    }
+
+    suspend fun setActiveConversationId(conversationId: Long?) {
+        context.keyVaultDataStore.edit { prefs ->
+            if (conversationId == null || conversationId <= 0L) {
+                prefs.remove(KEY_ACTIVE_CONVERSATION_ID)
+            } else {
+                prefs[KEY_ACTIVE_CONVERSATION_ID] = conversationId
+            }
+        }
+    }
+
+    val activeModelDbIdFlow: Flow<Long?> = context.keyVaultDataStore.data.map { prefs ->
+        prefs[KEY_ACTIVE_MODEL_ID]?.takeIf { it > 0L }
+    }
+
+    suspend fun setActiveModelDbId(modelDbId: Long?) {
+        context.keyVaultDataStore.edit { prefs ->
+            if (modelDbId == null || modelDbId <= 0L) {
+                prefs.remove(KEY_ACTIVE_MODEL_ID)
+            } else {
+                prefs[KEY_ACTIVE_MODEL_ID] = modelDbId
+            }
+        }
+    }
+
+    val quickContactsFlow: Flow<List<QuickContact>> = context.keyVaultDataStore.data.map { prefs ->
+        val raw = prefs[KEY_QUICK_CONTACTS].orEmpty()
+        if (raw.isBlank()) return@map emptyList()
+        runCatching {
+            val arr = JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    val id = o.optString("id")
+                    val name = o.optString("name")
+                    val phone = o.optString("phoneNumber")
+                    if (name.isNotBlank() && phone.isNotBlank()) {
+                        add(QuickContact(id = id.ifBlank { "c_$i" }, name = name, phoneNumber = phone))
+                    }
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    suspend fun saveQuickContact(contact: QuickContact) {
+        val current = quickContactsFlow.first().toMutableList()
+        val id = contact.id.ifBlank { "qc_${System.currentTimeMillis()}" }
+        val normalized = contact.copy(id = id, name = contact.name.trim(), phoneNumber = contact.phoneNumber.trim())
+        val idx = current.indexOfFirst { it.id == id || it.name.equals(normalized.name, ignoreCase = true) }
+        if (idx >= 0) current[idx] = normalized else current.add(0, normalized)
+        val arr = JSONArray()
+        current.forEach { c ->
+            arr.put(JSONObject().put("id", c.id).put("name", c.name).put("phoneNumber", c.phoneNumber))
+        }
+        context.keyVaultDataStore.edit { it[KEY_QUICK_CONTACTS] = arr.toString() }
+    }
+
+    suspend fun deleteQuickContact(id: String) {
+        val updated = quickContactsFlow.first().filterNot { it.id == id }
+        val arr = JSONArray()
+        updated.forEach { c ->
+            arr.put(JSONObject().put("id", c.id).put("name", c.name).put("phoneNumber", c.phoneNumber))
+        }
+        context.keyVaultDataStore.edit { it[KEY_QUICK_CONTACTS] = arr.toString() }
+    }
+
+    val customAppsFlow: Flow<List<CustomAppEntry>> = context.keyVaultDataStore.data.map { prefs ->
+        val raw = prefs[KEY_CUSTOM_APPS].orEmpty()
+        if (raw.isBlank()) return@map emptyList()
+        runCatching {
+            val arr = JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    val id = o.optString("id")
+                    val name = o.optString("name")
+                    val pkg = o.optString("packageName")
+                    if (name.isNotBlank() && pkg.isNotBlank()) {
+                        add(CustomAppEntry(id = id.ifBlank { "app_$i" }, name = name, packageName = pkg))
+                    }
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    suspend fun saveCustomApp(entry: CustomAppEntry) {
+        val current = customAppsFlow.first().toMutableList()
+        val id = entry.id.ifBlank { "app_${System.currentTimeMillis()}" }
+        val clean = entry.copy(id = id, name = entry.name.trim(), packageName = entry.packageName.trim())
+        val idx = current.indexOfFirst { it.id == id || it.packageName.equals(clean.packageName, ignoreCase = true) }
+        if (idx >= 0) current[idx] = clean else current.add(0, clean)
+        val arr = JSONArray()
+        current.forEach { a ->
+            arr.put(JSONObject().put("id", a.id).put("name", a.name).put("packageName", a.packageName))
+        }
+        context.keyVaultDataStore.edit { it[KEY_CUSTOM_APPS] = arr.toString() }
+    }
+
+    suspend fun deleteCustomApp(id: String) {
+        val updated = customAppsFlow.first().filterNot { it.id == id }
+        val arr = JSONArray()
+        updated.forEach { a ->
+            arr.put(JSONObject().put("id", a.id).put("name", a.name).put("packageName", a.packageName))
+        }
+        context.keyVaultDataStore.edit { it[KEY_CUSTOM_APPS] = arr.toString() }
+    }
+
+    val visionFallbackModelIdsFlow: Flow<List<Long>> = context.keyVaultDataStore.data.map { prefs ->
+        val raw = prefs[KEY_VISION_FALLBACK_IDS].orEmpty()
+        if (raw.isBlank()) return@map emptyList()
+        runCatching {
+            val arr = JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val v = arr.optLong(i, -1L)
+                    if (v > 0L) add(v)
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    suspend fun setVisionFallbackModelIds(ids: List<Long>) {
+        val arr = JSONArray()
+        ids.distinct().forEach { arr.put(it) }
+        context.keyVaultDataStore.edit { it[KEY_VISION_FALLBACK_IDS] = arr.toString() }
+    }
+
+    val liveLensIntervalSecFlow: Flow<Int> = context.keyVaultDataStore.data.map { prefs ->
+        prefs[KEY_LENS_INTERVAL_SEC] ?: 0
+    }
+
+    suspend fun setLiveLensIntervalSec(seconds: Int) {
+        context.keyVaultDataStore.edit { it[KEY_LENS_INTERVAL_SEC] = seconds.coerceIn(0, 60) }
     }
 
     val autoRouterConfigFlow: Flow<AutoRouterConfig> = context.keyVaultDataStore.data.map { prefs ->
@@ -467,6 +615,17 @@ class ApiKeyVault(private val context: Context) {
         md.update(key.encoded)
         md.update("allchat_vault_verifier_v2".toByteArray(Charsets.UTF_8))
         return md.digest()
+    }
+
+    fun encryptSecret(plainText: String): String {
+        val clean = plainText.trim()
+        if (clean.isEmpty()) return ""
+        return encryptForStorage(clean)
+    }
+
+    fun decryptSecret(encoded: String?): String {
+        if (encoded.isNullOrBlank()) return ""
+        return decryptFromStorage(encoded)
     }
 
     private fun encryptForStorage(plainText: String): String {

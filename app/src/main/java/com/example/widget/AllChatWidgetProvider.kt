@@ -107,11 +107,15 @@ class AllChatWidgetProvider : AppWidgetProvider() {
 
             if (state.hasContent) {
                 views.setViewVisibility(R.id.widget_answer_container, View.VISIBLE)
-                views.setTextViewText(R.id.widget_question_text, "Q // ${state.question}")
-                views.setTextViewText(R.id.widget_answer_text, state.answer)
+                val turnCount = state.turns.count { it.role == "USER" }.coerceAtLeast(1)
+                views.setTextViewText(
+                    R.id.widget_question_text,
+                    "THREAD ($turnCount) // ${state.question}"
+                )
+                views.setTextViewText(R.id.widget_answer_text, state.formattedTranscript())
                 views.setTextViewText(
                     R.id.widget_btn_ask,
-                    if (state.isLoading) "ASKING…" else "ASK ANOTHER…"
+                    if (state.isLoading) "ASKING…" else "FOLLOW UP…"
                 )
             } else {
                 views.setViewVisibility(R.id.widget_answer_container, View.GONE)

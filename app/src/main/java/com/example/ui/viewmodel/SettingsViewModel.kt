@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.remote.ConnectionTestResult
 import com.example.data.repository.AllChatRepository
 import com.example.domain.model.AutoRouterConfig
+import com.example.domain.model.CustomAppEntry
 import com.example.domain.model.DisplayCurrency
 import com.example.domain.model.ModelCapability
 import com.example.domain.model.ModelInfo
@@ -13,6 +14,7 @@ import com.example.domain.model.ProviderCategory
 import com.example.domain.model.ProviderConfig
 import com.example.domain.model.ProviderPreset
 import com.example.domain.model.ProviderType
+import com.example.domain.model.QuickContact
 import com.example.domain.model.SelectableModel
 import com.example.domain.model.WebSearchProvider
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -33,7 +35,9 @@ data class ProviderEditorState(
     val apiKey: String = "",
     val hasExistingKey: Boolean = false,
     val requiresApiKey: Boolean = true,
-    val helperHint: String = ProviderCatalog.defaultPreset.helperHint
+    val helperHint: String = ProviderCatalog.defaultPreset.helperHint,
+    val customModelsText: String = "",
+    val isEnabled: Boolean = true
 ) {
     val hasUrlPlaceholders: Boolean
         get() = baseUrl.contains('<') && baseUrl.contains('>')
@@ -59,8 +63,14 @@ data class SettingsUiState(
     val hasSearchApiKey: Boolean = false,
     val autoRouterConfig: AutoRouterConfig = AutoRouterConfig(),
     val textChatModels: List<SelectableModel> = emptyList(),
-    val isImportingHistory: Boolean = false
-)
+    val isImportingHistory: Boolean = false,
+    val quickContacts: List<QuickContact> = emptyList(),
+    val customApps: List<CustomAppEntry> = emptyList(),
+    val visionFallbackModelIds: List<Long> = emptyList()
+) {
+    val visionModels: List<SelectableModel>
+        get() = textChatModels.filter { it.model.supportsImageInput }.ifEmpty { textChatModels }
+}
 
 class SettingsViewModel(
     private val repository: AllChatRepository
@@ -139,6 +149,18 @@ class SettingsViewModel(
             autoRouterConfig = power.autoRouterConfig,
             textChatModels = power.textChatModels,
             isImportingHistory = power.isImportingHistory
+        )
+    }.combine(
+        combine(
+            repository.quickContactsFlow,
+            repository.customAppsFlow,
+            repository.visionFallbackModelIdsFlow
+        ) { contacts, apps, fallbackIds -> Triple(contacts, apps, fallbackIds) }
+    ) { state, (contacts, apps, fallbackIds) ->
+        state.copy(
+            quickContacts = contacts,
+            customApps = apps,
+            visionFallbackModelIds = fallbackIds
         )
     }.stateIn(
         scope = viewModelScope,
@@ -253,6 +275,47 @@ class SettingsViewModel(
         }
     }
 
+    // --- Quick Contacts, Custom App Packages & Live Lens 429 Failover Queue ---
+
+    fun saveQuickContact(name: String, phoneNumber: String) {
+        val cleanName = name.trim()
+        val cleanPhone = phoneNumber.trim()
+        if (cleanName.isBlank() || cleanPhone.isBlank()) return
+        viewModelScope.launch {
+            repository.saveQuickContact(QuickContact(name = cleanName, phoneNumber = cleanPhone))
+            vaultStatusMessage.value = "CONTACTS // Saved $cleanName ($cleanPhone)."
+        }
+    }
+
+    fun deleteQuickContact(id: String) {
+        viewModelScope.launch {
+            repository.deleteQuickContact(id)
+        }
+    }
+
+    fun saveCustomApp(name: String, packageName: String) {
+        val cleanName = name.trim()
+        val cleanPkg = packageName.trim()
+        if (cleanName.isBlank() || cleanPkg.isBlank()) return
+        viewModelScope.launch {
+            repository.saveCustomApp(CustomAppEntry(name = cleanName, packageName = cleanPkg))
+            vaultStatusMessage.value = "APPS // Added $cleanName ($cleanPkg)."
+        }
+    }
+
+    fun deleteCustomApp(id: String) {
+        viewModelScope.launch {
+            repository.deleteCustomApp(id)
+        }
+    }
+
+    fun updateVisionFallbackQueue(ids: List<Long>) {
+        viewModelScope.launch {
+            repository.setVisionFallbackModelIds(ids)
+            vaultStatusMessage.value = "FAILOVER // Updated Live Lens vision priority queue (${ids.size} model${if (ids.size == 1) "" else "s"})."
+        }
+    }
+
     // --- Model Token Pricing ---
 
     fun openModelPricing(model: ModelInfo) {
@@ -345,7 +408,9 @@ class SettingsViewModel(
                 apiKey = existingKey,
                 hasExistingKey = provider.hasApiKey,
                 requiresApiKey = true,
-                helperHint = ""
+                helperHint = "",
+                customModelsText = provider.models.joinToString(", ") { it.modelId },
+                isEnabled = provider.isEnabled
             )
         }
     }
@@ -367,7 +432,9 @@ class SettingsViewModel(
         type: ProviderType? = null,
         baseUrl: String? = null,
         proxyUrl: String? = null,
-        apiKey: String? = null
+        apiKey: String? = null,
+        customModelsText: String? = null,
+        isEnabled: Boolean? = null
     ) {
         editorState.update { current ->
             val newType = type ?: current.type
@@ -381,7 +448,9 @@ class SettingsViewModel(
                 type = newType,
                 baseUrl = newBase,
                 proxyUrl = proxyUrl ?: current.proxyUrl,
-                apiKey = apiKey ?: current.apiKey
+                apiKey = apiKey ?: current.apiKey,
+                customModelsText = customModelsText ?: current.customModelsText,
+                isEnabled = isEnabled ?: current.isEnabled
             )
         }
     }
@@ -393,6 +462,8 @@ class SettingsViewModel(
     fun saveEditorProvider() {
         val current = editorState.value
         if (current.name.isBlank()) return
+        val parsedModels = ProviderConfigViewModel.parseModelListInput(current.customModelsText)
+        val shouldSyncModels = current.editingProviderId != null || parsedModels.isNotEmpty()
         viewModelScope.launch {
             repository.saveProvider(
                 existingId = current.editingProviderId,
@@ -400,9 +471,18 @@ class SettingsViewModel(
                 type = current.type,
                 baseUrl = current.baseUrl,
                 proxyUrl = current.proxyUrl,
-                apiKey = current.apiKey
+                apiKey = current.apiKey,
+                defaultModelId = parsedModels.firstOrNull(),
+                isEnabled = current.isEnabled,
+                modelIds = if (shouldSyncModels) parsedModels else null
             )
             dismissEditor()
+        }
+    }
+
+    fun toggleProviderEnabled(providerId: Long, enabled: Boolean) {
+        viewModelScope.launch {
+            repository.setProviderEnabled(providerId, enabled)
         }
     }
 

@@ -1,0 +1,1394 @@
+package com.example.ui.components
+
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.outlined.Alarm
+import androidx.compose.material.icons.outlined.Build
+import androidx.compose.material.icons.outlined.Call
+import androidx.compose.material.icons.outlined.CameraAlt
+import androidx.compose.material.icons.outlined.Chat
+import androidx.compose.material.icons.outlined.DeleteOutline
+import androidx.compose.material.icons.outlined.History
+import androidx.compose.material.icons.outlined.Language
+import androidx.compose.material.icons.outlined.PlayCircleOutline
+import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Translate
+import androidx.compose.material.icons.outlined.VolumeOff
+import androidx.compose.material.icons.outlined.VolumeUp
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.data.local.ConversationEntity
+import com.example.data.local.MessageEntity
+import com.example.data.repository.AllChatRepository
+import com.example.domain.model.ChatOptions
+import com.example.domain.model.ConversationTree
+import com.example.domain.model.ModelCapability
+import com.example.domain.model.QuickContact
+import com.example.domain.model.SelectableModel
+import com.example.ui.theme.SwissCanvas
+import com.example.ui.theme.SwissConcrete
+import com.example.ui.theme.SwissInk
+import com.example.ui.theme.SwissMuted
+import com.example.ui.theme.SwissPaper
+import com.example.ui.theme.SwissSignalRed
+import com.example.ui.theme.SwissSubtleFill
+import com.example.ui.theme.SwissVerifiedInk
+import com.example.ui.theme.SwissWhite
+import com.example.util.DeviceAction
+import com.example.util.DeviceActionEngine
+import com.example.util.ReadAloudController
+import com.example.util.VoiceInputController
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import kotlin.math.sin
+
+@OptIn(ExperimentalCoroutinesApi::class)
+@Composable
+fun AssistantOverlaySheet(
+    repository: AllChatRepository,
+    autoStartMic: Boolean = true,
+    onOpenTranslateCamera: () -> Unit,
+    onOpenLiveLensExplain: (() -> Unit)? = null,
+    onOpenFullApp: (() -> Unit)? = null,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val scope = rememberCoroutineScope()
+
+    // Sync directly to the active persisted Room conversation shared with Main Chat & Mini-Window
+    val allConversations by repository.conversationsFlow.collectAsStateWithLifecycle(initialValue = emptyList())
+    val availableModels by remember(repository) {
+        repository.observeModelsForCapability(ModelCapability.TEXT_CHAT)
+    }.collectAsStateWithLifecycle(initialValue = emptyList())
+    val persistedModelDbId by repository.activeModelDbIdFlow.collectAsStateWithLifecycle(initialValue = null)
+    val quickContacts by repository.quickContactsFlow.collectAsStateWithLifecycle(initialValue = emptyList())
+    val customApps by repository.customAppsFlow.collectAsStateWithLifecycle(initialValue = emptyList())
+
+    val activeConvIdFlow = remember(repository) {
+        combine(
+            repository.activeConversationIdFlow,
+            repository.conversationsFlow
+        ) { storedId, allConvs ->
+            when {
+                storedId != null && allConvs.any { it.id == storedId } -> storedId
+                allConvs.isNotEmpty() -> allConvs.first().id
+                else -> null
+            }
+        }
+    }
+    val activeConvId by activeConvIdFlow.collectAsStateWithLifecycle(initialValue = null)
+
+    val persistedMessagesFlow = remember(repository) {
+        activeConvIdFlow.flatMapLatest { convId ->
+            if (convId == null) flowOf(emptyList()) else repository.observeMessages(convId)
+        }
+    }
+    val allPersistedMessages by persistedMessagesFlow.collectAsStateWithLifecycle(initialValue = emptyList())
+    val visibleMessages by remember(allPersistedMessages) {
+        derivedStateOf {
+            ConversationTree.resolveActiveBranch(allPersistedMessages, emptyMap()).map { it.message }
+        }
+    }
+
+    var selectedModel by remember { mutableStateOf<SelectableModel?>(null) }
+    var showModelPicker by remember { mutableStateOf(false) }
+    var showHistoryDrawer by remember { mutableStateOf(false) }
+    var historySearch by remember { mutableStateOf("") }
+
+    var isListening by remember { mutableStateOf(false) }
+    var isStreaming by remember { mutableStateOf(false) }
+    var muteTts by remember { mutableStateOf(false) }
+    var webSearchEnabled by remember { mutableStateOf(false) }
+    var toolsEnabled by remember { mutableStateOf(true) }
+    var liveRms by remember { mutableFloatStateOf(0f) }
+    var transcriptInput by remember { mutableStateOf("") }
+    var pendingAction by remember { mutableStateOf<DeviceAction?>(null) }
+    var statusBanner by remember { mutableStateOf<String?>(null) }
+    var errorBanner by remember { mutableStateOf<String?>(null) }
+    var lastFailedPrompt by remember { mutableStateOf<String?>(null) }
+    var activeJob by remember { mutableStateOf<Job?>(null) }
+
+    val listState = rememberLazyListState()
+    var autoScrollEnabled by remember { mutableStateOf(true) }
+
+    val isScrolledUp by remember {
+        derivedStateOf {
+            visibleMessages.isNotEmpty() && listState.canScrollForward
+        }
+    }
+
+    // Keep selectedModel synced with activeModelDbIdFlow and freshly hydrated provider settings
+    LaunchedEffect(availableModels, persistedModelDbId) {
+        selectedModel = availableModels.firstOrNull { it.model.id == persistedModelDbId }
+            ?: runCatching { repository.resolveFreshModel(persistedModelDbId) }.getOrNull()
+            ?: availableModels.firstOrNull()
+    }
+
+    // Wake / Re-hydrate provider config cleanly on ON_RESUME after idle gaps
+    DisposableEffect(lifecycleOwner, repository) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                scope.launch {
+                    runCatching { repository.resolveFreshModel() }
+                        .getOrNull()
+                        ?.let { selectedModel = it }
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // Pause auto-scroll if the user manually scrolls up; resume when reaching the bottom
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress to listState.canScrollForward }
+            .collect { (scrolling, canScrollDown) ->
+                if (scrolling && canScrollDown) {
+                    autoScrollEnabled = false
+                } else if (!canScrollDown) {
+                    autoScrollEnabled = true
+                }
+            }
+    }
+
+    // Smart auto-scroll on new messages and live streaming deltas
+    val lastMessage = visibleMessages.lastOrNull()
+    LaunchedEffect(visibleMessages.size, lastMessage?.id, lastMessage?.content?.length) {
+        if (visibleMessages.isEmpty()) return@LaunchedEffect
+        val lastIdx = visibleMessages.lastIndex
+        if (autoScrollEnabled) {
+            if (isStreaming) {
+                listState.scrollToItem(lastIdx)
+            } else {
+                listState.animateScrollToItem(lastIdx)
+            }
+        }
+    }
+
+    val ttsController = remember(context) {
+        ReadAloudController(
+            context = context,
+            onSpeakingIdChanged = {}
+        )
+    }
+
+    fun cancelInFlightRequest() {
+        activeJob?.cancel()
+        activeJob = null
+        isStreaming = false
+        ttsController.stop()
+    }
+
+    fun startFreshConversation() {
+        cancelInFlightRequest()
+        pendingAction = null
+        errorBanner = null
+        lastFailedPrompt = null
+        showHistoryDrawer = false
+        scope.launch {
+            val freshModel = runCatching { repository.resolveFreshModel(selectedModel?.model?.id) }.getOrNull()
+            val newId = repository.createConversation("New Chat", freshModel?.model?.id, null)
+            repository.setActiveConversationId(newId)
+            autoScrollEnabled = true
+            statusBanner = "OK // Started fresh conversation. Previous thread saved."
+        }
+    }
+
+    fun handlePromptSubmission(rawPrompt: String) {
+        val clean = rawPrompt.trim()
+        if (clean.isEmpty()) return
+        transcriptInput = ""
+        statusBanner = null
+        errorBanner = null
+        lastFailedPrompt = null
+        autoScrollEnabled = true
+
+        // 1. Check Instant Device Action Parser first (Calls, WhatsApp, YouTube, Alarms, Timers, App Launch)
+        val parsedAction = DeviceActionEngine.parseFromPrompt(clean, quickContacts, customApps)
+        if (parsedAction != null) {
+            pendingAction = parsedAction
+            val spoken = "Ready to ${parsedAction.title}. Tap the confirmation button to execute."
+            if (!muteTts) ttsController.speak(System.currentTimeMillis(), spoken)
+            scope.launch {
+                val convId = activeConvId ?: repository.getOrCreateActiveConversationId(
+                    defaultTitle = clean.take(40)
+                )
+                repository.appendInstantExchange(
+                    conversationId = convId,
+                    userText = clean,
+                    assistantText = spoken,
+                    modelLabel = parsedAction.badge
+                )
+            }
+            return
+        }
+
+        // 2. Append user turn & stream assistant reply into the persisted Room conversation
+        //    reading fresh provider baseUrl / proxyUrl / API key / modelId at exact send time.
+        cancelInFlightRequest()
+        pendingAction = null
+        activeJob = scope.launch {
+            isStreaming = true
+            try {
+                val freshModel = repository.resolveFreshModel(selectedModel?.model?.id)
+                    ?: throw IllegalStateException("No AI model configured. Open Settings to add a provider & API key.")
+                selectedModel = freshModel
+                val convId = activeConvId ?: repository.getOrCreateActiveConversationId(
+                    defaultTitle = clean.take(40),
+                    modelDbId = freshModel.model.id
+                )
+                val leafId = visibleMessages.lastOrNull()?.id
+                var hadRequestError = false
+                repository.sendChatMessage(
+                    conversationId = convId,
+                    promptText = clean,
+                    attachmentLocalUri = null,
+                    selectableModel = freshModel,
+                    parentMessageId = leafId,
+                    options = ChatOptions(
+                        systemPrompt = "You are AllChat Assistant in Quick Overlay mode. Answer clearly, concisely, and naturally while remembering all prior turns in this conversation. When the user asks to call someone, send a WhatsApp message, play/open YouTube, set an alarm/timer, or open an app, call the execute_device_action tool.",
+                        enableTools = toolsEnabled
+                    ),
+                    enableWebSearch = webSearchEnabled,
+                    onGroundingStatus = { status -> statusBanner = status },
+                    onSentenceReady = { sentence ->
+                        if (!muteTts) ttsController.enqueueSentence(sentence)
+                    },
+                    onDeviceActionTriggered = { triggered ->
+                        pendingAction = triggered
+                    },
+                    onRequestError = { msg ->
+                        hadRequestError = true
+                        errorBanner = msg
+                        lastFailedPrompt = clean
+                    }
+                )
+                if (!hadRequestError) {
+                    errorBanner = null
+                    lastFailedPrompt = null
+                }
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (err: Throwable) {
+                errorBanner = err.message ?: "Assistant request failed. Tap Retry to try again."
+                lastFailedPrompt = clean
+            } finally {
+                isStreaming = false
+            }
+        }
+    }
+
+    val voiceController = remember(context) {
+        VoiceInputController(
+            context = context,
+            onPartialText = { partial -> transcriptInput = partial },
+            onFinalText = { finalText ->
+                val trimmed = finalText.trim()
+                if (trimmed.isNotEmpty()) {
+                    handlePromptSubmission(trimmed)
+                }
+            },
+            onListeningChanged = { active -> isListening = active },
+            onFailure = { err -> statusBanner = err },
+            onRmsChanged = { rms -> liveRms = ((rms + 2f) / 12f).coerceIn(0f, 1f) }
+        )
+    }
+
+    DisposableEffect(voiceController, ttsController) {
+        onDispose {
+            activeJob?.cancel()
+            voiceController.release()
+            ttsController.release()
+        }
+    }
+
+    val micPermLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+        onResult = { granted ->
+            if (granted) {
+                voiceController.start()
+            } else {
+                statusBanner = "Microphone permission denied. You can still type below."
+            }
+        }
+    )
+
+    fun startMic() {
+        ttsController.stop()
+        val granted = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+        if (granted) {
+            voiceController.start()
+        } else {
+            micPermLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    LaunchedEffect(autoStartMic) {
+        if (autoStartMic) {
+            startMic()
+        }
+    }
+
+    val infiniteTransition = rememberInfiniteTransition(label = "assistant_wave")
+    val wavePhase by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 6.28318f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1200, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "wave_phase"
+    )
+
+    val filteredHistory = remember(allConversations, historySearch) {
+        val q = historySearch.trim()
+        if (q.isEmpty()) allConversations
+        else allConversations.filter { it.title.contains(q, ignoreCase = true) }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.55f))
+            .clickable(onClick = onDismiss)
+            .imePadding(),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        // Fixed-height flex-column overlay sheet:
+        // Pinned Header + Scrollable Message List (weight 1f) + Pinned Bottom Input Bar
+        Surface(
+            color = SwissCanvas,
+            shape = RectangleShape,
+            border = BorderStroke(1.dp, SwissInk),
+            modifier = Modifier
+                .fillMaxWidth()
+                .fillMaxHeight(0.86f)
+                .clickable(enabled = false) {}
+                .testTag("assistant_overlay_sheet")
+        ) {
+            Box(modifier = Modifier.fillMaxSize()) {
+                Column(modifier = Modifier.fillMaxSize()) {
+                    // 1. PINNED TOP HEADER
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(SwissInk)
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        // Clickable Model Selector Pill
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable { showModelPicker = !showModelPicker }
+                                .padding(end = 8.dp)
+                                .testTag("assistant_model_selector_pill")
+                        ) {
+                            Text(
+                                text = "ASSISTANT // TAP TO SWITCH MODEL",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissSignalRed,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(3.dp)
+                            ) {
+                                Text(
+                                    text = selectedModel?.let { "${it.model.displayName} · ${it.provider.name}" }
+                                        ?: "NO MODEL — CONFIGURE IN SETTINGS",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = SwissWhite,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f, fill = false)
+                                )
+                                Icon(
+                                    imageVector = Icons.Filled.KeyboardArrowDown,
+                                    contentDescription = "Select model",
+                                    tint = SwissSignalRed,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
+
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(7.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            // History Clock Icon Button (opens scrollable thread drawer inside Assistant)
+                            Box(
+                                modifier = Modifier
+                                    .border(
+                                        1.dp,
+                                        if (showHistoryDrawer) SwissSignalRed else SwissWhite.copy(alpha = 0.65f),
+                                        RectangleShape
+                                    )
+                                    .background(if (showHistoryDrawer) SwissSignalRed else Color.Transparent)
+                                    .clickable {
+                                        showModelPicker = false
+                                        showHistoryDrawer = !showHistoryDrawer
+                                    }
+                                    .padding(horizontal = 6.dp, vertical = 4.dp)
+                                    .testTag("assistant_overlay_history")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Outlined.History,
+                                    contentDescription = "Assistant Chat History",
+                                    tint = SwissWhite,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+
+                            // Explicit New Chat / Clear Button (aborts in-flight jobs & resets cleanly)
+                            Row(
+                                modifier = Modifier
+                                    .border(1.dp, SwissWhite.copy(alpha = 0.7f), RectangleShape)
+                                    .clickable { startFreshConversation() }
+                                    .padding(horizontal = 6.dp, vertical = 4.dp)
+                                    .testTag("assistant_overlay_new_chat"),
+                                horizontalArrangement = Arrangement.spacedBy(2.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Add,
+                                    contentDescription = "New Chat",
+                                    tint = SwissWhite,
+                                    modifier = Modifier.size(13.dp)
+                                )
+                                Text(
+                                    text = "NEW",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SwissWhite
+                                )
+                            }
+
+                            if (onOpenFullApp != null) {
+                                Text(
+                                    text = "[FULL]",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SwissWhite,
+                                    modifier = Modifier
+                                        .clickable(onClick = onOpenFullApp)
+                                        .padding(vertical = 4.dp)
+                                )
+                            }
+
+                            Icon(
+                                imageVector = if (muteTts) Icons.Outlined.VolumeOff else Icons.Outlined.VolumeUp,
+                                contentDescription = "Toggle voice reply",
+                                tint = if (muteTts) SwissConcrete else SwissSignalRed,
+                                modifier = Modifier
+                                    .size(20.dp)
+                                    .clickable {
+                                        muteTts = !muteTts
+                                        if (muteTts) ttsController.stop()
+                                    }
+                            )
+
+                            Icon(
+                                imageVector = Icons.Filled.Close,
+                                contentDescription = "Close assistant",
+                                tint = SwissWhite,
+                                modifier = Modifier
+                                    .size(22.dp)
+                                    .clickable(onClick = onDismiss)
+                                    .testTag("assistant_overlay_close")
+                            )
+                        }
+                    }
+
+                    // Inline Model Picker Dropdown when header pill is tapped
+                    AnimatedVisibility(visible = showModelPicker) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(SwissPaper)
+                                .border(1.dp, SwissInk, RectangleShape)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(SwissSubtleFill)
+                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "SELECT ACTIVE MODEL // SYNCED ACROSS ALLCHAT",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SwissMuted
+                                )
+                                Text(
+                                    text = "[CLOSE]",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SwissSignalRed,
+                                    modifier = Modifier.clickable { showModelPicker = false }
+                                )
+                            }
+                            if (availableModels.isEmpty()) {
+                                Text(
+                                    text = "No models configured yet. Add a provider & fetch models in Settings.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = SwissMuted,
+                                    modifier = Modifier.padding(12.dp)
+                                )
+                            } else {
+                                LazyColumn(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .heightIn(max = 190.dp)
+                                ) {
+                                    items(availableModels, key = { it.model.id }) { candidate ->
+                                        val isActive = candidate.model.id == selectedModel?.model?.id
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .background(if (isActive) SwissInk else SwissPaper)
+                                                .clickable {
+                                                    selectedModel = candidate
+                                                    showModelPicker = false
+                                                    scope.launch {
+                                                        repository.setActiveModelDbId(candidate.model.id)
+                                                        activeConvId?.let { cid ->
+                                                            repository.updateConversationModel(cid, candidate.model.id)
+                                                        }
+                                                    }
+                                                }
+                                                .padding(horizontal = 12.dp, vertical = 9.dp),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = candidate.model.displayName,
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = if (isActive) SwissWhite else SwissInk,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                                Text(
+                                                    text = "${candidate.provider.name} · ${candidate.model.modelId}",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = if (isActive) SwissSignalRed else SwissMuted,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                            }
+                                            if (isActive) {
+                                                Text(
+                                                    text = "ACTIVE",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = SwissSignalRed
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Compact Live Audio Waveform Visualizer Strip (Pinned under header)
+                    Canvas(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(28.dp)
+                            .background(SwissInk)
+                            .padding(horizontal = 16.dp)
+                    ) {
+                        val barCount = 28
+                        val spacing = size.width / barCount
+                        val midY = size.height / 2f
+                        for (i in 0 until barCount) {
+                            val norm = i / barCount.toFloat()
+                            val envelope = sin(norm * Math.PI).toFloat()
+                            val amplitude = when {
+                                isListening -> (0.25f + liveRms * 0.75f) * envelope * (0.65f + 0.35f * sin(wavePhase + i * 0.5f))
+                                isStreaming -> 0.55f * envelope * (0.5f + 0.5f * sin(wavePhase * 1.4f + i * 0.6f))
+                                else -> 0.08f * envelope
+                            }
+                            val barHalfH = (size.height * 0.40f * amplitude).coerceAtLeast(2f)
+                            val x = spacing * i + spacing / 2f
+                            drawLine(
+                                color = if (isListening || isStreaming) SwissSignalRed else SwissConcrete,
+                                start = Offset(x, midY - barHalfH),
+                                end = Offset(x, midY + barHalfH),
+                                strokeWidth = (spacing * 0.45f).coerceIn(3f, 8f),
+                                cap = StrokeCap.Butt
+                            )
+                        }
+                    }
+
+                    // Quick-Action & Parity Controls Strip (Pinned under waveform)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(SwissPaper)
+                            .padding(horizontal = 10.dp, vertical = 7.dp)
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        AssistantQuickChip(
+                            icon = Icons.Outlined.Language,
+                            label = if (webSearchEnabled) "SEARCH: ON" else "SEARCH",
+                            accent = webSearchEnabled,
+                            onClick = { webSearchEnabled = !webSearchEnabled },
+                            testTag = "assist_chip_web_search"
+                        )
+                        AssistantQuickChip(
+                            icon = Icons.Outlined.Build,
+                            label = if (toolsEnabled) "TOOLS: ON" else "TOOLS",
+                            accent = toolsEnabled,
+                            onClick = { toolsEnabled = !toolsEnabled },
+                            testTag = "assist_chip_tools"
+                        )
+                        AssistantQuickChip(
+                            icon = Icons.Outlined.CameraAlt,
+                            label = "LIVE LENS",
+                            onClick = {
+                                voiceController.stop()
+                                ttsController.stop()
+                                (onOpenLiveLensExplain ?: onOpenTranslateCamera).invoke()
+                            },
+                            testTag = "assist_chip_live_lens"
+                        )
+                        AssistantQuickChip(
+                            icon = Icons.Outlined.Translate,
+                            label = "TRANSLATE",
+                            onClick = {
+                                voiceController.stop()
+                                ttsController.stop()
+                                onOpenTranslateCamera()
+                            },
+                            testTag = "assist_chip_translate_cam"
+                        )
+                        AssistantQuickChip(
+                            icon = Icons.Outlined.Call,
+                            label = "CALL",
+                            onClick = {
+                                pendingAction = DeviceAction.DialPhone("")
+                                statusBanner = "Pick a Quick Contact or type a number below."
+                            },
+                            testTag = "assist_chip_call"
+                        )
+                        AssistantQuickChip(
+                            icon = Icons.Outlined.Chat,
+                            label = "WHATSAPP",
+                            onClick = {
+                                pendingAction = DeviceAction.SendWhatsApp(phoneNumber = "", message = "")
+                                statusBanner = "Pick a Quick Contact or enter a WhatsApp number below."
+                            },
+                            testTag = "assist_chip_whatsapp"
+                        )
+                        AssistantQuickChip(
+                            icon = Icons.Outlined.PlayCircleOutline,
+                            label = "YOUTUBE",
+                            onClick = { handlePromptSubmission("Open YouTube") },
+                            testTag = "assist_chip_youtube"
+                        )
+                        AssistantQuickChip(
+                            icon = Icons.Outlined.Alarm,
+                            label = "TIMER 5M",
+                            onClick = { handlePromptSubmission("Set a timer for 5 minutes") },
+                            testTag = "assist_chip_timer"
+                        )
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(1.dp)
+                            .background(SwissInk)
+                    )
+
+                    // 2. SCROLLABLE MULTI-TURN CONVERSATION AREA (flex: 1)
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
+                            .background(SwissCanvas)
+                    ) {
+                        if (visibleMessages.isEmpty()) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(16.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .background(SwissPaper, RectangleShape)
+                                        .border(1.dp, SwissInk, RectangleShape)
+                                        .padding(14.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Text(
+                                        text = "READY // PERSISTENT MULTI-TURN ASSISTANT",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = SwissSignalRed
+                                    )
+                                    Text(
+                                        text = "Speak or type below. Try \"Call Mom\", \"WhatsApp Rahul saying I'll be late\", \"Play lofi beats on YouTube\", or ask any follow-up question.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = SwissMuted
+                                    )
+                                }
+                            }
+                        } else {
+                            LazyColumn(
+                                state = listState,
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 10.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .testTag("assistant_overlay_message_list")
+                            ) {
+                                itemsIndexed(
+                                    items = visibleMessages,
+                                    key = { _, msg -> msg.id }
+                                ) { idx, msg ->
+                                    val isLastStreaming = isStreaming && idx == visibleMessages.lastIndex && msg.role == "ASSISTANT"
+                                    OverlayMessageCard(
+                                        turnNumber = idx + 1,
+                                        message = msg,
+                                        isStreamingThis = isLastStreaming
+                                    )
+                                }
+                            }
+                        }
+
+                        // Floating "↓ Jump to Latest" pill when user scrolls up
+                        androidx.compose.animation.AnimatedVisibility(
+                            visible = isScrolledUp,
+                            enter = fadeIn(),
+                            exit = fadeOut(),
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(bottom = 10.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .background(SwissInk, RectangleShape)
+                                    .border(1.dp, SwissSignalRed, RectangleShape)
+                                    .clickable {
+                                        autoScrollEnabled = true
+                                        scope.launch {
+                                            if (visibleMessages.isNotEmpty()) {
+                                                listState.animateScrollToItem(visibleMessages.lastIndex)
+                                            }
+                                        }
+                                    }
+                                    .padding(horizontal = 12.dp, vertical = 7.dp)
+                                    .testTag("assistant_jump_to_latest"),
+                                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.ArrowDownward,
+                                    contentDescription = "Jump to latest message",
+                                    tint = SwissSignalRed,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Text(
+                                    text = "JUMP TO LATEST",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SwissWhite
+                                )
+                            }
+                        }
+                    }
+
+                    // 3. PINNED BOTTOM INPUT BAR
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(SwissPaper)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(1.dp)
+                                .background(SwissInk)
+                        )
+
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 10.dp, vertical = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            // 1-Tap Device Action Confirmation Card (Calls, WhatsApp, YouTube, Alarms, Timers, Apps)
+                            AnimatedVisibility(visible = pendingAction != null) {
+                                pendingAction?.let { action ->
+                                    DeviceActionConfirmCard(
+                                        action = action,
+                                        quickContacts = quickContacts,
+                                        onUpdateAction = { updated -> pendingAction = updated },
+                                        onSaveQuickContact = { name, phone ->
+                                            scope.launch {
+                                                repository.saveQuickContact(
+                                                    QuickContact(name = name, phoneNumber = phone)
+                                                )
+                                                statusBanner = "OK // Saved $name ($phone) to Quick Contacts."
+                                            }
+                                        },
+                                        onExecute = {
+                                            DeviceActionEngine.execute(context, action)
+                                                .onSuccess { msg ->
+                                                    statusBanner = "OK // $msg"
+                                                    pendingAction = null
+                                                }
+                                                .onFailure { err ->
+                                                    errorBanner = err.message ?: "Action failed"
+                                                }
+                                        },
+                                        onDismiss = { pendingAction = null }
+                                    )
+                                }
+                            }
+
+                            // Actionable Error Banner with 1-Tap RETRY Button
+                            AnimatedVisibility(visible = errorBanner != null) {
+                                errorBanner?.let { errMsg ->
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .background(SwissInk, RectangleShape)
+                                            .border(1.dp, SwissSignalRed, RectangleShape)
+                                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = errMsg,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = SwissWhite,
+                                            maxLines = 3,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        lastFailedPrompt?.let { failed ->
+                                            Row(
+                                                modifier = Modifier
+                                                    .background(SwissSignalRed, RectangleShape)
+                                                    .clickable { handlePromptSubmission(failed) }
+                                                    .padding(horizontal = 9.dp, vertical = 6.dp)
+                                                    .testTag("assistant_retry_button"),
+                                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Outlined.Refresh,
+                                                    contentDescription = "Retry request",
+                                                    tint = SwissWhite,
+                                                    modifier = Modifier.size(14.dp)
+                                                )
+                                                Text(
+                                                    text = "RETRY",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = SwissWhite
+                                                )
+                                            }
+                                        }
+                                        Icon(
+                                            imageVector = Icons.Filled.Close,
+                                            contentDescription = "Dismiss error",
+                                            tint = SwissConcrete,
+                                            modifier = Modifier
+                                                .size(18.dp)
+                                                .clickable { errorBanner = null }
+                                        )
+                                    }
+                                }
+                            }
+
+                            // Non-Error Status Notice
+                            AnimatedVisibility(visible = statusBanner != null) {
+                                statusBanner?.let { note ->
+                                    Text(
+                                        text = note,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (note.startsWith("OK")) SwissVerifiedInk else SwissMuted,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+
+                            // Mic + Text Field + Send/Stop Bar
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                SwissIconCell(
+                                    icon = if (isListening) Icons.Filled.Stop else Icons.Filled.Mic,
+                                    contentDescription = if (isListening) "Stop listening" else "Start voice input",
+                                    onClick = {
+                                        if (isListening) voiceController.stop() else startMic()
+                                    },
+                                    accent = isListening,
+                                    cellSize = 48.dp,
+                                    modifier = Modifier.testTag("assistant_mic_button")
+                                )
+
+                                OutlinedTextField(
+                                    value = transcriptInput,
+                                    onValueChange = { transcriptInput = it },
+                                    placeholder = {
+                                        Text(
+                                            if (isListening) "LISTENING // SPEAK COMMAND OR QUESTION…" else "Ask follow-up, call, WhatsApp, YouTube…",
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                    },
+                                    singleLine = true,
+                                    shape = RectangleShape,
+                                    colors = swissTextFieldColors(containerColor = SwissCanvas),
+                                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                                    keyboardActions = KeyboardActions(
+                                        onSend = {
+                                            if (transcriptInput.isNotBlank() && !isStreaming) {
+                                                handlePromptSubmission(transcriptInput)
+                                            }
+                                        }
+                                    ),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .testTag("assistant_text_input")
+                                )
+
+                                if (isStreaming) {
+                                    SwissIconCell(
+                                        icon = Icons.Filled.Stop,
+                                        contentDescription = "Stop generating",
+                                        onClick = { cancelInFlightRequest() },
+                                        accent = true,
+                                        cellSize = 48.dp,
+                                        modifier = Modifier.testTag("assistant_stop_button")
+                                    )
+                                } else {
+                                    SwissIconCell(
+                                        icon = Icons.AutoMirrored.Filled.Send,
+                                        contentDescription = "Send command",
+                                        onClick = { handlePromptSubmission(transcriptInput) },
+                                        enabled = transcriptInput.isNotBlank(),
+                                        accent = true,
+                                        cellSize = 48.dp,
+                                        modifier = Modifier.testTag("assistant_send_button")
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 4. COMPACT SCROLLABLE SLIDE-OVER CHAT HISTORY DRAWER (INSIDE ASSISTANT)
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = showHistoryDrawer,
+                    enter = fadeIn(),
+                    exit = fadeOut(),
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(Color.Black.copy(alpha = 0.45f))
+                            .clickable { showHistoryDrawer = false }
+                    )
+                }
+
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = showHistoryDrawer,
+                    enter = slideInHorizontally(initialOffsetX = { -it }),
+                    exit = slideOutHorizontally(targetOffsetX = { -it }),
+                    modifier = Modifier
+                        .align(Alignment.CenterStart)
+                        .fillMaxWidth(0.86f)
+                        .fillMaxHeight()
+                ) {
+                    AssistantHistoryDrawerPanel(
+                        conversations = filteredHistory,
+                        activeConversationId = activeConvId,
+                        searchQuery = historySearch,
+                        onSearchChange = { historySearch = it },
+                        onSelectConversation = { conv ->
+                            cancelInFlightRequest()
+                            errorBanner = null
+                            lastFailedPrompt = null
+                            showHistoryDrawer = false
+                            autoScrollEnabled = true
+                            scope.launch {
+                                repository.setActiveConversationId(conv.id)
+                            }
+                        },
+                        onDeleteConversation = { conv ->
+                            scope.launch {
+                                if (conv.id == activeConvId) {
+                                    cancelInFlightRequest()
+                                    repository.setActiveConversationId(null)
+                                }
+                                repository.deleteConversation(conv.id)
+                            }
+                        },
+                        onNewChat = { startFreshConversation() },
+                        onOpenFullApp = onOpenFullApp,
+                        onClose = { showHistoryDrawer = false }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AssistantHistoryDrawerPanel(
+    conversations: List<ConversationEntity>,
+    activeConversationId: Long?,
+    searchQuery: String,
+    onSearchChange: (String) -> Unit,
+    onSelectConversation: (ConversationEntity) -> Unit,
+    onDeleteConversation: (ConversationEntity) -> Unit,
+    onNewChat: () -> Unit,
+    onOpenFullApp: (() -> Unit)?,
+    onClose: () -> Unit
+) {
+    val timeFormatter = remember { SimpleDateFormat("MMM d · HH:mm", Locale.US) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(SwissPaper)
+            .border(1.dp, SwissInk, RectangleShape)
+            .clickable(enabled = false) {}
+            .testTag("assistant_history_drawer")
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(SwissInk)
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "HISTORY // SAVED SESSIONS",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = SwissSignalRed
+                )
+                Text(
+                    text = "${conversations.size} Thread${if (conversations.size == 1) "" else "s"}",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = SwissWhite
+                )
+            }
+            Icon(
+                imageVector = Icons.Filled.Close,
+                contentDescription = "Close history drawer",
+                tint = SwissWhite,
+                modifier = Modifier
+                    .size(20.dp)
+                    .clickable(onClick = onClose)
+                    .testTag("assistant_history_close")
+            )
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                SwissButton(
+                    text = "New Thread",
+                    leadingIcon = Icons.Filled.Add,
+                    variant = SwissButtonVariant.PRIMARY,
+                    minHeight = 38.dp,
+                    onClick = onNewChat,
+                    modifier = Modifier.weight(1f)
+                )
+                if (onOpenFullApp != null) {
+                    SwissButton(
+                        text = "Full App",
+                        variant = SwissButtonVariant.OUTLINE,
+                        minHeight = 38.dp,
+                        onClick = onOpenFullApp,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+            OutlinedTextField(
+                value = searchQuery,
+                onValueChange = onSearchChange,
+                placeholder = { Text("Filter history…", style = MaterialTheme.typography.bodySmall) },
+                singleLine = true,
+                shape = RectangleShape,
+                colors = swissTextFieldColors(containerColor = SwissCanvas),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("assistant_history_search")
+            )
+        }
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(1.dp)
+                .background(SwissInk)
+        )
+
+        if (conversations.isEmpty()) {
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "No saved conversations yet.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = SwissMuted
+                )
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .testTag("assistant_history_list"),
+                contentPadding = PaddingValues(10.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                items(conversations, key = { it.id }) { conv ->
+                    val isCurrent = conv.id == activeConversationId
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(if (isCurrent) SwissInk else SwissCanvas, RectangleShape)
+                            .border(1.dp, if (isCurrent) SwissSignalRed else SwissInk, RectangleShape)
+                            .clickable { onSelectConversation(conv) }
+                            .padding(horizontal = 10.dp, vertical = 9.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(end = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            Text(
+                                text = conv.title.ifBlank { "Untitled Chat" },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (isCurrent) SwissWhite else SwissInk,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = buildString {
+                                    if (isCurrent) append("ACTIVE · ")
+                                    append(timeFormatter.format(Date(conv.updatedAt)))
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (isCurrent) SwissSignalRed else SwissMuted
+                            )
+                        }
+                        Icon(
+                            imageVector = Icons.Outlined.DeleteOutline,
+                            contentDescription = "Delete thread",
+                            tint = if (isCurrent) SwissWhite.copy(alpha = 0.8f) else SwissMuted,
+                            modifier = Modifier
+                                .size(18.dp)
+                                .clickable { onDeleteConversation(conv) }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun OverlayMessageCard(
+    turnNumber: Int,
+    message: MessageEntity,
+    isStreamingThis: Boolean
+) {
+    val isUser = message.role == "USER"
+    val borderColor = if (isUser) SwissInk else SwissInk.copy(alpha = 0.7f)
+    val bgColor = if (isUser) SwissInk else SwissPaper
+    val headerFg = if (isUser) SwissSignalRed else SwissMuted
+    val bodyFg = if (isUser) SwissWhite else SwissInk
+    val indexStr = turnNumber.toString().padStart(2, '0')
+    val headerLabel = if (isUser) {
+        "$indexStr // YOU"
+    } else {
+        "$indexStr // ${(message.modelLabel ?: "ASSISTANT").uppercase()}"
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(bgColor, RectangleShape)
+            .border(1.dp, borderColor, RectangleShape)
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = headerLabel,
+                style = MaterialTheme.typography.labelSmall,
+                color = headerFg,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
+            if (isStreamingThis) {
+                Text(
+                    text = "STREAMING…",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = SwissSignalRed
+                )
+            }
+        }
+        Text(
+            text = message.content.ifBlank { if (isStreamingThis) "Thinking…" else "" },
+            style = MaterialTheme.typography.bodyMedium,
+            color = if (message.isError) SwissSignalRed else bodyFg
+        )
+    }
+}
+
+@Composable
+private fun AssistantQuickChip(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    accent: Boolean = false,
+    onClick: () -> Unit,
+    testTag: String
+) {
+    Row(
+        modifier = Modifier
+            .background(if (accent) SwissSignalRed else SwissCanvas, RectangleShape)
+            .border(1.dp, if (accent) SwissSignalRed else SwissInk, RectangleShape)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 9.dp, vertical = 6.dp)
+            .testTag(testTag),
+        horizontalArrangement = Arrangement.spacedBy(5.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = if (accent) SwissWhite else SwissInk,
+            modifier = Modifier.size(14.dp)
+        )
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = if (accent) SwissWhite else SwissInk
+        )
+    }
+}

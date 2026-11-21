@@ -31,11 +31,15 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.math.tan
 
+import com.example.util.DeviceAction
+import com.example.util.DeviceActionEngine
+
 data class ToolExecutionOutcome(
     val toolName: String,
     val resultJson: String,
     val displaySummary: String,
-    val inlineArtifactMarkdown: String? = null
+    val inlineArtifactMarkdown: String? = null,
+    val triggeredDeviceAction: DeviceAction? = null
 )
 
 /**
@@ -184,6 +188,59 @@ object ClientToolEngine {
                         )
                 )
                 .put("required", JSONArray().put("chart_type").put("title"))
+        ),
+        ToolSchema(
+            name = "execute_device_action",
+            description = "Triggers a native Android device action confirmation card to make a phone call (make_call), play/search a YouTube video (open_youtube), send a WhatsApp message to a contact or number (send_whatsapp), launch any installed Android app (open_app), set an alarm (set_alarm), or start a countdown timer (set_timer).",
+            parameters = JSONObject()
+                .put("type", "object")
+                .put(
+                    "properties",
+                    JSONObject()
+                        .put(
+                            "action_type",
+                            JSONObject()
+                                .put("type", "string")
+                                .put("description", "One of: 'make_call', 'open_youtube', 'send_whatsapp', 'open_app', 'set_alarm', 'set_timer'.")
+                        )
+                        .put(
+                            "phone_number",
+                            JSONObject().put("type", "string").put("description", "Phone number for make_call or send_whatsapp.")
+                        )
+                        .put(
+                            "contact_name",
+                            JSONObject().put("type", "string").put("description", "Contact name (e.g. 'Mom', 'Rahul') to resolve from saved Quick Contacts for make_call or send_whatsapp.")
+                        )
+                        .put(
+                            "message",
+                            JSONObject().put("type", "string").put("description", "Pre-filled message text for send_whatsapp.")
+                        )
+                        .put(
+                            "youtube_query",
+                            JSONObject().put("type", "string").put("description", "Song/video search query or direct YouTube URL for open_youtube.")
+                        )
+                        .put(
+                            "app_name",
+                            JSONObject().put("type", "string").put("description", "App name or Android package ID (e.g. 'WhatsApp', 'PhonePe', 'com.spotify.music') for open_app.")
+                        )
+                        .put(
+                            "hour",
+                            JSONObject().put("type", "integer").put("description", "Hour (0-23) for set_alarm.")
+                        )
+                        .put(
+                            "minute",
+                            JSONObject().put("type", "integer").put("description", "Minute (0-59) for set_alarm.")
+                        )
+                        .put(
+                            "duration_seconds",
+                            JSONObject().put("type", "integer").put("description", "Duration in seconds for set_timer.")
+                        )
+                        .put(
+                            "label",
+                            JSONObject().put("type", "string").put("description", "Optional label for alarm, timer, or contact.")
+                        )
+                )
+                .put("required", JSONArray().put("action_type"))
         )
     )
 
@@ -234,7 +291,9 @@ object ClientToolEngine {
     suspend fun executeTool(
         name: String,
         argumentsJson: String,
-        webSearchClient: WebSearchClient
+        webSearchClient: WebSearchClient,
+        contacts: List<QuickContact> = emptyList(),
+        customApps: List<CustomAppEntry> = emptyList()
     ): ToolExecutionOutcome {
         val args = runCatching { JSONObject(argumentsJson.ifBlank { "{}" }) }.getOrDefault(JSONObject())
         return when (name.trim().lowercase()) {
@@ -243,12 +302,96 @@ object ClientToolEngine {
             "timezone_convert" -> runTimezoneConvert(args)
             "fetch_url" -> runFetchUrl(args, webSearchClient)
             "generate_chart" -> runGenerateChart(args)
+            "execute_device_action", "device_action" -> runDeviceAction(args, contacts, customApps)
             else -> ToolExecutionOutcome(
                 toolName = name,
                 resultJson = JSONObject().put("error", "Unknown client tool: $name").toString(),
                 displaySummary = "TOOL // Unknown tool `$name`"
             )
         }
+    }
+
+    private fun runDeviceAction(
+        args: JSONObject,
+        contacts: List<QuickContact>,
+        customApps: List<CustomAppEntry>
+    ): ToolExecutionOutcome {
+        val type = args.optString("action_type").trim().lowercase(Locale.US)
+        val label = args.optString("label").trim()
+        val contactName = args.optString("contact_name").trim().ifBlank { label }
+        val rawPhone = args.optString("phone_number").trim()
+
+        val resolvedContact = if (rawPhone.isBlank() && contactName.isNotBlank()) {
+            DeviceActionEngine.resolveContact(contactName, contacts)
+        } else null
+
+        val action: DeviceAction? = when (type) {
+            "make_call", "dial_phone", "call" -> {
+                val number = when {
+                    rawPhone.isNotBlank() -> DeviceActionEngine.normalizePhoneNumber(rawPhone)
+                    resolvedContact != null -> DeviceActionEngine.normalizePhoneNumber(resolvedContact.phoneNumber)
+                    else -> ""
+                }
+                DeviceAction.DialPhone(
+                    phoneNumber = number,
+                    contactLabel = resolvedContact?.name ?: contactName.takeIf { it.isNotBlank() }
+                )
+            }
+            "open_youtube", "youtube", "play_youtube" -> {
+                val query = args.optString("youtube_query").trim()
+                    .ifBlank { args.optString("query").trim() }
+                    .ifBlank { label }
+                if (query.isNotBlank()) {
+                    DeviceAction.OpenYouTube(
+                        queryOrUrl = query,
+                        videoId = DeviceActionEngine.extractYouTubeVideoId(query)
+                    )
+                } else {
+                    DeviceActionEngine.resolveAppEntry("YouTube", customApps)
+                }
+            }
+            "send_whatsapp", "whatsapp" -> {
+                val digits = when {
+                    rawPhone.isNotBlank() -> DeviceActionEngine.normalizeWhatsAppDigits(rawPhone)
+                    resolvedContact != null -> DeviceActionEngine.normalizeWhatsAppDigits(resolvedContact.phoneNumber)
+                    else -> ""
+                }
+                val msg = args.optString("message").trim()
+                DeviceAction.SendWhatsApp(
+                    phoneNumber = digits,
+                    message = msg,
+                    contactLabel = resolvedContact?.name ?: contactName.takeIf { it.isNotBlank() }
+                )
+            }
+            "set_alarm" -> DeviceAction.SetAlarm(
+                hour = args.optInt("hour", 7),
+                minute = args.optInt("minute", 0),
+                label = label.takeIf { it.isNotBlank() }
+            )
+            "set_timer" -> DeviceAction.SetTimer(
+                seconds = args.optInt("duration_seconds", 60).coerceAtLeast(1),
+                label = label.takeIf { it.isNotBlank() }
+            )
+            "open_app" -> {
+                val appQuery = args.optString("app_name").trim().ifBlank { label }
+                DeviceActionEngine.resolveAppEntry(appQuery, customApps)
+                    ?: DeviceAction.OpenApp(appName = appQuery.ifBlank { "App" }, packageName = appQuery.takeIf { it.contains(".") })
+            }
+            else -> null
+        }
+
+        val summary = action?.let { "${it.badge} // ${it.title}" } ?: "ACTION // Prepared device intent"
+        return ToolExecutionOutcome(
+            toolName = "execute_device_action",
+            resultJson = JSONObject()
+                .put("status", "action_card_ready")
+                .put("action_type", type)
+                .put("title", action?.title.orEmpty())
+                .put("resolved_phone", resolvedContact?.phoneNumber ?: rawPhone)
+                .toString(),
+            displaySummary = summary,
+            triggeredDeviceAction = action
+        )
     }
 
     private fun runCalculator(args: JSONObject): ToolExecutionOutcome {

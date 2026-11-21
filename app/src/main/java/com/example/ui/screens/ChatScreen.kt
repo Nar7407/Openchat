@@ -3,6 +3,8 @@ package com.example.ui.screens
 import android.Manifest
 import android.app.Activity
 import android.app.PictureInPictureParams
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -12,6 +14,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -23,6 +27,8 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -44,24 +50,31 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.outlined.AccountTree
 import androidx.compose.material.icons.outlined.AutoAwesome
+import androidx.compose.material.icons.outlined.BugReport
 import androidx.compose.material.icons.outlined.Build
 import androidx.compose.material.icons.outlined.CameraAlt
 import androidx.compose.material.icons.outlined.ChevronLeft
 import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.CompareArrows
 import androidx.compose.material.icons.outlined.ContentCopy
+import androidx.compose.material.icons.outlined.Crop
 import androidx.compose.material.icons.outlined.DataObject
 import androidx.compose.material.icons.outlined.DeleteOutline
+import androidx.compose.material.icons.outlined.Draw
 import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.FormatQuote
+import androidx.compose.material.icons.outlined.GraphicEq
 import androidx.compose.material.icons.outlined.Hub
 import androidx.compose.material.icons.outlined.Image
+import androidx.compose.material.icons.outlined.IosShare
 import androidx.compose.material.icons.outlined.Language
 import androidx.compose.material.icons.outlined.LibraryBooks
 import androidx.compose.material.icons.outlined.Memory
@@ -69,15 +82,18 @@ import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.PictureInPictureAlt
+import androidx.compose.material.icons.outlined.PlayCircleOutline
 import androidx.compose.material.icons.outlined.Psychology
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.School
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Terminal
+import androidx.compose.material.icons.outlined.Translate
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.outlined.UnfoldLess
 import androidx.compose.material.icons.outlined.UnfoldMore
+import androidx.compose.material.icons.outlined.Videocam
 import androidx.compose.material.icons.outlined.VolumeOff
 import androidx.compose.material.icons.outlined.VolumeUp
 import androidx.compose.material3.AlertDialog
@@ -97,12 +113,14 @@ import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.RectangleShape
@@ -116,6 +134,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import com.example.data.local.ConversationEntity
@@ -127,12 +148,18 @@ import com.example.domain.model.CostEstimator
 import com.example.domain.model.DisplayCurrency
 import com.example.domain.model.ModelCapability
 import com.example.ui.components.AgentsMdInitDialog
+import com.example.ui.components.ChatMinimapScrubber
 import com.example.ui.components.CitationPillsRow
 import com.example.ui.components.CommandHelpSheet
 import com.example.ui.components.CustomSlashCommandsSheet
+import com.example.ui.components.DeviceActionConfirmCard
 import com.example.ui.components.EditMessageForkDialog
 import com.example.ui.components.ErrorBanner
+import com.example.ui.components.ExportStudioDialog
 import com.example.ui.components.KnowledgeTagBar
+import com.example.ui.components.LiveCamController
+import com.example.ui.components.LiveCameraViewfinderPanel
+import com.example.ui.components.LiveVoiceOverlay
 import com.example.ui.components.MarkdownText
 import com.example.ui.components.McpServersSheet
 import com.example.ui.components.MemoryBankDialog
@@ -142,6 +169,7 @@ import com.example.ui.components.PersonaCommandBar
 import com.example.ui.components.PersonaManagerSheet
 import com.example.ui.components.PromptEditorDialog
 import com.example.ui.components.RawJsonInspectorDialog
+import com.example.ui.components.RegionSnipDialog
 import com.example.ui.components.RequestParamsPopover
 import com.example.ui.components.ShareSessionDialog
 import com.example.ui.components.SlashCommandSuggestionBar
@@ -170,13 +198,14 @@ import com.example.ui.theme.SwissVerifiedTint
 import com.example.ui.theme.SwissWhite
 import com.example.ui.viewmodel.ChatUiEvent
 import com.example.ui.viewmodel.ChatViewModel
+import com.example.util.DeviceActionEngine
 import com.example.util.ReadAloudController
 import com.example.util.VoiceInputController
 import kotlinx.coroutines.launch
 import java.io.File
 import java.util.Locale
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun ChatScreen(
     viewModel: ChatViewModel,
@@ -186,12 +215,19 @@ fun ChatScreen(
     onOpenSummarize: () -> Unit,
     onOpenImage: () -> Unit,
     onOpenVideo: () -> Unit,
+    onOpenRewrite: () -> Unit,
+    onOpenDebugger: () -> Unit,
+    onOpenYouTube: () -> Unit,
+    onOpenLiveLens: (Boolean) -> Unit,
+    onOpenAssistantOverlay: () -> Unit,
+    onSummarizeClipboardText: (String) -> Unit,
     onOpenSettings: () -> Unit,
     onConnectProvider: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val clipboard = LocalClipboardManager.current
     val scope = rememberCoroutineScope()
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
@@ -220,7 +256,23 @@ fun ChatScreen(
     var showMemoryBank by remember { mutableStateOf(false) }
     var editorInitialText by remember { mutableStateOf<String?>(null) }
     var shareDialogPayload by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var exportStudioPayload by remember { mutableStateOf<Pair<String, String>?>(null) }
     var pendingExportMarkdown by remember { mutableStateOf<String?>(null) }
+    var snipSourceUri by remember { mutableStateOf<Uri?>(null) }
+    val liveCamController = remember { LiveCamController() }
+
+    // Smart "Paste & Ask" Clipboard Detector when returning to AllChat
+    DisposableEffect(lifecycleOwner, context) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                val clipText = cm?.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()
+                viewModel.inspectClipboardOnResume(clipText)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     val voiceController = remember(context) {
         VoiceInputController(
@@ -325,6 +377,35 @@ fun ChatScreen(
         }
     )
 
+    val batchDocsLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments(),
+        onResult = { uris ->
+            if (uris.isNotEmpty()) {
+                viewModel.attachBatchDocuments(uris)
+            }
+        }
+    )
+
+    val snipPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia(),
+        onResult = { uri ->
+            if (uri != null) {
+                snipSourceUri = uri
+            }
+        }
+    )
+
+    val liveCamPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+        onResult = { granted ->
+            if (granted) {
+                viewModel.setLiveCamEnabled(true)
+            } else {
+                viewModel.showToast("Camera permission is required for Live Camera Viewfinder.")
+            }
+        }
+    )
+
     LaunchedEffect(viewModel) {
         viewModel.events.collect { event ->
             when (event) {
@@ -365,6 +446,9 @@ fun ChatScreen(
                 is ChatUiEvent.OpenShareDialog -> {
                     shareDialogPayload = event.shareUrl to event.markdown
                 }
+                is ChatUiEvent.OpenExportStudio -> {
+                    exportStudioPayload = event.title to event.markdown
+                }
                 is ChatUiEvent.TriggerExportMarkdown -> {
                     pendingExportMarkdown = event.markdown
                     exportMdLauncher.launch(event.suggestedFileName)
@@ -376,9 +460,41 @@ fun ChatScreen(
         }
     }
 
-    LaunchedEffect(state.branchNodes.size, state.branchNodes.lastOrNull()?.message?.content?.length) {
-        if (state.branchNodes.isNotEmpty()) {
-            listState.animateScrollToItem(state.branchNodes.lastIndex)
+    var autoScrollEnabled by remember(state.activeConversation?.id) { mutableStateOf(true) }
+    val showJumpToLatest by remember {
+        derivedStateOf {
+            state.branchNodes.isNotEmpty() && listState.canScrollForward
+        }
+    }
+
+    // Pause auto-scrolling immediately if the user manually scrolls up; resume upon reaching bottom
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress to listState.canScrollForward }
+            .collect { (scrolling, canScrollDown) ->
+                if (scrolling && canScrollDown) {
+                    autoScrollEnabled = false
+                } else if (!canScrollDown) {
+                    autoScrollEnabled = true
+                }
+            }
+    }
+
+    // Re-engage auto-scroll whenever the user submits a fresh message
+    val lastNode = state.branchNodes.lastOrNull()
+    LaunchedEffect(lastNode?.message?.id) {
+        if (lastNode?.message?.role == "USER") {
+            autoScrollEnabled = true
+        }
+    }
+
+    // Smart auto-scroll when a new turn arrives or while streaming (only if not paused by user)
+    LaunchedEffect(state.branchNodes.size, lastNode?.message?.id, lastNode?.message?.content?.length) {
+        if (state.branchNodes.isNotEmpty() && autoScrollEnabled) {
+            if (state.isStreaming) {
+                listState.scrollToItem(state.branchNodes.lastIndex)
+            } else {
+                listState.animateScrollToItem(state.branchNodes.lastIndex)
+            }
         }
     }
 
@@ -1002,10 +1118,27 @@ fun ChatScreen(
                 state.errorToast?.let { toast ->
                     ErrorBanner(
                         message = toast,
+                        onRetry = if (state.lastFailedPrompt != null) viewModel::retryLastFailedMessage else null,
                         onDismiss = viewModel::clearErrorToast,
                         modifier = Modifier.padding(12.dp)
                     )
                 }
+            }
+
+            // Live Camera Viewfinder Q&A Dock (Split-Screen Top Preview)
+            AnimatedVisibility(visible = state.liveCamEnabled) {
+                LiveCameraViewfinderPanel(
+                    controller = liveCamController,
+                    onSnapNow = {
+                        val frame = liveCamController.grabCurrentFrameBitmap()
+                        if (frame != null) {
+                            viewModel.attachBitmapAndSelectVision(frame, label = "Live Cam Frame")
+                        } else {
+                            viewModel.showToast("Camera frame not ready yet. Try again in a moment.")
+                        }
+                    },
+                    onClose = { viewModel.setLiveCamEnabled(false) }
+                )
             }
 
             // Messages Viewport
@@ -1026,7 +1159,12 @@ fun ChatScreen(
                 } else {
                     LazyColumn(
                         state = listState,
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 14.dp),
+                        contentPadding = PaddingValues(
+                            start = 12.dp,
+                            end = if (state.branchNodes.count { it.message.role == "USER" } >= 3) 26.dp else 12.dp,
+                            top = 14.dp,
+                            bottom = 14.dp
+                        ),
                         verticalArrangement = Arrangement.spacedBy(12.dp),
                         modifier = Modifier
                             .fillMaxSize()
@@ -1062,6 +1200,9 @@ fun ChatScreen(
                                 onRegenerateBranch = { viewModel.regenerateAsBranch(msg) },
                                 onGenerateStudyPack = { viewModel.generateStudyPackForMessage(msg) },
                                 onGenerateMindMap = { viewModel.generateMindMapForMessage(msg) },
+                                onExportMessage = {
+                                    exportStudioPayload = (state.activeConversation?.title ?: "AllChat Response") to msg.content
+                                },
                                 onSwitchBranch = { targetId -> viewModel.switchBranch(node.parentKey, targetId) },
                                 onInspectJson = { inspectingMessage = msg },
                                 onOpenCitationUrl = { url ->
@@ -1073,6 +1214,103 @@ fun ChatScreen(
                                     }
                                 },
                                 onOpenProxySettings = onOpenSettings
+                            )
+                        }
+
+                        // Smart 1-Tap Follow-Up Suggestion Pills below last AI response
+                        if (!state.isStreaming && state.followUpSuggestions.isNotEmpty()) {
+                            item(key = "smart_followup_chips") {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(top = 2.dp, bottom = 6.dp),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Text(
+                                        text = "NEXT // 1-TAP FOLLOW-UPS",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = SwissMuted
+                                    )
+                                    FlowRow(
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        state.followUpSuggestions.forEachIndexed { idx, suggestion ->
+                                            Row(
+                                                modifier = Modifier
+                                                    .background(SwissPaper, RectangleShape)
+                                                    .border(1.dp, SwissInk, RectangleShape)
+                                                    .clickable { viewModel.sendMessage(suggestion) }
+                                                    .padding(horizontal = 10.dp, vertical = 7.dp)
+                                                    .testTag("followup_chip_$idx"),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                            ) {
+                                                Text(
+                                                    text = "0${idx + 1}",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = SwissSignalRed
+                                                )
+                                                Text(
+                                                    text = suggestion,
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                    color = SwissInk
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // In-Chat Message Minimap / Jump-to-Question Scrubber Rail
+                    ChatMinimapScrubber(
+                        branchNodes = state.branchNodes,
+                        currentVisibleIndex = listState.firstVisibleItemIndex,
+                        onJumpToIndex = { targetIdx ->
+                            autoScrollEnabled = targetIdx >= state.branchNodes.lastIndex
+                            scope.launch { listState.animateScrollToItem(targetIdx) }
+                        },
+                        modifier = Modifier.align(Alignment.CenterEnd)
+                    )
+
+                    // Floating "↓ Jump to Latest" pill when scrolled up reading earlier messages
+                    androidx.compose.animation.AnimatedVisibility(
+                        visible = showJumpToLatest,
+                        enter = fadeIn(),
+                        exit = fadeOut(),
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(bottom = 12.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .background(SwissInk, RectangleShape)
+                                .border(1.dp, SwissSignalRed, RectangleShape)
+                                .clickable {
+                                    autoScrollEnabled = true
+                                    scope.launch {
+                                        if (state.branchNodes.isNotEmpty()) {
+                                            listState.animateScrollToItem(state.branchNodes.lastIndex)
+                                        }
+                                    }
+                                }
+                                .padding(horizontal = 12.dp, vertical = 7.dp)
+                                .testTag("chat_jump_to_latest_button"),
+                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.ArrowDownward,
+                                contentDescription = "Jump to latest message",
+                                tint = SwissSignalRed,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Text(
+                                text = "JUMP TO LATEST",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissWhite
                             )
                         }
                     }
@@ -1091,6 +1329,146 @@ fun ChatScreen(
                         .height(1.dp)
                         .background(SwissInk)
                 )
+
+                // 1-Tap Device Action Confirmation Card (Calls, WhatsApp, YouTube, Alarms, Timers, App Launch)
+                AnimatedVisibility(visible = state.pendingDeviceAction != null) {
+                    state.pendingDeviceAction?.let { devAction ->
+                        DeviceActionConfirmCard(
+                            action = devAction,
+                            quickContacts = state.quickContacts,
+                            onUpdateAction = viewModel::setPendingDeviceAction,
+                            onSaveQuickContact = viewModel::saveQuickContact,
+                            onExecute = {
+                                DeviceActionEngine.execute(context, devAction)
+                                    .onSuccess { msg ->
+                                        viewModel.dismissDeviceAction()
+                                        viewModel.showNotice("ACTION // $msg")
+                                    }
+                                    .onFailure { err ->
+                                        viewModel.showToast(err.message ?: "Unable to execute device action.")
+                                    }
+                            },
+                            onDismiss = viewModel::dismissDeviceAction,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                        )
+                    }
+                }
+
+                // "Paste & Ask" Smart Clipboard Detector Floating Pill
+                AnimatedVisibility(visible = state.clipboardHint != null) {
+                    state.clipboardHint?.let { hint ->
+                        Column {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(SwissInk)
+                                    .padding(horizontal = 10.dp, vertical = 7.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "CLIPBOARD // ${hint.kindLabel} DETECTED",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = SwissSignalRed
+                                    )
+                                    Text(
+                                        text = hint.preview,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = SwissWhite,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                                Text(
+                                    text = "[ ASK ]",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SwissWhite,
+                                    modifier = Modifier
+                                        .background(SwissSignalRed, RectangleShape)
+                                        .clickable {
+                                            val raw = hint.rawText
+                                            viewModel.dismissClipboardHint()
+                                            inputText = if (hint.kindLabel == "LINK") {
+                                                "@$raw Explain and summarize the key points."
+                                            } else if (hint.kindLabel == "ERROR TRACE") {
+                                                "Debug this error trace and provide the root cause + fix:\n\n$raw"
+                                            } else {
+                                                raw
+                                            }
+                                        }
+                                        .padding(horizontal = 8.dp, vertical = 5.dp)
+                                        .testTag("clipboard_paste_ask_button")
+                                )
+                                Text(
+                                    text = "[ SUM ]",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SwissInk,
+                                    modifier = Modifier
+                                        .background(SwissPaper, RectangleShape)
+                                        .clickable {
+                                            val raw = hint.rawText
+                                            viewModel.dismissClipboardHint()
+                                            onSummarizeClipboardText(raw)
+                                        }
+                                        .padding(horizontal = 8.dp, vertical = 5.dp)
+                                        .testTag("clipboard_summarize_button")
+                                )
+                                Icon(
+                                    imageVector = Icons.Filled.Close,
+                                    contentDescription = "Dismiss clipboard prompt",
+                                    tint = SwissWhite,
+                                    modifier = Modifier
+                                        .size(20.dp)
+                                        .clickable { viewModel.dismissClipboardHint() }
+                                )
+                            }
+                            Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(SwissInk))
+                        }
+                    }
+                }
+
+                // Batch Multi-Document Q&A Strip (5–10 Files Ready)
+                AnimatedVisibility(visible = state.batchDocumentTitles.isNotEmpty()) {
+                    Column {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(SwissVerifiedTint)
+                                .padding(horizontal = 12.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.FolderOpen,
+                                contentDescription = null,
+                                tint = SwissVerifiedInk,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "BATCH // ${state.batchDocumentTitles.size} DOCS ATTACHED FOR CROSS-DOC Q&A",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SwissVerifiedInk
+                                )
+                                Text(
+                                    text = state.batchDocumentTitles.joinToString(" · "),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = SwissInk,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            SwissIconCell(
+                                icon = Icons.Filled.Close,
+                                contentDescription = "Clear batch documents",
+                                onClick = viewModel::clearBatchDocuments,
+                                cellSize = 30.dp
+                            )
+                        }
+                        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(SwissInk))
+                    }
+                }
 
                 // Quoted Message Reply Strip (triggered via Swipe-Right on any message)
                 AnimatedVisibility(visible = state.quotedMessage != null) {
@@ -1299,7 +1677,9 @@ fun ChatScreen(
                     )
                 }
 
-                // Compact Power-User Grounding, Native Tools, Memory & Parameter Strip above composer
+                // Compact Power-User Grounding, Native Tools, Live Lens/Voice/Cam/Snip, Batch Docs & Memory Strip
+                // Auto-collapses cleanly in Small Window / Split-Screen Mini Mode to maximize chat viewport
+                if (!effectiveMiniMode) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1309,6 +1689,146 @@ fun ChatScreen(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
+                    // Zero-Prompt Live Lens Auto-Explainer & Translator
+                    Row(
+                        modifier = Modifier
+                            .background(SwissSignalRed, RectangleShape)
+                            .border(1.dp, SwissSignalRed, RectangleShape)
+                            .clickable { onOpenLiveLens(false) }
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                            .testTag("live_lens_chip_button"),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.Translate,
+                            contentDescription = "Open Live Lens Auto-Explainer & Translator",
+                            tint = SwissWhite,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Text(
+                            text = "LENS",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SwissWhite
+                        )
+                    }
+
+                    // Hands-Free Live Voice Conversation Loop
+                    Row(
+                        modifier = Modifier
+                            .background(if (state.liveVoiceActive) SwissSignalRed else SwissInk, RectangleShape)
+                            .border(1.dp, if (state.liveVoiceActive) SwissSignalRed else SwissInk, RectangleShape)
+                            .clickable { viewModel.openLiveVoice() }
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                            .testTag("live_voice_chip_button"),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.GraphicEq,
+                            contentDescription = "Open Hands-Free Live Voice Loop",
+                            tint = SwissWhite,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Text(
+                            text = "LIVE",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SwissWhite
+                        )
+                    }
+
+                    // Live Camera Viewfinder Q&A Toggle
+                    Row(
+                        modifier = Modifier
+                            .background(if (state.liveCamEnabled) SwissSignalRed else SwissPaper, RectangleShape)
+                            .border(1.dp, if (state.liveCamEnabled) SwissSignalRed else SwissInk, RectangleShape)
+                            .clickable {
+                                if (state.liveCamEnabled) {
+                                    viewModel.setLiveCamEnabled(false)
+                                } else {
+                                    val granted = ContextCompat.checkSelfPermission(
+                                        context,
+                                        Manifest.permission.CAMERA
+                                    ) == PackageManager.PERMISSION_GRANTED
+                                    if (granted) {
+                                        viewModel.setLiveCamEnabled(true)
+                                    } else {
+                                        liveCamPermissionLauncher.launch(Manifest.permission.CAMERA)
+                                    }
+                                }
+                            }
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                            .testTag("live_cam_toggle_button"),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.Videocam,
+                            contentDescription = "Toggle Live Camera Viewfinder",
+                            tint = if (state.liveCamEnabled) SwissWhite else SwissInk,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Text(
+                            text = if (state.liveCamEnabled) "CAM ON" else "CAM",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (state.liveCamEnabled) SwissWhite else SwissInk
+                        )
+                    }
+
+                    // Region Snip (Crop Screenshot / Chart / UI Bug to Vision)
+                    Row(
+                        modifier = Modifier
+                            .background(SwissPaper, RectangleShape)
+                            .border(1.dp, SwissInk, RectangleShape)
+                            .clickable {
+                                snipPickerLauncher.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                )
+                            }
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                            .testTag("region_snip_button"),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.Crop,
+                            contentDescription = "Region Snip Screenshot to Vision",
+                            tint = SwissInk,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Text(
+                            text = "SNIP",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SwissInk
+                        )
+                    }
+
+                    // Batch Multi-Doc Drop (5-10 PDFs/TXT/MD at once)
+                    Row(
+                        modifier = Modifier
+                            .background(if (state.batchDocumentTitles.isNotEmpty()) SwissSignalRed else SwissPaper, RectangleShape)
+                            .border(1.dp, if (state.batchDocumentTitles.isNotEmpty()) SwissSignalRed else SwissInk, RectangleShape)
+                            .clickable {
+                                batchDocsLauncher.launch(arrayOf("application/pdf", "text/plain", "text/markdown", "text/*"))
+                            }
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                            .testTag("batch_docs_button"),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.FolderOpen,
+                            contentDescription = "Batch Attach Multiple Documents",
+                            tint = if (state.batchDocumentTitles.isNotEmpty()) SwissWhite else SwissInk,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Text(
+                            text = if (state.batchDocumentTitles.isNotEmpty()) "+DOCS (${state.batchDocumentTitles.size})" else "+DOCS",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (state.batchDocumentTitles.isNotEmpty()) SwissWhite else SwissInk
+                        )
+                    }
+
                     Row(
                         modifier = Modifier
                             .background(if (state.webSearchEnabled) SwissSignalRed else SwissPaper, RectangleShape)
@@ -1412,6 +1932,7 @@ fun ChatScreen(
                         .height(1.dp)
                         .background(SwissConcrete)
                 )
+                }
 
                 Row(
                     modifier = Modifier
@@ -1496,9 +2017,17 @@ fun ChatScreen(
                                 if (isDictating) voiceController.stop()
                                 val prompt = inputText
                                 inputText = ""
-                                viewModel.sendMessage(prompt)
+                                if (state.liveCamEnabled) {
+                                    val frame = liveCamController.grabCurrentFrameBitmap()
+                                    viewModel.sendMessageWithOptionalLiveFrame(prompt, frame)
+                                } else {
+                                    viewModel.sendMessage(prompt)
+                                }
                             },
-                            enabled = inputText.isNotBlank() || state.pendingAttachmentUri != null,
+                            enabled = inputText.isNotBlank() ||
+                                state.pendingAttachmentUri != null ||
+                                state.batchDocumentTitles.isNotEmpty() ||
+                                state.liveCamEnabled,
                             accent = true,
                             cellSize = 48.dp,
                             modifier = Modifier.testTag("send_chat_button")
@@ -1664,8 +2193,138 @@ fun ChatScreen(
                         Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(SwissInk))
                         StudioToolRow(
                             index = "10",
+                            title = "Tone & Rewrite Studio",
+                            subtitle = "WhatsApp / Email / LinkedIn polish, Hindi/Marathi/Spanish + Copy & Open WhatsApp",
+                            icon = Icons.Outlined.Draw,
+                            onClick = {
+                                showPlusMenu = false
+                                onOpenRewrite()
+                            },
+                            testTag = "plus_menu_rewrite"
+                        )
+                        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(SwissInk))
+                        StudioToolRow(
+                            index = "11",
+                            title = "Code & Error Debugger",
+                            subtitle = "Paste stack trace or broken file → Root Cause + Fixed Code Patch + Copy Patch",
+                            icon = Icons.Outlined.BugReport,
+                            onClick = {
+                                showPlusMenu = false
+                                onOpenDebugger()
+                            },
+                            testTag = "plus_menu_debugger"
+                        )
+                        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(SwissInk))
+                        StudioToolRow(
+                            index = "12",
+                            title = "YouTube Lecture Extractor",
+                            subtitle = "Paste YouTube URL → Timestamped Chapters, Key Takeaways & Study Notes",
+                            icon = Icons.Outlined.PlayCircleOutline,
+                            onClick = {
+                                showPlusMenu = false
+                                onOpenYouTube()
+                            },
+                            testTag = "plus_menu_youtube"
+                        )
+                        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(SwissInk))
+                        StudioToolRow(
+                            index = "13",
+                            title = "Live Lens (Auto-Explain & Translator)",
+                            subtitle = "Zero-prompt camera explainer, 1.5s steady auto-scan & live text translation",
+                            icon = Icons.Outlined.Translate,
+                            onClick = {
+                                showPlusMenu = false
+                                onOpenLiveLens(false)
+                            },
+                            testTag = "plus_menu_live_lens"
+                        )
+                        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(SwissInk))
+                        StudioToolRow(
+                            index = "14",
+                            title = "Voice & Lens Assistant Overlay",
+                            subtitle = "Google-Assistant-style sheet · Auto-mic, timers, calls, apps (Vol Up+Down)",
+                            icon = Icons.Outlined.GraphicEq,
+                            onClick = {
+                                showPlusMenu = false
+                                onOpenAssistantOverlay()
+                            },
+                            testTag = "plus_menu_assistant_overlay"
+                        )
+                        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(SwissInk))
+                        StudioToolRow(
+                            index = "15",
+                            title = "Live Voice Loop (Hands-Free)",
+                            subtitle = "Full-screen Waveform Orb · Auto-listen → Stream → Speak → Re-listen",
+                            icon = Icons.Outlined.GraphicEq,
+                            onClick = {
+                                showPlusMenu = false
+                                viewModel.openLiveVoice()
+                            },
+                            testTag = "plus_menu_live_voice"
+                        )
+                        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(SwissInk))
+                        StudioToolRow(
+                            index = "14",
+                            title = "Live Camera Viewfinder Q&A",
+                            subtitle = "Keep camera live at top of Chat · Auto-snaps frame on every Send",
+                            icon = Icons.Outlined.Videocam,
+                            onClick = {
+                                showPlusMenu = false
+                                val granted = ContextCompat.checkSelfPermission(
+                                    context,
+                                    Manifest.permission.CAMERA
+                                ) == PackageManager.PERMISSION_GRANTED
+                                if (granted) {
+                                    viewModel.setLiveCamEnabled(true)
+                                } else {
+                                    liveCamPermissionLauncher.launch(Manifest.permission.CAMERA)
+                                }
+                            },
+                            testTag = "plus_menu_live_cam"
+                        )
+                        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(SwissInk))
+                        StudioToolRow(
+                            index = "15",
+                            title = "Region Snip (Screenshot Crop)",
+                            subtitle = "Draw crop box over an error, chart, or UI bug → Send straight to Vision",
+                            icon = Icons.Outlined.Crop,
+                            onClick = {
+                                showPlusMenu = false
+                                snipPickerLauncher.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                )
+                            },
+                            testTag = "plus_menu_region_snip"
+                        )
+                        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(SwissInk))
+                        StudioToolRow(
+                            index = "16",
+                            title = "Batch Multi-Doc Q&A (5–10 Files)",
+                            subtitle = "Drop multiple PDFs, TXT, or MD files together for cross-document Q&A",
+                            icon = Icons.Outlined.FolderOpen,
+                            onClick = {
+                                showPlusMenu = false
+                                batchDocsLauncher.launch(arrayOf("application/pdf", "text/plain", "text/markdown", "text/*"))
+                            },
+                            testTag = "plus_menu_batch_docs"
+                        )
+                        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(SwissInk))
+                        StudioToolRow(
+                            index = "17",
+                            title = "Export Studio (PDF / DOCX / Notion)",
+                            subtitle = "Export current chat as styled PDF, Word .docx, Notion MD, or Share Sheet",
+                            icon = Icons.Outlined.IosShare,
+                            onClick = {
+                                showPlusMenu = false
+                                viewModel.openExportStudioForCurrentSession()
+                            },
+                            testTag = "plus_menu_export_studio"
+                        )
+                        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(SwissInk))
+                        StudioToolRow(
+                            index = "18",
                             title = "Slash Commands Reference (/help)",
-                            subtitle = "All built-in commands: /remember, /mcp, /init, /compact, /undo",
+                            subtitle = "All built-in commands: /remember, /mcp, /init, /compact, /undo, /export",
                             icon = Icons.Outlined.Terminal,
                             onClick = {
                                 showPlusMenu = false
@@ -1917,6 +2576,35 @@ fun ChatScreen(
             onDismiss = viewModel::dismissMindMap
         )
     }
+
+    if (state.liveVoiceActive) {
+        LiveVoiceOverlay(
+            selectedModel = state.selectedModel,
+            onStreamReply = { history, userText, onPartial, onSentence ->
+                viewModel.streamLiveVoiceTurn(history, userText, onPartial, onSentence)
+            },
+            onDismiss = viewModel::closeLiveVoice
+        )
+    }
+
+    snipSourceUri?.let { srcUri ->
+        RegionSnipDialog(
+            sourceUri = srcUri,
+            onConfirmCrop = { croppedBitmap ->
+                snipSourceUri = null
+                viewModel.attachBitmapAndSelectVision(croppedBitmap, label = "Region Snip")
+            },
+            onDismiss = { snipSourceUri = null }
+        )
+    }
+
+    exportStudioPayload?.let { (title, markdown) ->
+        ExportStudioDialog(
+            title = title,
+            markdownContent = markdown,
+            onDismiss = { exportStudioPayload = null }
+        )
+    }
 }
 
 @Composable
@@ -2033,6 +2721,7 @@ private fun ChatMessageCell(
     onRegenerateBranch: () -> Unit,
     onGenerateStudyPack: () -> Unit,
     onGenerateMindMap: () -> Unit,
+    onExportMessage: () -> Unit,
     onSwitchBranch: (Long) -> Unit,
     onInspectJson: () -> Unit,
     onOpenCitationUrl: (String) -> Unit,
@@ -2296,6 +2985,13 @@ private fun ChatMessageCell(
                                         accent = isSpeakingThis,
                                         cellSize = 36.dp,
                                         modifier = Modifier.testTag("tts_speak_${message.id}")
+                                    )
+                                    SwissIconCell(
+                                        icon = Icons.Outlined.IosShare,
+                                        contentDescription = "Export Studio (PDF, DOCX, Notion MD, Share)",
+                                        onClick = onExportMessage,
+                                        cellSize = 36.dp,
+                                        modifier = Modifier.testTag("export_studio_${message.id}")
                                     )
                                     SwissIconCell(
                                         icon = Icons.Outlined.ContentCopy,

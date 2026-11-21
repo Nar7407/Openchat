@@ -1,5 +1,6 @@
 package com.example.ui.viewmodel
 
+import android.graphics.Bitmap
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -9,7 +10,9 @@ import com.example.data.repository.AllChatRepository
 import com.example.domain.model.AutoRouterConfig
 import com.example.domain.model.BranchMessageNode
 import com.example.domain.model.ChatOptions
+import com.example.domain.model.ClipboardPromptHint
 import com.example.domain.model.ConversationTree
+import com.example.domain.model.CustomAppEntry
 import com.example.domain.model.CustomSlashCommand
 import com.example.domain.model.DisplayCurrency
 import com.example.domain.model.KnowledgeDocInfo
@@ -18,6 +21,7 @@ import com.example.domain.model.McpServerConfig
 import com.example.domain.model.MindMapNode
 import com.example.domain.model.ModelCapability
 import com.example.domain.model.PersonaInfo
+import com.example.domain.model.QuickContact
 import com.example.domain.model.RequestParamsOverride
 import com.example.domain.model.SelectableModel
 import com.example.domain.model.SlashCommandDef
@@ -27,6 +31,8 @@ import com.example.domain.model.StudyPack
 import com.example.domain.model.UserMemoryInfo
 import com.example.domain.model.WebSearchProvider
 import com.example.ui.theme.SwissThemePreset
+import com.example.util.DeviceAction
+import com.example.util.DeviceActionEngine
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -56,6 +62,7 @@ sealed interface ChatUiEvent {
     data object LaunchCameraVision : ChatUiEvent
     data class OpenPromptEditor(val initialText: String) : ChatUiEvent
     data class OpenShareDialog(val shareUrl: String, val markdown: String) : ChatUiEvent
+    data class OpenExportStudio(val title: String, val markdown: String) : ChatUiEvent
     data class TriggerExportMarkdown(val suggestedFileName: String, val markdown: String) : ChatUiEvent
     data object ExitApp : ChatUiEvent
 }
@@ -99,10 +106,19 @@ data class ChatUiState(
     val activeStudyPack: StudyPack? = null,
     val isGeneratingMindMap: Boolean = false,
     val activeMindMap: MindMapNode? = null,
+    val followUpSuggestions: List<String> = emptyList(),
+    val clipboardHint: ClipboardPromptHint? = null,
+    val batchDocumentTitles: List<String> = emptyList(),
+    val liveCamEnabled: Boolean = false,
+    val liveVoiceActive: Boolean = false,
+    val pendingDeviceAction: DeviceAction? = null,
+    val quickContacts: List<QuickContact> = emptyList(),
+    val customApps: List<CustomAppEntry> = emptyList(),
     val pendingAttachmentUri: String? = null,
     val isStreaming: Boolean = false,
     val statusNotice: String? = null,
-    val errorToast: String? = null
+    val errorToast: String? = null,
+    val lastFailedPrompt: String? = null
 ) {
     val messages: List<MessageEntity> get() = branchNodes.map { it.message }
 }
@@ -134,6 +150,14 @@ class ChatViewModel(
     private val activeStudyPack = MutableStateFlow<StudyPack?>(null)
     private val isGeneratingMindMap = MutableStateFlow(false)
     private val activeMindMap = MutableStateFlow<MindMapNode?>(null)
+    private val followUpSuggestions = MutableStateFlow<List<String>>(emptyList())
+    private val clipboardHint = MutableStateFlow<ClipboardPromptHint?>(null)
+    private var dismissedClipboardHash: Int? = null
+    private val pendingBatchDocuments = MutableStateFlow<List<Pair<String, String>>>(emptyList())
+    private val liveCamEnabled = MutableStateFlow(false)
+    private val liveVoiceActive = MutableStateFlow(false)
+    private val pendingDeviceAction = MutableStateFlow<DeviceAction?>(null)
+    private val lastFailedPrompt = MutableStateFlow<String?>(null)
 
     // Per-conversation redo stack storing popped message turns from /undo
     private val redoStackByConv = MutableStateFlow<Map<Long, List<List<MessageEntity>>>>(emptyMap())
@@ -234,6 +258,22 @@ class ChatViewModel(
         StudyMapBundle(pendingDoc?.first, genStudy, studyPack, genMap, mindMap)
     }
 
+    private val advancedStudioBundleFlow = combine(
+        followUpSuggestions,
+        clipboardHint,
+        pendingBatchDocuments,
+        liveCamEnabled,
+        liveVoiceActive
+    ) { followUps, clipHint, batchDocs, liveCam, liveVoice ->
+        AdvancedStudioBundle(
+            followUpSuggestions = followUps,
+            clipboardHint = clipHint,
+            batchDocumentTitles = batchDocs.map { it.first },
+            liveCamEnabled = liveCam,
+            liveVoiceActive = liveVoice
+        )
+    }
+
     val uiState: StateFlow<ChatUiState> = combine(
         repository.conversationsFlow,
         searchQuery,
@@ -314,12 +354,34 @@ class ChatViewModel(
             isGeneratingMindMap = sm.isGeneratingMindMap,
             activeMindMap = sm.activeMindMap
         )
+    }.combine(advancedStudioBundleFlow) { state, adv ->
+        state.copy(
+            followUpSuggestions = adv.followUpSuggestions,
+            clipboardHint = adv.clipboardHint,
+            batchDocumentTitles = adv.batchDocumentTitles,
+            liveCamEnabled = adv.liveCamEnabled,
+            liveVoiceActive = adv.liveVoiceActive
+        )
     }.combine(pendingAttachmentUri) { state, att ->
         state.copy(pendingAttachmentUri = att)
+    }.combine(
+        combine(
+            pendingDeviceAction,
+            repository.quickContactsFlow,
+            repository.customAppsFlow
+        ) { devAction, contacts, apps -> Triple(devAction, contacts, apps) }
+    ) { state, (devAction, contacts, apps) ->
+        state.copy(
+            pendingDeviceAction = devAction,
+            quickContacts = contacts,
+            customApps = apps
+        )
     }.combine(isStreaming) { state, streaming ->
         state.copy(isStreaming = streaming)
-    }.combine(combine(statusNotice, errorToast) { notice, err -> notice to err }) { state, (notice, err) ->
-        state.copy(statusNotice = notice, errorToast = err)
+    }.combine(
+        combine(statusNotice, errorToast, lastFailedPrompt) { notice, err, failed -> Triple(notice, err, failed) }
+    ) { state, (notice, err, failed) ->
+        state.copy(statusNotice = notice, errorToast = err, lastFailedPrompt = failed)
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5000),
@@ -331,9 +393,26 @@ class ChatViewModel(
             repository.ensureDefaultPersonas()
         }
         viewModelScope.launch {
-            repository.conversationsFlow.collect { list ->
-                if (activeConversationId.value == null && list.isNotEmpty()) {
-                    activeConversationId.value = list.first().id
+            repository.activeModelDbIdFlow.collect { persistedModelId ->
+                if (persistedModelId != null && fallbackSelectedModelId.value != persistedModelId) {
+                    fallbackSelectedModelId.value = persistedModelId
+                }
+            }
+        }
+        viewModelScope.launch {
+            combine(
+                repository.conversationsFlow,
+                repository.activeConversationIdFlow
+            ) { list, persistedId -> list to persistedId }.collect { (list, persistedId) ->
+                if (persistedId != null && list.any { it.id == persistedId }) {
+                    if (activeConversationId.value != persistedId) {
+                        selectedBranchByParent.value = emptyMap()
+                        activeConversationId.value = persistedId
+                    }
+                } else if (activeConversationId.value == null && list.isNotEmpty()) {
+                    val firstId = list.first().id
+                    activeConversationId.value = firstId
+                    repository.setActiveConversationId(firstId)
                 }
             }
         }
@@ -359,17 +438,23 @@ class ChatViewModel(
     fun selectConversation(conversationId: Long) {
         stopGeneration()
         selectedBranchByParent.value = emptyMap()
+        followUpSuggestions.value = emptyList()
         activeConversationId.value = conversationId
+        viewModelScope.launch {
+            repository.setActiveConversationId(conversationId)
+        }
     }
 
     fun createNewChat() {
         stopGeneration()
         selectedBranchByParent.value = emptyMap()
+        followUpSuggestions.value = emptyList()
         viewModelScope.launch {
             val modelId = uiState.value.selectedModel?.model?.id
             val personaId = uiState.value.activePersona?.id
             val newId = repository.createConversation("New Chat", modelId, personaId)
             activeConversationId.value = newId
+            repository.setActiveConversationId(newId)
         }
     }
 
@@ -384,6 +469,9 @@ class ChatViewModel(
             stopGeneration()
             selectedBranchByParent.value = emptyMap()
             activeConversationId.value = null
+            viewModelScope.launch {
+                repository.setActiveConversationId(null)
+            }
         }
         viewModelScope.launch {
             repository.deleteConversation(conversationId)
@@ -394,6 +482,7 @@ class ChatViewModel(
         fallbackSelectedModelId.value = selectableModel.model.id
         viewModelScope.launch {
             repository.setAutoRouteEnabled(false)
+            repository.setActiveModelDbId(selectableModel.model.id)
             val convId = activeConversationId.value
             if (convId != null) {
                 repository.updateConversationModel(convId, selectableModel.model.id)
@@ -468,6 +557,173 @@ class ChatViewModel(
 
     fun triggerCameraVision() {
         _events.tryEmit(ChatUiEvent.LaunchCameraVision)
+    }
+
+    fun setLiveCamEnabled(enabled: Boolean) {
+        liveCamEnabled.value = enabled
+        if (enabled) {
+            statusNotice.value = "LIVE CAM // Viewfinder active. Every prompt auto-captures the current frame."
+        }
+    }
+
+    fun openLiveVoice() {
+        if (uiState.value.selectedModel == null) {
+            errorToast.value = "Configure a Text Chat model in Settings first to use Live Voice."
+            return
+        }
+        liveVoiceActive.value = true
+    }
+
+    fun closeLiveVoice() {
+        liveVoiceActive.value = false
+    }
+
+    suspend fun streamLiveVoiceTurn(
+        history: List<Pair<String, String>>,
+        userText: String,
+        onPartial: (String) -> Unit,
+        onSentence: (String) -> Unit
+    ): String {
+        val model = uiState.value.selectedModel
+            ?: throw IllegalStateException("Select a Text Chat model first.")
+        return repository.streamLiveVoiceReply(
+            history = history,
+            userText = userText,
+            selectableModel = model,
+            onPartialFullText = onPartial,
+            onSentenceReady = onSentence
+        )
+    }
+
+    fun attachBitmapAndSelectVision(bitmap: Bitmap, label: String = "Region Snip") {
+        viewModelScope.launch {
+            runCatching {
+                repository.saveBitmapAsAttachment(bitmap, prefix = "snip")
+            }.onSuccess { localUri ->
+                pendingAttachmentUri.value = localUri
+                val state = uiState.value
+                val currentSupportsVision = state.selectedModel?.model?.supportsImageInput == true
+                if (!currentSupportsVision) {
+                    val configuredVision = state.autoRouterConfig.visionModelId?.let { id ->
+                        state.availableModels.firstOrNull { it.model.id == id }
+                    }
+                    val bestVision = configuredVision
+                        ?: state.availableModels.firstOrNull { it.model.supportsImageInput }
+                    if (bestVision != null) {
+                        selectModel(bestVision)
+                        statusNotice.value = "SNIP // $label attached & switched to Vision model: ${bestVision.model.displayName}."
+                    } else {
+                        statusNotice.value = "SNIP // $label attached. Select a Vision-capable model to analyze."
+                    }
+                } else {
+                    statusNotice.value = "SNIP // $label attached to prompt."
+                }
+            }.onFailure { err ->
+                errorToast.value = err.message ?: "Failed to attach cropped image."
+            }
+        }
+    }
+
+    fun sendMessageWithOptionalLiveFrame(rawPromptText: String, liveFrameBitmap: Bitmap?) {
+        if (liveFrameBitmap == null || pendingAttachmentUri.value != null) {
+            sendMessage(rawPromptText)
+            return
+        }
+        viewModelScope.launch {
+            val savedUri = runCatching {
+                repository.saveBitmapAsAttachment(liveFrameBitmap, prefix = "livecam")
+            }.getOrNull()
+            if (savedUri != null) {
+                pendingAttachmentUri.value = savedUri
+                val state = uiState.value
+                if (state.selectedModel?.model?.supportsImageInput != true) {
+                    val bestVision = state.autoRouterConfig.visionModelId?.let { id ->
+                        state.availableModels.firstOrNull { it.model.id == id }
+                    } ?: state.availableModels.firstOrNull { it.model.supportsImageInput }
+                    if (bestVision != null) {
+                        selectModel(bestVision)
+                    }
+                }
+            }
+            sendMessage(rawPromptText.ifBlank { "Describe and answer based on what you see in this live camera frame." })
+        }
+    }
+
+    fun attachBatchDocuments(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        viewModelScope.launch {
+            statusNotice.value = "BATCH // Extracting ${uris.size.coerceAtMost(10)} document(s)…"
+            runCatching {
+                repository.extractMultipleDocuments(uris)
+            }.onSuccess { docs ->
+                if (docs.isEmpty()) {
+                    errorToast.value = "Could not extract text from the selected files."
+                } else {
+                    pendingBatchDocuments.value = docs
+                    statusNotice.value = "BATCH // Loaded ${docs.size} document${if (docs.size > 1) "s" else ""} for cross-doc Q&A."
+                }
+            }.onFailure { err ->
+                errorToast.value = err.message ?: "Batch document extraction failed."
+            }
+        }
+    }
+
+    fun clearBatchDocuments() {
+        pendingBatchDocuments.value = emptyList()
+    }
+
+    fun inspectClipboardOnResume(clipboardText: String?) {
+        val trimmed = clipboardText?.trim().orEmpty()
+        if (trimmed.length < 12) return
+        val hash = trimmed.hashCode()
+        if (hash == dismissedClipboardHash) return
+        if (clipboardHint.value?.hash == hash) return
+
+        val kindLabel = when {
+            trimmed.startsWith("http://", ignoreCase = true) || trimmed.startsWith("https://", ignoreCase = true) -> "LINK"
+            trimmed.contains("Exception") ||
+                trimmed.contains("Error:") ||
+                trimmed.contains("Traceback") ||
+                trimmed.contains("at com.") ||
+                trimmed.contains("at java.") ||
+                trimmed.contains("NullPointer") -> "ERROR TRACE"
+            else -> "TEXT"
+        }
+        val preview = trimmed.replace(Regex("\\s+"), " ").take(96)
+        clipboardHint.value = ClipboardPromptHint(
+            hash = hash,
+            rawText = trimmed,
+            preview = preview,
+            kindLabel = kindLabel
+        )
+    }
+
+    fun dismissClipboardHint() {
+        clipboardHint.value?.let { dismissedClipboardHash = it.hash }
+        clipboardHint.value = null
+    }
+
+    fun setPendingDeviceAction(action: DeviceAction?) {
+        pendingDeviceAction.value = action
+    }
+
+    fun dismissDeviceAction() {
+        pendingDeviceAction.value = null
+    }
+
+    fun saveQuickContact(name: String, phoneNumber: String) {
+        if (name.isBlank() || phoneNumber.isBlank()) return
+        viewModelScope.launch {
+            repository.saveQuickContact(QuickContact(name = name.trim(), phoneNumber = phoneNumber.trim()))
+            statusNotice.value = "CONTACTS // Saved $name ($phoneNumber) to Quick Contacts."
+        }
+    }
+
+    fun retryLastFailedMessage() {
+        val retryPrompt = lastFailedPrompt.value ?: return
+        lastFailedPrompt.value = null
+        errorToast.value = null
+        sendMessage(retryPrompt)
     }
 
     fun setAutoExtractMemories(enabled: Boolean) {
@@ -669,6 +925,7 @@ class ChatViewModel(
                 val newId = repository.createConversation("Doc: ${title.take(32)}", modelId, personaId)
                 selectedBranchByParent.value = emptyMap()
                 activeConversationId.value = newId
+                repository.setActiveConversationId(newId)
                 pendingDocumentContext.value = title to text.take(28_000)
                 statusNotice.value = "DOC // Loaded \"$title\" (${text.length} chars). Ask anything about it."
             }.onFailure { err ->
@@ -696,6 +953,7 @@ class ChatViewModel(
 
     fun clearErrorToast() {
         errorToast.value = null
+        lastFailedPrompt.value = null
     }
 
     // --- Theme, MCP & AGENTS.md Controls ---
@@ -979,8 +1237,11 @@ class ChatViewModel(
         }
         val shareUrl = state.activeShareCode?.let { "https://opncd.ai/s/$it" }
         val md = repository.buildMarkdownTranscript(conv.title, state.messages, shareUrl)
-        val safeTitle = conv.title.lowercase().replace(Regex("[^a-z0-9]+"), "_").trim('_').ifBlank { "session" }
-        _events.tryEmit(ChatUiEvent.TriggerExportMarkdown("allchat_${safeTitle}.md", md))
+        _events.tryEmit(ChatUiEvent.OpenExportStudio(conv.title, md))
+    }
+
+    fun openExportStudioForCurrentSession() {
+        exportCurrentSession()
     }
 
     // --- Sending & Branching ---
@@ -989,7 +1250,8 @@ class ChatViewModel(
         val state = uiState.value
         val trimmed = rawPromptText.trim()
         val attachment = pendingAttachmentUri.value
-        if (trimmed.isEmpty() && attachment == null) return
+        val batchDocs = pendingBatchDocuments.value
+        if (trimmed.isEmpty() && attachment == null && batchDocs.isEmpty()) return
 
         // 1. Intercept built-in /slash commands first!
         val matchedSlash = SlashCommandRegistry.matchExact(trimmed)
@@ -997,6 +1259,20 @@ class ChatViewModel(
             val arg = trimmed.dropWhile { !it.isWhitespace() }.trim()
             runSlashCommand(matchedSlash, arg)
             return
+        }
+
+        // 1b. Intercept Device Action commands (Call, WhatsApp, YouTube, Alarm, Timer, Open App) with 1-tap confirmation card
+        if (attachment == null && batchDocs.isEmpty()) {
+            val parsedDeviceAction = DeviceActionEngine.parseFromPrompt(
+                rawInput = trimmed,
+                contacts = state.quickContacts,
+                customApps = state.customApps
+            )
+            if (parsedDeviceAction != null) {
+                pendingDeviceAction.value = parsedDeviceAction
+                statusNotice.value = "${parsedDeviceAction.badge} // Ready — tap confirmation button below."
+                return
+            }
         }
 
         if (isStreaming.value) return
@@ -1075,12 +1351,26 @@ class ChatViewModel(
                 appendLine("> Quoting: \"$preview\"")
                 appendLine()
             }
-            append(effectivePrompt)
+            if (effectivePrompt.isNotBlank()) {
+                append(effectivePrompt)
+            } else if (batchDocs.isNotEmpty()) {
+                append("Analyze, compare, and synthesize the ${batchDocs.size} attached documents below.")
+            }
             if (docCtx != null) {
                 appendLine()
                 appendLine()
                 appendLine("--- SHARED DOCUMENT: ${docCtx.first} ---")
                 appendLine(docCtx.second)
+            }
+            if (batchDocs.isNotEmpty()) {
+                appendLine()
+                appendLine()
+                appendLine("=== BATCH ATTACHED DOCUMENTS (${batchDocs.size}) ===")
+                batchDocs.forEachIndexed { idx, (docTitle, docContent) ->
+                    appendLine()
+                    appendLine("--- DOCUMENT ${idx + 1}: $docTitle ---")
+                    appendLine(docContent)
+                }
             }
         }.trim()
 
@@ -1090,6 +1380,8 @@ class ChatViewModel(
         pendingAttachmentUri.value = null
         quotedMessage.value = null
         pendingDocumentContext.value = null
+        pendingBatchDocuments.value = emptyList()
+        followUpSuggestions.value = emptyList()
         clearNotices()
         if (autoRouteLabel != null) {
             statusNotice.value = "AUTO-ROUTER // Selected ${model.model.displayName} ($autoRouteLabel)."
@@ -1097,13 +1389,17 @@ class ChatViewModel(
 
         activeStreamJob = viewModelScope.launch {
             isStreaming.value = true
+            lastFailedPrompt.value = null
             try {
                 val convId = activeConversationId.value
                     ?: repository.createConversation(
                         title = effectivePrompt.take(40).ifBlank { "Image Chat" },
                         modelDbId = model.model.id,
                         personaId = effectivePersona?.id
-                    ).also { activeConversationId.value = it }
+                    ).also {
+                        activeConversationId.value = it
+                        repository.setActiveConversationId(it)
+                    }
 
                 redoStackByConv.update { it - convId }
 
@@ -1121,12 +1417,32 @@ class ChatViewModel(
                     },
                     onBranchCreated = { parentKey, childId ->
                         selectedBranchByParent.update { it + (parentKey to childId) }
+                    },
+                    onDeviceActionTriggered = { triggered ->
+                        pendingDeviceAction.value = triggered
+                        statusNotice.value = "${triggered.badge} // Ready — tap confirmation button below."
+                    },
+                    onRequestError = { errMsg ->
+                        errorToast.value = errMsg
+                        lastFailedPrompt.value = rawPromptText
                     }
                 )
 
-                if (shouldAutoExtractMemory && effectivePrompt.length >= 18) {
-                    val lastReply = uiState.value.messages.lastOrNull { it.role == "ASSISTANT" }?.content.orEmpty()
-                    if (lastReply.isNotBlank()) {
+                val lastReply = uiState.value.messages.lastOrNull { it.role == "ASSISTANT" && !it.isError }?.content.orEmpty()
+                if (lastReply.isNotBlank()) {
+                    // Generate 3 clickable 1-tap Smart Follow-Up Chips silently in background
+                    viewModelScope.launch {
+                        val chips = repository.generateFollowUpChips(
+                            userPrompt = effectivePrompt.ifBlank { finalPrompt.take(300) },
+                            assistantReply = lastReply,
+                            selectableModel = model
+                        )
+                        if (chips.isNotEmpty()) {
+                            followUpSuggestions.value = chips
+                        }
+                    }
+
+                    if (shouldAutoExtractMemory && effectivePrompt.length >= 18) {
                         viewModelScope.launch {
                             val savedCount = repository.extractMemoriesFromTurn(effectivePrompt, lastReply, model)
                             if (savedCount > 0) {
@@ -1135,6 +1451,11 @@ class ChatViewModel(
                         }
                     }
                 }
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (err: Throwable) {
+                errorToast.value = err.message ?: "Request failed. Tap Retry to try again."
+                lastFailedPrompt.value = rawPromptText
             } finally {
                 isStreaming.value = false
             }
@@ -1271,5 +1592,13 @@ class ChatViewModel(
         val activeStudyPack: StudyPack?,
         val isGeneratingMindMap: Boolean,
         val activeMindMap: MindMapNode?
+    )
+
+    private data class AdvancedStudioBundle(
+        val followUpSuggestions: List<String>,
+        val clipboardHint: ClipboardPromptHint?,
+        val batchDocumentTitles: List<String>,
+        val liveCamEnabled: Boolean,
+        val liveVoiceActive: Boolean
     )
 }

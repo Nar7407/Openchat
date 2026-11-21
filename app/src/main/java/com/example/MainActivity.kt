@@ -4,6 +4,8 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
+import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
@@ -19,6 +21,8 @@ class MainActivity : ComponentActivity() {
 
     private val pendingSharePayload = mutableStateOf<IncomingSharePayload?>(null)
     private val pendingAppAction = mutableStateOf<IncomingAppAction?>(null)
+    private var lastVolUpDownMs: Long = 0L
+    private var lastVolDownDownMs: Long = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -54,8 +58,49 @@ class MainActivity : ComponentActivity() {
         handleIncomingIntent(intent)
     }
 
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+            val now = SystemClock.uptimeMillis()
+            when (event.keyCode) {
+                KeyEvent.KEYCODE_VOLUME_UP -> {
+                    lastVolUpDownMs = now
+                    if (now - lastVolDownDownMs in 0L..300L) {
+                        lastVolUpDownMs = 0L
+                        lastVolDownDownMs = 0L
+                        pendingAppAction.value = IncomingAppAction.ASSISTANT_OVERLAY
+                        return true
+                    }
+                }
+                KeyEvent.KEYCODE_VOLUME_DOWN -> {
+                    lastVolDownDownMs = now
+                    if (now - lastVolUpDownMs in 0L..300L) {
+                        lastVolUpDownMs = 0L
+                        lastVolDownDownMs = 0L
+                        pendingAppAction.value = IncomingAppAction.ASSISTANT_OVERLAY
+                        return true
+                    }
+                }
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
     private fun handleIncomingIntent(intent: Intent?) {
         if (intent == null) return
+
+        // 0. Check ?mode=assistant or allchat://assistant URI
+        val dataUri = intent.data
+        if (dataUri != null) {
+            val modeParam = dataUri.getQueryParameter("mode")?.lowercase()
+            if (modeParam == "assistant" || dataUri.host.equals("assistant", ignoreCase = true)) {
+                pendingAppAction.value = IncomingAppAction.ASSISTANT_OVERLAY
+                return
+            }
+            if (modeParam == "lens" || dataUri.host.equals("lens", ignoreCase = true)) {
+                pendingAppAction.value = IncomingAppAction.LIVE_LENS_EXPLAIN
+                return
+            }
+        }
 
         // 1. Check App Shortcut / Home Screen Widget quick action
         val actionExtra = intent.getStringExtra(AllChatWidgetProvider.EXTRA_ALLCHAT_ACTION)?.lowercase()
@@ -66,6 +111,9 @@ class MainActivity : ComponentActivity() {
                 "clipboard" -> IncomingAppAction.SUMMARIZE_CLIPBOARD
                 "image" -> IncomingAppAction.GENERATE_IMAGE
                 "camera" -> IncomingAppAction.CAMERA_VISION
+                "assistant" -> IncomingAppAction.ASSISTANT_OVERLAY
+                "lens" -> IncomingAppAction.LIVE_LENS_EXPLAIN
+                "lens_translate" -> IncomingAppAction.LIVE_LENS_TRANSLATE
                 else -> null
             }
             return

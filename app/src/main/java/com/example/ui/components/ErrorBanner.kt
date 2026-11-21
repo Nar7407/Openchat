@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -34,6 +35,8 @@ fun ErrorBanner(
     message: String,
     suggestProxySetting: Boolean = false,
     onOpenProxySettings: (() -> Unit)? = null,
+    onRetry: (() -> Unit)? = null,
+    retryLabel: String = "Retry",
     onDismiss: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
@@ -95,15 +98,36 @@ fun ErrorBanner(
                         color = SwissMuted
                     )
                 }
-                if (suggestProxySetting && onOpenProxySettings != null) {
-                    SwissButton(
-                        text = "Configure Proxy / Base URL",
-                        onClick = onOpenProxySettings,
-                        leadingIcon = Icons.Outlined.Settings,
-                        variant = SwissButtonVariant.OUTLINE,
-                        minHeight = 40.dp,
-                        modifier = Modifier.testTag("error_open_proxy_settings")
-                    )
+                if (onRetry != null || (suggestProxySetting && onOpenProxySettings != null)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        if (onRetry != null) {
+                            SwissButton(
+                                text = retryLabel,
+                                onClick = onRetry,
+                                leadingIcon = Icons.Outlined.Refresh,
+                                variant = SwissButtonVariant.PRIMARY,
+                                minHeight = 40.dp,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("error_retry_button")
+                            )
+                        }
+                        if (suggestProxySetting && onOpenProxySettings != null) {
+                            SwissButton(
+                                text = "Configure Proxy / Base URL",
+                                onClick = onOpenProxySettings,
+                                leadingIcon = Icons.Outlined.Settings,
+                                variant = SwissButtonVariant.OUTLINE,
+                                minHeight = 40.dp,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("error_open_proxy_settings")
+                            )
+                        }
+                    }
                 }
             }
         }

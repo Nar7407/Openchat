@@ -190,10 +190,34 @@ data class ProviderConfig(
     val proxyUrl: String?,
     val hasApiKey: Boolean,
     val models: List<ModelInfo>,
-    val createdAt: Long
+    val createdAt: Long,
+    val defaultModelId: String? = null,
+    val isEnabled: Boolean = true,
+    val updatedAt: Long = createdAt
 ) {
     val effectiveBaseUrl: String
-        get() = proxyUrl?.trim()?.takeIf { it.isNotEmpty() } ?: baseUrl.trim()
+        get() {
+            val validProxy = proxyUrl?.trim()?.takeIf {
+                it.startsWith("http://", ignoreCase = true) ||
+                    it.startsWith("https://", ignoreCase = true)
+            }
+            val raw = validProxy
+                ?: baseUrl.trim().takeIf {
+                    it.startsWith("http://", ignoreCase = true) ||
+                        it.startsWith("https://", ignoreCase = true)
+                }
+                ?: type.defaultBaseUrl
+
+            var normalized = raw.trimEnd('/')
+            // Collapse accidental duplicate version segments like /v1/v1 or /v1beta/v1beta
+            normalized = normalized
+                .replace(Regex("""(/v1)+$""", RegexOption.IGNORE_CASE), "/v1")
+                .replace(Regex("""(/v1beta)+$""", RegexOption.IGNORE_CASE), "/v1beta")
+            if (type == ProviderType.ANTHROPIC && normalized.endsWith("/v1", ignoreCase = true)) {
+                normalized = normalized.dropLast(3).trimEnd('/')
+            }
+            return normalized.ifBlank { type.defaultBaseUrl }
+        }
 }
 
 data class SelectableModel(
@@ -214,7 +238,15 @@ enum class IncomingAppAction {
     VOICE_PROMPT,
     SUMMARIZE_CLIPBOARD,
     GENERATE_IMAGE,
-    CAMERA_VISION
+    CAMERA_VISION,
+    ASSISTANT_OVERLAY,
+    LIVE_LENS_EXPLAIN,
+    LIVE_LENS_TRANSLATE
+}
+
+enum class LiveLensMode(val label: String) {
+    AUTO_EXPLAIN("AUTO-EXPLAIN"),
+    LIVE_TRANSLATOR("LIVE TRANSLATOR")
 }
 
 data class UserMemoryInfo(
@@ -277,4 +309,61 @@ object ContextWindowEstimator {
         else -> tokens.toString()
     }
 }
+
+enum class RewritePreset(val label: String, val instruction: String) {
+    POLITE_REPLY("Polite Reply", "Rewrite as a warm, polite, natural reply suitable for WhatsApp or chat."),
+    FIX_GRAMMAR("Fix Grammar", "Fix grammar, spelling, and punctuation while preserving the original tone and meaning."),
+    MAKE_SHORTER("Make Shorter", "Condense to the clearest, punchiest short message without losing key facts."),
+    PROFESSIONAL_EMAIL("Professional Email", "Rewrite as a crisp, polished professional email with a clear subject line and sign-off."),
+    LINKEDIN_POLISH("LinkedIn Polish", "Rewrite as an engaging, structured LinkedIn post or message with strong clarity and no fluff."),
+    TRANSLATE_HINDI("→ Hindi", "Translate naturally into fluent, everyday Hindi (Devanagari script)."),
+    TRANSLATE_MARATHI("→ Marathi", "Translate naturally into fluent, everyday Marathi (Devanagari script)."),
+    TRANSLATE_SPANISH("→ Spanish", "Translate naturally into clear, idiomatic Spanish."),
+    CASUAL_FRIENDLY("Casual & Friendly", "Rewrite in a relaxed, upbeat, friendly tone for messaging friends or teammates.")
+}
+
+data class CodeDebugResult(
+    val rootCause: String,
+    val severity: String,
+    val explanation: String,
+    val fixedCode: String,
+    val patchSummary: String,
+    val verificationSteps: List<String>
+)
+
+data class YouTubeStudyResult(
+    val videoId: String,
+    val canonicalUrl: String,
+    val title: String,
+    val author: String,
+    val hasTimestampedCaptions: Boolean,
+    val markdownNotes: String
+)
+
+data class ClipboardPromptHint(
+    val hash: Int,
+    val rawText: String,
+    val preview: String,
+    val kindLabel: String // "LINK", "ERROR TRACE", "TEXT"
+)
+
+data class QuickContact(
+    val id: String = "",
+    val name: String,
+    val phoneNumber: String
+)
+
+data class CustomAppEntry(
+    val id: String = "",
+    val name: String,
+    val packageName: String
+)
+
+data class LiveLensAnalysisResult(
+    val modelLabel: String,
+    val answer: String,
+    val failoverNotice: String? = null
+)
+
+
 

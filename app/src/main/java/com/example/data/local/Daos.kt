@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import androidx.room.Update
 import kotlinx.coroutines.flow.Flow
 
@@ -11,6 +12,30 @@ import kotlinx.coroutines.flow.Flow
 interface ProviderDao {
     @Query("SELECT * FROM providers ORDER BY createdAt ASC")
     fun observeProviders(): Flow<List<ProviderEntity>>
+
+    @Transaction
+    @Query("SELECT * FROM providers ORDER BY createdAt ASC")
+    fun observeProvidersWithModels(): Flow<List<ProviderWithModels>>
+
+    @Transaction
+    @Query("SELECT * FROM providers WHERE isEnabled = 1 ORDER BY createdAt ASC")
+    fun observeEnabledProvidersWithModels(): Flow<List<ProviderWithModels>>
+
+    @Transaction
+    @Query("SELECT * FROM providers WHERE id = :id")
+    fun observeProviderWithModels(id: Long): Flow<ProviderWithModels?>
+
+    @Transaction
+    @Query(
+        "SELECT * FROM providers " +
+            "WHERE name LIKE '%' || :query || '%' OR baseUrl LIKE '%' || :query || '%' OR type LIKE '%' || :query || '%' " +
+            "ORDER BY updatedAt DESC, createdAt ASC"
+    )
+    fun searchProvidersWithModels(query: String): Flow<List<ProviderWithModels>>
+
+    @Transaction
+    @Query("SELECT * FROM providers WHERE id = :id")
+    suspend fun getProviderWithModels(id: Long): ProviderWithModels?
 
     @Query("SELECT * FROM providers ORDER BY createdAt ASC")
     suspend fun getAll(): List<ProviderEntity>
@@ -24,6 +49,54 @@ interface ProviderDao {
     @Update
     suspend fun update(provider: ProviderEntity)
 
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertModelsForProvider(models: List<ModelEntity>)
+
+    @Query("DELETE FROM models WHERE providerId = :providerId")
+    suspend fun deleteModelsForProvider(providerId: Long)
+
+    @Transaction
+    suspend fun upsertProviderWithModels(
+        provider: ProviderEntity,
+        isUpdate: Boolean,
+        models: List<ModelEntity>?
+    ): Long {
+        val providerId = if (isUpdate) {
+            update(provider)
+            provider.id
+        } else {
+            insert(provider)
+        }
+        if (models != null) {
+            deleteModelsForProvider(providerId)
+            if (models.isNotEmpty()) {
+                insertModelsForProvider(models.map { it.copy(providerId = providerId) })
+            }
+        }
+        return providerId
+    }
+
+    @Query("UPDATE providers SET encryptedApiKey = :encryptedApiKey, updatedAt = :updatedAt WHERE id = :id")
+    suspend fun updateEncryptedApiKey(
+        id: Long,
+        encryptedApiKey: String?,
+        updatedAt: Long = System.currentTimeMillis()
+    )
+
+    @Query("UPDATE providers SET isEnabled = :enabled, updatedAt = :updatedAt WHERE id = :id")
+    suspend fun setEnabled(
+        id: Long,
+        enabled: Boolean,
+        updatedAt: Long = System.currentTimeMillis()
+    )
+
+    @Query("UPDATE providers SET defaultModelId = :modelId, updatedAt = :updatedAt WHERE id = :id")
+    suspend fun setDefaultModelId(
+        id: Long,
+        modelId: String?,
+        updatedAt: Long = System.currentTimeMillis()
+    )
+
     @Query("DELETE FROM providers WHERE id = :id")
     suspend fun deleteById(id: Long)
 
@@ -35,6 +108,9 @@ interface ProviderDao {
 interface ModelDao {
     @Query("SELECT * FROM models ORDER BY displayName ASC")
     fun observeAllModels(): Flow<List<ModelEntity>>
+
+    @Query("SELECT * FROM models WHERE providerId = :providerId ORDER BY displayName ASC")
+    fun observeByProviderId(providerId: Long): Flow<List<ModelEntity>>
 
     @Query("SELECT * FROM models ORDER BY displayName ASC")
     suspend fun getAll(): List<ModelEntity>
@@ -53,6 +129,14 @@ interface ModelDao {
 
     @Update
     suspend fun update(model: ModelEntity)
+
+    @Transaction
+    suspend fun replaceModelsForProvider(providerId: Long, models: List<ModelEntity>) {
+        deleteByProviderId(providerId)
+        if (models.isNotEmpty()) {
+            insertAll(models.map { it.copy(providerId = providerId) })
+        }
+    }
 
     @Query("DELETE FROM models WHERE id = :id")
     suspend fun deleteById(id: Long)

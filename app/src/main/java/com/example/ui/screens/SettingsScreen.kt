@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.provider.Settings as AndroidSettings
 import com.example.widget.AllChatWidgetProvider
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -64,9 +65,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextDecoration
@@ -85,10 +88,12 @@ import com.example.domain.model.ProviderConfig
 import com.example.domain.model.ProviderType
 import com.example.domain.model.SelectableModel
 import com.example.domain.model.WebSearchProvider
+import com.example.ui.components.CustomAppsSettingsPanel
 import com.example.ui.components.ModelPickerButton
 import com.example.ui.components.ModelPricingDialog
 import com.example.ui.components.PasswordPromptDialog
 import com.example.ui.components.ProviderCatalogSheet
+import com.example.ui.components.QuickContactsSettingsPanel
 import com.example.ui.components.SwissBadge
 import com.example.ui.components.SwissButton
 import com.example.ui.components.SwissButtonVariant
@@ -99,6 +104,7 @@ import com.example.ui.components.SwissRuleDivider
 import com.example.ui.components.SwissToggleCell
 import com.example.ui.components.SwissUtilityHeader
 import com.example.ui.components.VaultSecurityAndBackupPanel
+import com.example.ui.components.VisionFallbackSettingsPanel
 import com.example.ui.components.swissGraphPaper
 import com.example.ui.components.swissRegistrationMarks
 import com.example.ui.components.swissTextFieldColors
@@ -123,10 +129,12 @@ import com.example.ui.viewmodel.SettingsViewModel
 fun SettingsScreen(
     viewModel: SettingsViewModel,
     onNavigateBack: () -> Unit,
+    onTestAssistantOverlay: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
     val scope = rememberCoroutineScope()
 
     var showPinSetupDialog by remember { mutableStateOf(false) }
@@ -290,6 +298,36 @@ fun SettingsScreen(
                     }
                 }
 
+                // Live Lens 429 Auto-Failover Vision Fallback Queue
+                if (state.visionModels.isNotEmpty()) {
+                    item {
+                        VisionFallbackSettingsPanel(
+                            visionModels = state.visionModels,
+                            fallbackQueueIds = state.visionFallbackModelIds,
+                            onUpdateQueue = viewModel::updateVisionFallbackQueue
+                        )
+                    }
+                }
+
+                // Quick Contacts Manager (Zero-Permission Phone Contact Picker + Manual Entry)
+                item {
+                    QuickContactsSettingsPanel(
+                        contacts = state.quickContacts,
+                        onSaveContact = viewModel::saveQuickContact,
+                        onDeleteContact = viewModel::deleteQuickContact,
+                        onReportError = viewModel::reportVaultError
+                    )
+                }
+
+                // Custom App Packages Manager (for "Open <App>" Device Actions)
+                item {
+                    CustomAppsSettingsPanel(
+                        customApps = state.customApps,
+                        onSaveCustomApp = viewModel::saveCustomApp,
+                        onDeleteCustomApp = viewModel::deleteCustomApp
+                    )
+                }
+
                 // ChatGPT / Claude Conversation History Importer
                 item {
                     SwissPanel(modifier = Modifier.fillMaxWidth()) {
@@ -368,6 +406,111 @@ fun SettingsScreen(
                                 widgetPinStatus?.let { notice ->
                                     Text(
                                         text = notice,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = SwissSignalRed
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Assistant Overlay & Volume Up + Volume Down System-Wide Trigger Guide
+                item {
+                    var triggerNotice by remember { mutableStateOf<String?>(null) }
+                    SwissPanel(modifier = Modifier.fillMaxWidth()) {
+                        Column {
+                            SwissPanelHeader(
+                                leftLabel = "SYS // ASSISTANT OVERLAY & VOLUME TRIGGER",
+                                rightLabel = "VOL UP + DOWN",
+                                rightAccent = true
+                            )
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text(
+                                    text = "In-App Hardware Chord: Press Volume Up + Volume Down simultaneously (within 300ms) anywhere inside AllChat to pop open the Voice & Lens Assistant Overlay.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = SwissInk
+                                )
+                                Text(
+                                    text = "System-Wide (Lock Screen / Any App): Bind Volume Up + Down via Android Accessibility → Volume key shortcut, Key Mapper, or Default Digital Assistant to launch:\n• Deep Link: allchat://assistant\n• Activity: com.example.ui.assistant.AssistantOverlayActivity",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = SwissMuted
+                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    SwissButton(
+                                        text = "Test Overlay",
+                                        variant = SwissButtonVariant.PRIMARY,
+                                        minHeight = 40.dp,
+                                        onClick = onTestAssistantOverlay,
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .testTag("settings_test_assistant_overlay")
+                                    )
+                                    SwissButton(
+                                        text = "Copy Deep Link",
+                                        variant = SwissButtonVariant.OUTLINE,
+                                        minHeight = 40.dp,
+                                        onClick = {
+                                            clipboard.setText(AnnotatedString("allchat://assistant"))
+                                            triggerNotice = "COPIED // allchat://assistant copied for Key Mapper / Shortcuts."
+                                        },
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .testTag("settings_copy_assistant_uri")
+                                    )
+                                }
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    SwissButton(
+                                        text = "Accessibility Settings",
+                                        variant = SwissButtonVariant.INK,
+                                        minHeight = 40.dp,
+                                        onClick = {
+                                            runCatching {
+                                                context.startActivity(
+                                                    Intent(AndroidSettings.ACTION_ACCESSIBILITY_SETTINGS).apply {
+                                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                    }
+                                                )
+                                            }.onFailure {
+                                                triggerNotice = "ERR // Open Android Settings → Accessibility manually."
+                                            }
+                                        },
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .testTag("settings_open_accessibility")
+                                    )
+                                    SwissButton(
+                                        text = "Default Assistant",
+                                        variant = SwissButtonVariant.OUTLINE,
+                                        minHeight = 40.dp,
+                                        onClick = {
+                                            runCatching {
+                                                context.startActivity(
+                                                    Intent(AndroidSettings.ACTION_VOICE_INPUT_SETTINGS).apply {
+                                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                    }
+                                                )
+                                            }.onFailure {
+                                                triggerNotice = "ERR // Open Android Settings → Default Apps → Digital Assistant."
+                                            }
+                                        },
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .testTag("settings_open_default_assistant")
+                                    )
+                                }
+                                triggerNotice?.let { note ->
+                                    Text(
+                                        text = note,
                                         style = MaterialTheme.typography.labelSmall,
                                         color = SwissSignalRed
                                     )
@@ -485,6 +628,7 @@ fun SettingsScreen(
                             fetchMessage = state.fetchMessages[provider.id],
                             onEdit = { viewModel.openEditProvider(provider) },
                             onDelete = { viewModel.deleteProvider(provider.id) },
+                            onToggleEnabled = { enabled -> viewModel.toggleProviderEnabled(provider.id, enabled) },
                             onTest = { viewModel.testConnection(provider) },
                             onFetchModels = { viewModel.fetchModels(provider) },
                             onAddManualModel = { modelId -> viewModel.addManualModel(provider.id, modelId) },
@@ -514,7 +658,16 @@ fun SettingsScreen(
         ProviderEditorDialog(
             editor = state.editor,
             onBrowseCatalog = viewModel::openCatalog,
-            onUpdateFields = viewModel::updateEditorFields,
+            onUpdateFields = { n, t, b, p, k, modelsText ->
+                viewModel.updateEditorFields(
+                    name = n,
+                    type = t,
+                    baseUrl = b,
+                    proxyUrl = p,
+                    apiKey = k,
+                    customModelsText = modelsText
+                )
+            },
             onDismiss = viewModel::dismissEditor,
             onSave = viewModel::saveEditorProvider
         )
@@ -653,6 +806,7 @@ private fun ProviderPanel(
     fetchMessage: String?,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
+    onToggleEnabled: (Boolean) -> Unit,
     onTest: () -> Unit,
     onFetchModels: () -> Unit,
     onAddManualModel: (String) -> Unit,
@@ -677,7 +831,7 @@ private fun ProviderPanel(
                 Row(
                     modifier = Modifier.weight(1f),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     SwissBadge(
                         text = provider.type.label,
@@ -689,6 +843,13 @@ private fun ProviderPanel(
                         text = if (provider.hasApiKey) "KEY ENCRYPTED" else "NO KEY",
                         containerColor = if (provider.hasApiKey) SwissVerifiedTint else SwissConcrete,
                         contentColor = if (provider.hasApiKey) SwissVerifiedInk else SwissInk
+                    )
+                    SwissToggleCell(
+                        label = if (provider.isEnabled) "ON" else "PAUSED",
+                        selected = provider.isEnabled,
+                        useSignalRedWhenSelected = false,
+                        onClick = { onToggleEnabled(!provider.isEnabled) },
+                        modifier = Modifier.testTag("toggle_provider_enabled_${provider.id}")
                     )
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -971,7 +1132,8 @@ private fun ProviderEditorDialog(
         type: ProviderType?,
         baseUrl: String?,
         proxyUrl: String?,
-        apiKey: String?
+        apiKey: String?,
+        customModelsText: String?
     ) -> Unit,
     onDismiss: () -> Unit,
     onSave: () -> Unit
@@ -1054,7 +1216,7 @@ private fun ProviderEditorDialog(
 
                 OutlinedTextField(
                     value = editor.name,
-                    onValueChange = { onUpdateFields(it, null, null, null, null) },
+                    onValueChange = { onUpdateFields(it, null, null, null, null, null) },
                     label = { Text("Provider Name") },
                     singleLine = true,
                     shape = RectangleShape,
@@ -1089,14 +1251,14 @@ private fun ProviderEditorDialog(
                             label = type.label,
                             selected = editor.type == type,
                             useSignalRedWhenSelected = type == ProviderType.GEMINI,
-                            onClick = { onUpdateFields(null, type, null, null, null) }
+                            onClick = { onUpdateFields(null, type, null, null, null, null) }
                         )
                     }
                 }
 
                 OutlinedTextField(
                     value = editor.baseUrl,
-                    onValueChange = { onUpdateFields(null, null, it, null, null) },
+                    onValueChange = { onUpdateFields(null, null, it, null, null, null) },
                     label = { Text("Base URL") },
                     singleLine = true,
                     shape = RectangleShape,
@@ -1108,7 +1270,7 @@ private fun ProviderEditorDialog(
 
                 OutlinedTextField(
                     value = editor.proxyUrl,
-                    onValueChange = { onUpdateFields(null, null, null, it, null) },
+                    onValueChange = { onUpdateFields(null, null, null, it, null, null) },
                     label = { Text("Proxy / Gateway URL (Optional)") },
                     placeholder = { Text("https://my-proxy.example.com/v1") },
                     singleLine = true,
@@ -1121,7 +1283,7 @@ private fun ProviderEditorDialog(
 
                 OutlinedTextField(
                     value = editor.apiKey,
-                    onValueChange = { onUpdateFields(null, null, null, null, it) },
+                    onValueChange = { onUpdateFields(null, null, null, null, it, null) },
                     label = {
                         Text(
                             if (editor.requiresApiKey) {
@@ -1154,6 +1316,26 @@ private fun ProviderEditorDialog(
                     modifier = Modifier
                         .fillMaxWidth()
                         .testTag("editor_api_key")
+                )
+
+                OutlinedTextField(
+                    value = editor.customModelsText,
+                    onValueChange = { onUpdateFields(null, null, null, null, null, it) },
+                    label = { Text("Model List (Optional, comma-separated)") },
+                    placeholder = { Text("gpt-4o, deepseek-r1, llama-3.3-70b") },
+                    supportingText = {
+                        Text(
+                            "Pre-seed custom model IDs directly into Room, or leave blank and tap Fetch Models after saving.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SwissMuted
+                        )
+                    },
+                    maxLines = 3,
+                    shape = RectangleShape,
+                    colors = swissTextFieldColors(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("editor_custom_models")
                 )
             }
         },

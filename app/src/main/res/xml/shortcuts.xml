@@ -50,17 +50,29 @@
 
     <shortcut
         android:enabled="true"
+        android:icon="@drawable/ic_shortcut_voice"
+        android:shortcutId="shortcut_assistant"
+        android:shortcutLongLabel="@string/shortcut_assistant_long"
+        android:shortcutShortLabel="@string/shortcut_assistant_short">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetClass="com.example.ui.assistant.AssistantOverlayActivity"
+            android:targetPackage="com.aistudio.allchat.kxmpzq" />
+    </shortcut>
+
+    <shortcut
+        android:enabled="true"
         android:icon="@drawable/ic_shortcut_image"
-        android:shortcutId="shortcut_image"
-        android:shortcutLongLabel="@string/shortcut_image_long"
-        android:shortcutShortLabel="@string/shortcut_image_short">
+        android:shortcutId="shortcut_lens"
+        android:shortcutLongLabel="@string/shortcut_lens_long"
+        android:shortcutShortLabel="@string/shortcut_lens_short">
         <intent
             android:action="android.intent.action.VIEW"
             android:targetClass="com.example.MainActivity"
             android:targetPackage="com.aistudio.allchat.kxmpzq">
             <extra
                 android:name="allchat_action"
-                android:value="image" />
+                android:value="lens_translate" />
         </intent>
     </shortcut>
 </shortcuts>

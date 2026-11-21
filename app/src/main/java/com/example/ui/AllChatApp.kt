@@ -4,6 +4,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.net.Uri
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
@@ -20,6 +21,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.platform.LocalContext
@@ -29,20 +31,27 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import androidx.navigation.toRoute
 import com.example.data.repository.AllChatRepository
 import com.example.domain.model.IncomingAppAction
 import com.example.domain.model.IncomingSharePayload
+import com.example.ui.components.AssistantOverlaySheet
+import com.example.ui.components.FloatingSidebarDock
+import com.example.ui.components.LiveLensScreen
 import com.example.ui.components.PinLockOverlay
 import com.example.ui.components.SwissButton
 import com.example.ui.components.SwissButtonVariant
 import com.example.ui.screens.ArenaScreen
 import com.example.ui.screens.ChatScreen
+import com.example.ui.screens.CodeDebuggerScreen
 import com.example.ui.screens.ImageScreen
 import com.example.ui.screens.KnowledgeScreen
 import com.example.ui.screens.PipelineScreen
+import com.example.ui.screens.RewriteStudioScreen
 import com.example.ui.screens.SettingsScreen
 import com.example.ui.screens.SummarizeScreen
 import com.example.ui.screens.VideoScreen
+import com.example.ui.screens.YouTubeExtractorScreen
 import com.example.ui.theme.SwissCanvas
 import com.example.ui.theme.SwissInk
 import com.example.ui.theme.SwissMuted
@@ -51,13 +60,16 @@ import com.example.ui.theme.SwissThemeState
 import com.example.ui.viewmodel.AllChatViewModelFactory
 import com.example.ui.viewmodel.ArenaViewModel
 import com.example.ui.viewmodel.ChatViewModel
+import com.example.ui.viewmodel.CodeDebuggerViewModel
 import com.example.ui.viewmodel.ImageViewModel
 import com.example.ui.viewmodel.KnowledgeViewModel
 import com.example.ui.viewmodel.PipelineViewModel
+import com.example.ui.viewmodel.RewriteStudioViewModel
 import com.example.ui.viewmodel.SettingsViewModel
 import com.example.ui.viewmodel.SummarizeInputMode
 import com.example.ui.viewmodel.SummarizeViewModel
 import com.example.ui.viewmodel.VideoViewModel
+import com.example.ui.viewmodel.YouTubeExtractorViewModel
 import kotlinx.serialization.Serializable
 
 @Serializable data object ChatRoute
@@ -67,6 +79,10 @@ import kotlinx.serialization.Serializable
 @Serializable data object SummarizeRoute
 @Serializable data object ImageRoute
 @Serializable data object VideoRoute
+@Serializable data object RewriteRoute
+@Serializable data object DebuggerRoute
+@Serializable data object YouTubeRoute
+@Serializable data class LiveLensRoute(val startInTranslator: Boolean = false)
 @Serializable data object SettingsRoute
 
 @Composable
@@ -81,6 +97,7 @@ fun AllChatApp(
     val isLocked by repository.isLockedFlow.collectAsStateWithLifecycle()
     val themeId by repository.themePresetIdFlow.collectAsStateWithLifecycle(initialValue = SwissThemePreset.SWISS_SIGNAL.id)
     var pendingDocShareUri by remember { mutableStateOf<String?>(null) }
+    var showAssistantOverlay by remember { mutableStateOf(false) }
 
     LaunchedEffect(themeId) {
         SwissThemeState.activePreset = SwissThemePreset.fromId(themeId)
@@ -105,6 +122,9 @@ fun AllChatApp(
     val summarizeViewModel: SummarizeViewModel = viewModel(factory = factory)
     val imageViewModel: ImageViewModel = viewModel(factory = factory)
     val videoViewModel: VideoViewModel = viewModel(factory = factory)
+    val rewriteViewModel: RewriteStudioViewModel = viewModel(factory = factory)
+    val debuggerViewModel: CodeDebuggerViewModel = viewModel(factory = factory)
+    val youtubeViewModel: YouTubeExtractorViewModel = viewModel(factory = factory)
     val settingsViewModel: SettingsViewModel = viewModel(factory = factory)
 
     val navController = rememberNavController()
@@ -163,6 +183,18 @@ fun AllChatApp(
             IncomingAppAction.CAMERA_VISION -> {
                 navController.popBackStack(ChatRoute, inclusive = false)
                 chatViewModel.triggerCameraVision()
+                onAppActionConsumed()
+            }
+            IncomingAppAction.ASSISTANT_OVERLAY -> {
+                showAssistantOverlay = true
+                onAppActionConsumed()
+            }
+            IncomingAppAction.LIVE_LENS_EXPLAIN -> {
+                navigateTo(LiveLensRoute(startInTranslator = false))
+                onAppActionConsumed()
+            }
+            IncomingAppAction.LIVE_LENS_TRANSLATE -> {
+                navigateTo(LiveLensRoute(startInTranslator = true))
                 onAppActionConsumed()
             }
             null -> Unit
@@ -233,86 +265,164 @@ fun AllChatApp(
         )
     }
 
+    val chatState by chatViewModel.uiState.collectAsStateWithLifecycle()
+
     Scaffold(
         containerColor = SwissCanvas,
         contentWindowInsets = WindowInsets.safeDrawing
     ) { innerPadding ->
-        NavHost(
-            navController = navController,
-            startDestination = ChatRoute,
+        Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
-            composable<ChatRoute> {
-                ChatScreen(
-                    viewModel = chatViewModel,
-                    onOpenArena = { navigateTo(ArenaRoute) },
-                    onOpenPipeline = { navigateTo(PipelineRoute) },
-                    onOpenKnowledge = { navigateTo(KnowledgeRoute) },
-                    onOpenSummarize = { navigateTo(SummarizeRoute) },
-                    onOpenImage = { navigateTo(ImageRoute) },
-                    onOpenVideo = { navigateTo(VideoRoute) },
-                    onOpenSettings = { navigateTo(SettingsRoute) },
-                    onConnectProvider = {
-                        settingsViewModel.openCatalog()
-                        navigateTo(SettingsRoute)
-                    }
-                )
+            NavHost(
+                navController = navController,
+                startDestination = ChatRoute,
+                modifier = Modifier.fillMaxSize()
+            ) {
+                composable<ChatRoute> {
+                    ChatScreen(
+                        viewModel = chatViewModel,
+                        onOpenArena = { navigateTo(ArenaRoute) },
+                        onOpenPipeline = { navigateTo(PipelineRoute) },
+                        onOpenKnowledge = { navigateTo(KnowledgeRoute) },
+                        onOpenSummarize = { navigateTo(SummarizeRoute) },
+                        onOpenImage = { navigateTo(ImageRoute) },
+                        onOpenVideo = { navigateTo(VideoRoute) },
+                        onOpenRewrite = { navigateTo(RewriteRoute) },
+                        onOpenDebugger = { navigateTo(DebuggerRoute) },
+                        onOpenYouTube = { navigateTo(YouTubeRoute) },
+                        onOpenLiveLens = { translator -> navigateTo(LiveLensRoute(startInTranslator = translator)) },
+                        onOpenAssistantOverlay = { showAssistantOverlay = true },
+                        onSummarizeClipboardText = { clipText ->
+                            summarizeViewModel.consumeSharedPayload(clipText)
+                            navigateTo(SummarizeRoute)
+                        },
+                        onOpenSettings = { navigateTo(SettingsRoute) },
+                        onConnectProvider = {
+                            settingsViewModel.openCatalog()
+                            navigateTo(SettingsRoute)
+                        }
+                    )
+                }
+                composable<ArenaRoute> {
+                    ArenaScreen(
+                        viewModel = arenaViewModel,
+                        onNavigateBack = { navController.popBackStack() },
+                        onOpenSettings = { navigateTo(SettingsRoute) },
+                        onContinueInChat = { conversationId ->
+                            chatViewModel.selectConversation(conversationId)
+                            navController.popBackStack()
+                        }
+                    )
+                }
+                composable<PipelineRoute> {
+                    PipelineScreen(
+                        viewModel = pipelineViewModel,
+                        onNavigateBack = { navController.popBackStack() },
+                        onOpenSettings = { navigateTo(SettingsRoute) },
+                        onContinueInChat = { conversationId ->
+                            chatViewModel.selectConversation(conversationId)
+                            navController.popBackStack()
+                        }
+                    )
+                }
+                composable<KnowledgeRoute> {
+                    KnowledgeScreen(
+                        viewModel = knowledgeViewModel,
+                        onNavigateBack = { navController.popBackStack() }
+                    )
+                }
+                composable<SummarizeRoute> {
+                    SummarizeScreen(
+                        viewModel = summarizeViewModel,
+                        onNavigateBack = { navController.popBackStack() },
+                        onOpenSettings = { navigateTo(SettingsRoute) }
+                    )
+                }
+                composable<ImageRoute> {
+                    ImageScreen(
+                        viewModel = imageViewModel,
+                        onNavigateBack = { navController.popBackStack() },
+                        onOpenSettings = { navigateTo(SettingsRoute) }
+                    )
+                }
+                composable<VideoRoute> {
+                    VideoScreen(
+                        viewModel = videoViewModel,
+                        onNavigateBack = { navController.popBackStack() },
+                        onOpenSettings = { navigateTo(SettingsRoute) }
+                    )
+                }
+                composable<RewriteRoute> {
+                    RewriteStudioScreen(
+                        viewModel = rewriteViewModel,
+                        onNavigateBack = { navController.popBackStack() },
+                        onOpenSettings = { navigateTo(SettingsRoute) }
+                    )
+                }
+                composable<DebuggerRoute> {
+                    CodeDebuggerScreen(
+                        viewModel = debuggerViewModel,
+                        onNavigateBack = { navController.popBackStack() },
+                        onOpenSettings = { navigateTo(SettingsRoute) }
+                    )
+                }
+                composable<YouTubeRoute> {
+                    YouTubeExtractorScreen(
+                        viewModel = youtubeViewModel,
+                        onNavigateBack = { navController.popBackStack() },
+                        onOpenSettings = { navigateTo(SettingsRoute) }
+                    )
+                }
+                composable<LiveLensRoute> { backStackEntry ->
+                    val route = backStackEntry.toRoute<LiveLensRoute>()
+                    LiveLensScreen(
+                        repository = repository,
+                        preferredModel = chatState.selectedModel,
+                        initialTranslatorMode = route.startInTranslator,
+                        onNavigateBack = { navController.popBackStack() },
+                        onOpenSettings = { navigateTo(SettingsRoute) }
+                    )
+                }
+                composable<SettingsRoute> {
+                    SettingsScreen(
+                        viewModel = settingsViewModel,
+                        onNavigateBack = { navController.popBackStack() },
+                        onTestAssistantOverlay = { showAssistantOverlay = true }
+                    )
+                }
             }
-            composable<ArenaRoute> {
-                ArenaScreen(
-                    viewModel = arenaViewModel,
-                    onNavigateBack = { navController.popBackStack() },
-                    onOpenSettings = { navigateTo(SettingsRoute) },
-                    onContinueInChat = { conversationId ->
-                        chatViewModel.selectConversation(conversationId)
-                        navController.popBackStack()
-                    }
-                )
-            }
-            composable<PipelineRoute> {
-                PipelineScreen(
-                    viewModel = pipelineViewModel,
-                    onNavigateBack = { navController.popBackStack() },
-                    onOpenSettings = { navigateTo(SettingsRoute) },
-                    onContinueInChat = { conversationId ->
-                        chatViewModel.selectConversation(conversationId)
-                        navController.popBackStack()
-                    }
-                )
-            }
-            composable<KnowledgeRoute> {
-                KnowledgeScreen(
-                    viewModel = knowledgeViewModel,
-                    onNavigateBack = { navController.popBackStack() }
-                )
-            }
-            composable<SummarizeRoute> {
-                SummarizeScreen(
-                    viewModel = summarizeViewModel,
-                    onNavigateBack = { navController.popBackStack() },
-                    onOpenSettings = { navigateTo(SettingsRoute) }
-                )
-            }
-            composable<ImageRoute> {
-                ImageScreen(
-                    viewModel = imageViewModel,
-                    onNavigateBack = { navController.popBackStack() },
-                    onOpenSettings = { navigateTo(SettingsRoute) }
-                )
-            }
-            composable<VideoRoute> {
-                VideoScreen(
-                    viewModel = videoViewModel,
-                    onNavigateBack = { navController.popBackStack() },
-                    onOpenSettings = { navigateTo(SettingsRoute) }
-                )
-            }
-            composable<SettingsRoute> {
-                SettingsScreen(
-                    viewModel = settingsViewModel,
-                    onNavigateBack = { navController.popBackStack() }
+
+            // Right-Edge ColorOS / Android Floating Smart Sidebar Dock
+            FloatingSidebarDock(
+                isMiniWindowMode = chatState.miniModeEnabled,
+                onToggleMiniWindowMode = { chatViewModel.toggleMiniMode() },
+                onOpenLiveTranslator = { navigateTo(LiveLensRoute(startInTranslator = true)) },
+                onOpenAssistantOverlay = { showAssistantOverlay = true },
+                onOpenMiniChat = { navController.popBackStack(ChatRoute, inclusive = false) },
+                onTriggerDeviceAction = { action ->
+                    chatViewModel.setPendingDeviceAction(action)
+                    navController.popBackStack(ChatRoute, inclusive = false)
+                },
+                modifier = Modifier.align(Alignment.CenterEnd)
+            )
+
+            // In-App Google-Assistant-Style Bottom-Sheet Overlay (Volume Up+Down Chord or Quick Launch)
+            if (showAssistantOverlay) {
+                AssistantOverlaySheet(
+                    repository = repository,
+                    autoStartMic = true,
+                    onOpenTranslateCamera = {
+                        showAssistantOverlay = false
+                        navigateTo(LiveLensRoute(startInTranslator = true))
+                    },
+                    onOpenLiveLensExplain = {
+                        showAssistantOverlay = false
+                        navigateTo(LiveLensRoute(startInTranslator = false))
+                    },
+                    onDismiss = { showAssistantOverlay = false }
                 )
             }
         }
