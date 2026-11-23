@@ -54,7 +54,7 @@ import com.example.util.DeviceActionEngine
 @Composable
 fun QuickContactsSettingsPanel(
     contacts: List<QuickContact>,
-    onSaveContact: (name: String, phone: String) -> Unit,
+    onSaveContact: (name: String, phone: String, email: String, upiId: String) -> Unit,
     onDeleteContact: (id: String) -> Unit,
     onReportError: (String) -> Unit,
     modifier: Modifier = Modifier
@@ -62,6 +62,8 @@ fun QuickContactsSettingsPanel(
     val context = LocalContext.current
     var nameDraft by remember { mutableStateOf("") }
     var phoneDraft by remember { mutableStateOf("") }
+    var emailDraft by remember { mutableStateOf("") }
+    var upiDraft by remember { mutableStateOf("") }
 
     // Zero-permission Android Phone Contact Picker (Google Play Policy compliant — NO READ_CONTACTS required)
     val contactPickerLauncher = rememberLauncherForActivityResult(
@@ -81,7 +83,7 @@ fun QuickContactsSettingsPanel(
                         val pickedName = if (nameIdx >= 0) cursor.getString(nameIdx).orEmpty().trim() else ""
                         val pickedNum = if (numIdx >= 0) cursor.getString(numIdx).orEmpty().trim() else ""
                         if (pickedName.isNotBlank() && pickedNum.isNotBlank()) {
-                            onSaveContact(pickedName, DeviceActionEngine.normalizePhoneNumber(pickedNum))
+                            onSaveContact(pickedName, DeviceActionEngine.normalizePhoneNumber(pickedNum), "", "")
                         } else {
                             onReportError("Selected contact did not contain a valid phone number.")
                         }
@@ -96,7 +98,7 @@ fun QuickContactsSettingsPanel(
     SwissPanel(modifier = modifier.fillMaxWidth()) {
         Column {
             SwissPanelHeader(
-                leftLabel = "ACTIONS // QUICK CONTACTS (CALL & WHATSAPP)",
+                leftLabel = "ACTIONS // QUICK CONTACTS (CALL, SMS, EMAIL & UPI)",
                 rightLabel = "${contacts.size} SAVED"
             )
             Column(
@@ -104,7 +106,7 @@ fun QuickContactsSettingsPanel(
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Text(
-                    text = "Save contacts locally so saying \"Call Mom\" or \"WhatsApp Rahul saying I'll be late\" resolves automatically without requesting broad contacts permissions.",
+                    text = "Save phone numbers, emails, and UPI IDs locally so commands like \"Call Mom\", \"SMS Rahul\", \"Email Priya\", or \"Pay 250 to Amit via UPI\" resolve automatically without broad permissions.",
                     style = MaterialTheme.typography.bodySmall,
                     color = SwissMuted
                 )
@@ -159,16 +161,52 @@ fun QuickContactsSettingsPanel(
                     )
                 }
 
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    OutlinedTextField(
+                        value = emailDraft,
+                        onValueChange = { emailDraft = it },
+                        placeholder = { Text("Email (optional)", style = MaterialTheme.typography.bodySmall) },
+                        singleLine = true,
+                        shape = RectangleShape,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+                        colors = swissTextFieldColors(containerColor = SwissCanvas),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("settings_contact_email_input")
+                    )
+                    OutlinedTextField(
+                        value = upiDraft,
+                        onValueChange = { upiDraft = it },
+                        placeholder = { Text("UPI ID (name@bank)", style = MaterialTheme.typography.bodySmall) },
+                        singleLine = true,
+                        shape = RectangleShape,
+                        colors = swissTextFieldColors(containerColor = SwissCanvas),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("settings_contact_upi_input")
+                    )
+                }
+
                 SwissButton(
                     text = "Add Quick Contact",
                     leadingIcon = Icons.Filled.Add,
                     variant = SwissButtonVariant.INK,
-                    enabled = nameDraft.isNotBlank() && phoneDraft.isNotBlank(),
+                    enabled = nameDraft.isNotBlank() && (phoneDraft.isNotBlank() || emailDraft.isNotBlank() || upiDraft.isNotBlank()),
                     minHeight = 40.dp,
                     onClick = {
-                        onSaveContact(nameDraft.trim(), DeviceActionEngine.normalizePhoneNumber(phoneDraft))
+                        onSaveContact(
+                            nameDraft.trim(),
+                            if (phoneDraft.isNotBlank()) DeviceActionEngine.normalizePhoneNumber(phoneDraft) else "",
+                            emailDraft.trim(),
+                            upiDraft.trim()
+                        )
                         nameDraft = ""
                         phoneDraft = ""
+                        emailDraft = ""
+                        upiDraft = ""
                     },
                     modifier = Modifier
                         .fillMaxWidth()
@@ -195,10 +233,17 @@ fun QuickContactsSettingsPanel(
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
                                     )
+                                    val detailLine = listOfNotNull(
+                                        contact.phoneNumber.takeIf { it.isNotBlank() },
+                                        contact.email.takeIf { it.isNotBlank() },
+                                        contact.upiId.takeIf { it.isNotBlank() }?.let { "UPI: $it" }
+                                    ).joinToString(" · ")
                                     Text(
-                                        text = contact.phoneNumber,
+                                        text = detailLine,
                                         style = MaterialTheme.typography.labelSmall,
-                                        color = SwissMuted
+                                        color = SwissMuted,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
                                     )
                                 }
                                 Icon(

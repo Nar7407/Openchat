@@ -3,9 +3,15 @@ package com.example.data.repository
 import android.content.Context
 import android.net.Uri
 import com.example.data.local.ApiKeyVault
+import com.example.data.local.CanvasVersionDao
+import com.example.data.local.CanvasVersionEntity
+import com.example.data.local.ClipboardDao
+import com.example.data.local.ClipboardItemEntity
 import com.example.data.local.ConversationDao
 import com.example.data.local.ConversationEntity
 import com.example.data.local.ConversationImporter
+import com.example.data.local.ExpenseDao
+import com.example.data.local.ExpenseEntity
 import com.example.data.local.GeneratedMediaDao
 import com.example.data.local.GeneratedMediaEntity
 import com.example.data.local.KnowledgeDocDao
@@ -18,10 +24,18 @@ import com.example.data.local.PersonaDao
 import com.example.data.local.PersonaEntity
 import com.example.data.local.ProviderDao
 import com.example.data.local.ProviderEntity
+import com.example.data.local.RoutineDao
+import com.example.data.local.RoutineEntity
 import com.example.data.local.UserMemoryDao
 import com.example.data.local.UserMemoryEntity
 import com.example.data.local.VaultBackupManager
 import com.example.data.local.VaultSnapshot
+import com.example.data.local.VoiceNoteDao
+import com.example.data.local.VoiceNoteEntity
+import com.example.data.local.WatchlistDao
+import com.example.data.local.WatchlistItemEntity
+import com.example.data.local.WebhookActionEntity
+import com.example.data.local.WebhookDao
 import android.graphics.Bitmap
 import com.example.data.remote.AiRouter
 import com.example.data.remote.ChatInputMessage
@@ -33,6 +47,7 @@ import com.example.data.remote.WebSearchClient
 import com.example.data.remote.YouTubeExtractorClient
 import com.example.domain.model.AiErrorCategory
 import com.example.domain.model.AiException
+import com.example.domain.model.AssistantRoutine
 import com.example.domain.model.AutoRouterConfig
 import com.example.domain.model.ChatOptions
 import com.example.domain.model.ClientToolEngine
@@ -57,14 +72,35 @@ import com.example.domain.model.ProviderType
 import com.example.domain.model.QuickContact
 import com.example.domain.model.QuizQuestion
 import com.example.domain.model.RewritePreset
+import com.example.domain.model.RoutineStep
+import com.example.domain.model.RoutineStepType
 import com.example.domain.model.SearchCitation
 import com.example.domain.model.SelectableModel
+import com.example.domain.model.CanvasVersionInfo
+import com.example.domain.model.ClipboardSnippetInfo
+import com.example.domain.model.DecisionCriterion
+import com.example.domain.model.DecisionMatrixData
+import com.example.domain.model.ExpenseRecord
+import com.example.domain.model.FactCheckClaim
+import com.example.domain.model.CliCommandSpec
+import com.example.domain.model.CliFlagToken
+import com.example.domain.model.DailyBudgetConfig
+import com.example.domain.model.FilledFormResult
+import com.example.domain.model.SmartZone
+import com.example.domain.model.SpotlightResult
 import com.example.domain.model.StudyCard
 import com.example.domain.model.StudyPack
 import com.example.domain.model.SummaryLength
+import com.example.domain.model.ThreadCheckpoint
+import com.example.domain.model.TopicCluster
+import com.example.domain.model.VoiceFormTemplate
 import com.example.domain.model.UserMemoryInfo
+import com.example.domain.model.VoiceNoteInfo
+import com.example.domain.model.WatchlistItemInfo
 import com.example.domain.model.WebSearchProvider
+import com.example.domain.model.WebhookActionInfo
 import com.example.util.DeviceAction
+import com.example.util.DeviceActionEngine
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withTimeout
 import java.util.concurrent.ConcurrentHashMap
@@ -98,6 +134,15 @@ data class SummaryProgress(
     val isCompleted: Boolean = false
 )
 
+data class RoutineRunResult(
+    val routineName: String,
+    val summaryText: String,
+    val spokenText: String? = null,
+    val pendingDeviceAction: DeviceAction? = null,
+    val savedNote: VoiceNoteInfo? = null,
+    val modelLabel: String = "ROUTINE"
+)
+
 class AllChatRepository(
     private val context: Context,
     private val providerDao: ProviderDao,
@@ -108,6 +153,13 @@ class AllChatRepository(
     private val knowledgeDocDao: KnowledgeDocDao,
     private val generatedMediaDao: GeneratedMediaDao,
     private val userMemoryDao: UserMemoryDao,
+    private val routineDao: RoutineDao,
+    private val voiceNoteDao: VoiceNoteDao,
+    private val expenseDao: ExpenseDao,
+    private val watchlistDao: WatchlistDao,
+    private val webhookDao: WebhookDao,
+    private val canvasVersionDao: CanvasVersionDao,
+    private val clipboardDao: ClipboardDao,
     private val apiKeyVault: ApiKeyVault,
     private val aiRouter: AiRouter,
     private val webSearchClient: WebSearchClient,
@@ -124,6 +176,14 @@ class AllChatRepository(
 
     // 60-second cooldown tracker per modelDbId when HTTP 429 / RESOURCE_EXHAUSTED is encountered
     private val modelCooldownUntilMs = ConcurrentHashMap<Long, Long>()
+    private val _cooldownSnapshotFlow = kotlinx.coroutines.flow.MutableStateFlow<Map<Long, Long>>(emptyMap())
+    val cooldownSnapshotFlow: StateFlow<Map<Long, Long>> = _cooldownSnapshotFlow
+
+    private fun markModelRateLimited(modelId: Long, durationMs: Long = 60_000L) {
+        val until = System.currentTimeMillis() + durationMs
+        modelCooldownUntilMs[modelId] = until
+        _cooldownSnapshotFlow.value = modelCooldownUntilMs.toMap()
+    }
 
     // --- Vault Lock, Themes & Command Preferences ---
 
@@ -138,6 +198,21 @@ class AllChatRepository(
     val sharedSessionsFlow: Flow<Map<Long, String>> = apiKeyVault.sharedSessionsFlow
     val searchProviderFlow: Flow<WebSearchProvider> = apiKeyVault.searchProviderFlow
     val hasSearchApiKeyFlow: Flow<Boolean> = apiKeyVault.hasSearchApiKeyFlow
+    val timeProfilesEnabledFlow: Flow<Boolean> = apiKeyVault.timeProfilesEnabledFlow
+    val autoEcoModeFlow: Flow<Boolean> = apiKeyVault.autoEcoModeFlow
+    val autoDeleteJunkChatsFlow: Flow<Boolean> = apiKeyVault.autoDeleteJunkChatsFlow
+    val localWorkspaceUriFlow: Flow<String?> = apiKeyVault.localWorkspaceUriFlow
+    val wakePhraseEnabledFlow: Flow<Boolean> = apiKeyVault.wakePhraseEnabledFlow
+    val ambientWhisperEnabledFlow: Flow<Boolean> = apiKeyVault.ambientWhisperEnabledFlow
+    val smartZonesFlow: Flow<List<SmartZone>> = apiKeyVault.smartZonesFlow
+
+    suspend fun setTimeProfilesEnabled(enabled: Boolean) = apiKeyVault.setTimeProfilesEnabled(enabled)
+    suspend fun setAutoEcoMode(enabled: Boolean) = apiKeyVault.setAutoEcoMode(enabled)
+    suspend fun setAutoDeleteJunkChats(enabled: Boolean) = apiKeyVault.setAutoDeleteJunkChats(enabled)
+    suspend fun setLocalWorkspaceUri(uri: String?) = apiKeyVault.setLocalWorkspaceUri(uri)
+    suspend fun setWakePhraseEnabled(enabled: Boolean) = apiKeyVault.setWakePhraseEnabled(enabled)
+    suspend fun setAmbientWhisperEnabled(enabled: Boolean) = apiKeyVault.setAmbientWhisperEnabled(enabled)
+    suspend fun saveSmartZones(zones: List<SmartZone>) = apiKeyVault.saveSmartZones(zones)
     val customSlashCommandsFlow: Flow<List<CustomSlashCommand>> = apiKeyVault.customSlashCommandsFlow
     val autoRouterConfigFlow: Flow<AutoRouterConfig> = apiKeyVault.autoRouterConfigFlow
     val autoRouteEnabledFlow: Flow<Boolean> = apiKeyVault.autoRouteEnabledFlow
@@ -152,6 +227,12 @@ class AllChatRepository(
         list.map { it.toDomain() }
     }
     val memoriesFlow: Flow<List<UserMemoryInfo>> = userMemoryDao.observeAll().map { list ->
+        list.map { it.toDomain() }
+    }
+    val routinesFlow: Flow<List<AssistantRoutine>> = routineDao.observeAll().map { list ->
+        list.map { it.toDomainRoutine() }
+    }
+    val voiceNotesFlow: Flow<List<VoiceNoteInfo>> = voiceNoteDao.observeAll().map { list ->
         list.map { it.toDomain() }
     }
 
@@ -260,6 +341,36 @@ class AllChatRepository(
     suspend fun unlockWithPin(passphrase: String): Boolean = apiKeyVault.unlockWithPin(passphrase)
     fun lockNow() = apiKeyVault.lockNow()
     suspend fun disablePinPassphrase() = apiKeyVault.disablePinPassphrase()
+    val autoLockMinutesFlow: Flow<Int> = apiKeyVault.autoLockMinutesFlow
+    suspend fun setAutoLockMinutes(minutes: Int) = apiKeyVault.setAutoLockMinutes(minutes)
+    val lockOnAppSwitchFlow: Flow<Boolean> = apiKeyVault.lockOnAppSwitchFlow
+    suspend fun setLockOnAppSwitch(enabled: Boolean) = apiKeyVault.setLockOnAppSwitch(enabled)
+    val dailyBudgetConfigFlow: Flow<DailyBudgetConfig> = apiKeyVault.dailyBudgetConfigFlow
+    suspend fun saveDailyBudgetConfig(config: DailyBudgetConfig) = apiKeyVault.saveDailyBudgetConfig(config)
+    val voiceFormTemplatesFlow: Flow<List<VoiceFormTemplate>> = apiKeyVault.voiceFormTemplatesFlow
+    suspend fun saveVoiceFormTemplates(templates: List<VoiceFormTemplate>) = apiKeyVault.saveVoiceFormTemplates(templates)
+    val threadCheckpointsFlow: Flow<Map<Long, List<ThreadCheckpoint>>> = apiKeyVault.threadCheckpointsFlow
+
+    fun observeTodaySpendUsd(): Flow<Double> {
+        val cal = java.util.Calendar.getInstance().apply {
+            set(java.util.Calendar.HOUR_OF_DAY, 0)
+            set(java.util.Calendar.MINUTE, 0)
+            set(java.util.Calendar.SECOND, 0)
+            set(java.util.Calendar.MILLISECOND, 0)
+        }
+        return messageDao.observeSpendSince(cal.timeInMillis)
+    }
+
+    suspend fun getTodaySpendUsd(): Double = withContext(Dispatchers.IO) {
+        val cal = java.util.Calendar.getInstance().apply {
+            set(java.util.Calendar.HOUR_OF_DAY, 0)
+            set(java.util.Calendar.MINUTE, 0)
+            set(java.util.Calendar.SECOND, 0)
+            set(java.util.Calendar.MILLISECOND, 0)
+        }
+        messageDao.getSpendSince(cal.timeInMillis)
+    }
+
     suspend fun setDisplayCurrency(currency: DisplayCurrency) = apiKeyVault.setDisplayCurrency(currency)
     suspend fun setThemePresetId(presetId: String) = apiKeyVault.setThemePresetId(presetId)
     suspend fun setShowDetails(show: Boolean) = apiKeyVault.setShowDetails(show)
@@ -1642,7 +1753,7 @@ class AllChatRepository(
                 t.message ?: "Request failed."
             )
             if (isRateLimitError(aiEx)) {
-                modelCooldownUntilMs[selectableModel.model.id] = System.currentTimeMillis() + 60_000L
+                markModelRateLimited(selectableModel.model.id)
             }
             val errContent = if (buffer.isNotEmpty()) {
                 "${buffer}\n\n---\n**Error:** ${aiEx.message}"
@@ -2314,13 +2425,42 @@ class AllChatRepository(
         history: List<Pair<String, String>> = emptyList(),
         onPartialUpdate: (modelLabel: String, partialText: String) -> Unit
     ): Pair<String, String> = withContext(Dispatchers.IO) {
+        val trimmedPrompt = prompt.trim()
+
+        // 0a. Intercept /note <memo> from Home Screen Widget -> save structured Markdown note to Room
+        if (trimmedPrompt.startsWith("/note ", ignoreCase = true) || trimmedPrompt.equals("/note", ignoreCase = true)) {
+            val memoText = trimmedPrompt.removePrefix("/note").removePrefix("/NOTE").trim()
+            if (memoText.isBlank()) {
+                return@withContext "NOTES" to "Type /note followed by your memo (e.g. /note Buy milk and send invoice tomorrow)."
+            }
+            onPartialUpdate("NOTES", "Cleaning up note into structured Markdown…")
+            val saved = saveVoiceQuickNote(memoText, resolvePreferredChatModel())
+            val widgetReply = "SAVED NOTE: ${saved.title}\n\n${cleanWidgetAnswerText(saved.markdownContent)}"
+            return@withContext "VOICE NOTE" to widgetReply
+        }
+
+        // 0b. Intercept custom Assistant Routine trigger phrases right from Home Screen Widget
+        val matchedRoutine = matchRoutineByPhrase(trimmedPrompt)
+        if (matchedRoutine != null) {
+            onPartialUpdate("ROUTINE", "Running \"${matchedRoutine.name}\"…")
+            val runResult = executeRoutine(
+                routine = matchedRoutine,
+                preferredModel = resolvePreferredChatModel(),
+                onProgress = { msg -> onPartialUpdate("ROUTINE", msg) }
+            )
+            val cleanedSummary = cleanWidgetAnswerText(runResult.summaryText)
+                .ifBlank { "Routine \"${matchedRoutine.name}\" completed." }
+            val actionSuffix = runResult.pendingDeviceAction?.let { "\n\nAction ready in AllChat: ${it.title}" } ?: ""
+            return@withContext runResult.modelLabel to (cleanedSummary + actionSuffix)
+        }
+
         val available = observeModelsForCapability(ModelCapability.TEXT_CHAT).first()
         if (available.isEmpty()) {
             throw IllegalStateException("No Text Chat model configured. Open AllChat → Settings to add an API key.")
         }
 
         val activeConvId = getOrCreateActiveConversationId(
-            defaultTitle = prompt.trim().replace("\n", " ").take(40).ifBlank { "Widget Chat" }
+            defaultTitle = trimmedPrompt.replace("\n", " ").take(40).ifBlank { "Widget Chat" }
         )
         val latestConvModelId = conversationsFlow.first().firstOrNull { it.id == activeConvId }?.selectedModelDbId
             ?: conversationsFlow.first().firstOrNull()?.selectedModelDbId
@@ -2780,12 +2920,24 @@ class AllChatRepository(
                 "Identify, explain, and summarize what is shown in this image clearly and concisely without waiting for further questions."
             LiveLensMode.LIVE_TRANSLATOR ->
                 "Extract all visible text in this image and translate it cleanly into $targetLanguage, preserving layout context."
+            LiveLensMode.SOLVE_STEP_BY_STEP ->
+                "You are an expert STEM, mathematics, physics, and engineering tutor. Carefully read all equations, expressions, homework problems, or technical diagrams in this image. Solve them clearly step-by-step. Use standard LaTeX math formatting with inline \$...\$ and display \$\$...\$\$ equations, verify your arithmetic/algebra, and highlight the **Final Answer** clearly at the end."
+            LiveLensMode.WHITEBOARD_TO_CODE ->
+                "You are an expert UI Engineer and Systems Architect. Inspect this hand-drawn sketch, wireframe, flowchart, circuit diagram, or truth table. If it is a UI wireframe, generate a complete, self-contained single-file HTML+CSS responsive working UI wrapped in ```html ... ```. If it is a flowchart, block diagram, state machine, or table, convert it into clean Mermaid.js code wrapped in ```mermaid ... ``` AND a LaTeX tabular/equation block."
         }
         val userPrompt = when (mode) {
             LiveLensMode.AUTO_EXPLAIN ->
-                "Analyze this live camera view right now."
+                "Analyze this live view right now."
             LiveLensMode.LIVE_TRANSLATOR ->
-                "Read all visible text in this camera frame and translate it cleanly into $targetLanguage."
+                "Read all visible text in this image and translate it cleanly into $targetLanguage."
+            LiveLensMode.SOLVE_STEP_BY_STEP ->
+                "Solve the math equation, homework problem, or technical diagram shown in this image step-by-step using LaTeX math notation."
+            LiveLensMode.WHITEBOARD_TO_CODE ->
+                "Digitize this hand-drawn wireframe, diagram, or whiteboard sketch into clean runnable HTML/CSS or Mermaid/LaTeX code."
+        }
+        val maxLensTokens = when (mode) {
+            LiveLensMode.SOLVE_STEP_BY_STEP, LiveLensMode.WHITEBOARD_TO_CODE -> 1600
+            else -> 720
         }
 
         var lastError: Throwable? = null
@@ -2793,7 +2945,7 @@ class AllChatRepository(
 
         for (index in attemptOrder.indices) {
             val candidate = attemptOrder[index]
-            val apiKey = apiKeyVault.getApiKey(candidate.provider.id)
+            val apiKey = getProviderApiKey(candidate.provider.id)
             val buffer = StringBuilder()
             try {
                 withTimeout(35_000L) {
@@ -2809,15 +2961,21 @@ class AllChatRepository(
                                 imageMimeType = imgMime
                             )
                         ),
-                        options = ChatOptions(systemPrompt = systemInstruction, maxTokens = 700)
+                        options = ChatOptions(systemPrompt = systemInstruction, maxTokens = maxLensTokens)
                     ).collect { event ->
                         if (event is StreamEvent.TextDelta) {
                             buffer.append(event.text)
                         }
                     }
                 }
-                val resultText = cleanWidgetAnswerText(buffer.toString())
-                    .ifBlank { "Could not read details from this frame. Hold steady and try again." }
+                val rawOut = buffer.toString()
+                val resultText = if (mode == LiveLensMode.SOLVE_STEP_BY_STEP) {
+                    stripReasoningTagsOnly(rawOut)
+                        .ifBlank { "Could not read equations or diagram details. Hold steady and try again." }
+                } else {
+                    cleanWidgetAnswerText(rawOut)
+                        .ifBlank { "Could not read details from this frame. Hold steady and try again." }
+                }
                 return@withContext LiveLensAnalysisResult(
                     modelLabel = "${candidate.model.displayName} · ${candidate.provider.name}",
                     answer = resultText,
@@ -2837,7 +2995,7 @@ class AllChatRepository(
                 lastError = t
                 if (isRateLimitError(t)) {
                     // Put rate-limited model on 60-second cooldown and auto-switch immediately!
-                    modelCooldownUntilMs[candidate.model.id] = System.currentTimeMillis() + 60_000L
+                    markModelRateLimited(candidate.model.id)
                     if (index + 1 < attemptOrder.size) {
                         val next = attemptOrder[index + 1]
                         val notice = "Rate limit hit on ${candidate.model.displayName} — auto-switched to ${next.model.displayName}"
@@ -2872,5 +3030,1391 @@ class AllChatRepository(
                 available.firstOrNull { it.model.modelId.contains(kw, ignoreCase = true) }
             }
             ?: available.first()
+    }
+
+    // --- 1-Tap Assistant Routines & Macros ---
+
+    private fun stripReasoningTagsOnly(raw: String): String = raw
+        .replace(Regex("""<think>[\s\S]*?</think>""", RegexOption.IGNORE_CASE), "")
+        .replace(Regex("""<reasoning>[\s\S]*?</reasoning>""", RegexOption.IGNORE_CASE), "")
+        .trim()
+
+    private fun RoutineEntity.toDomainRoutine(): AssistantRoutine {
+        val parsedSteps = runCatching {
+            val arr = JSONArray(stepsJson)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    val typeName = obj.optString("type", RoutineStepType.AI_PROMPT.name)
+                    val stepType = runCatching { RoutineStepType.valueOf(typeName) }
+                        .getOrDefault(RoutineStepType.AI_PROMPT)
+                    add(
+                        RoutineStep(
+                            id = obj.optString("id", "step_$i"),
+                            type = stepType,
+                            payload = obj.optString("payload", "")
+                        )
+                    )
+                }
+            }
+        }.getOrDefault(emptyList())
+        return AssistantRoutine(
+            id = id,
+            name = name,
+            triggerPhrase = triggerPhrase,
+            steps = parsedSteps,
+            createdAt = createdAt
+        )
+    }
+
+    private fun serializeRoutineSteps(steps: List<RoutineStep>): String {
+        val arr = JSONArray()
+        steps.forEachIndexed { idx, step ->
+            arr.put(
+                JSONObject()
+                    .put("id", step.id.ifBlank { "step_${idx + 1}" })
+                    .put("type", step.type.name)
+                    .put("payload", step.payload.trim())
+            )
+        }
+        return arr.toString()
+    }
+
+    suspend fun saveRoutine(routine: AssistantRoutine): Long = withContext(Dispatchers.IO) {
+        val entity = RoutineEntity(
+            id = routine.id,
+            name = routine.name.trim().ifBlank { "Untitled Routine" },
+            triggerPhrase = routine.triggerPhrase.trim(),
+            stepsJson = serializeRoutineSteps(routine.steps),
+            createdAt = if (routine.id > 0L) routine.createdAt else System.currentTimeMillis()
+        )
+        if (routine.id <= 0L) {
+            routineDao.insert(entity.copy(id = 0L))
+        } else {
+            routineDao.update(entity)
+            routine.id
+        }
+    }
+
+    suspend fun deleteRoutine(id: Long) = withContext(Dispatchers.IO) {
+        routineDao.deleteById(id)
+    }
+
+    suspend fun matchRoutineByPhrase(rawInput: String): AssistantRoutine? = withContext(Dispatchers.IO) {
+        val normalized = rawInput.trim().lowercase()
+            .removePrefix("run ")
+            .removePrefix("start ")
+            .removePrefix("routine ")
+            .trim()
+        if (normalized.length < 2) return@withContext null
+        val all = routineDao.getAll().map { it.toDomainRoutine() }
+        all.firstOrNull { r ->
+            val phrase = r.triggerPhrase.trim().lowercase()
+            val rName = r.name.trim().lowercase()
+            (phrase.isNotEmpty() && (rawInput.trim().equals(phrase, ignoreCase = true) || normalized == phrase)) ||
+                (rName.isNotEmpty() && (rawInput.trim().equals("run $rName", ignoreCase = true) || normalized == rName))
+        }
+    }
+
+    suspend fun executeRoutine(
+        routine: AssistantRoutine,
+        preferredModel: SelectableModel? = null,
+        onProgress: ((String) -> Unit)? = null
+    ): RoutineRunResult = withContext(Dispatchers.IO) {
+        val contacts = quickContactsFlow.first()
+        val apps = customAppsFlow.first()
+        val activeModel = preferredModel ?: resolveFreshModel()
+        val sections = mutableListOf<String>()
+        var lastAiOutput = ""
+        var spokenText: String? = null
+        var pendingAction: DeviceAction? = null
+        var savedNote: VoiceNoteInfo? = null
+        var modelLabel = "ROUTINE"
+
+        routine.steps.forEachIndexed { idx, step ->
+            val stepNum = idx + 1
+            val total = routine.steps.size
+            when (step.type) {
+                RoutineStepType.AI_PROMPT, RoutineStepType.AI_WEB_SEARCH -> {
+                    val promptText = step.payload.trim().ifBlank { routine.name }
+                    val useSearch = step.type == RoutineStepType.AI_WEB_SEARCH
+                    onProgress?.invoke("Step $stepNum/$total · ${if (useSearch) "Web Search + AI" else "AI Prompt"}…")
+                    if (activeModel == null) {
+                        sections += "**Step $stepNum (AI):** No model configured in Settings."
+                    } else {
+                        modelLabel = "${activeModel.model.displayName} · Routine"
+                        val apiKey = getProviderApiKey(activeModel.provider.id)
+                        val extraGrounding = if (useSearch) {
+                            val searchProvider = searchProviderFlow.first()
+                            val searchKey = getSearchApiKey()
+                            if (searchKey.isNotBlank() && searchProvider != WebSearchProvider.GEMINI_NATIVE) {
+                                runCatching {
+                                    webSearchClient.searchWeb(promptText, searchProvider, searchKey, maxResults = 5)
+                                }.getOrDefault(emptyList()).takeIf { it.isNotEmpty() }?.let { results ->
+                                    buildString {
+                                        appendLine("Live Web Search Context:")
+                                        results.forEachIndexed { i, c ->
+                                            appendLine("[${i + 1}] ${c.title} (${c.url}): ${c.snippet}")
+                                        }
+                                    }
+                                }.orEmpty()
+                            } else {
+                                ""
+                            }
+                        } else {
+                            ""
+                        }
+                        val fullPrompt = if (extraGrounding.isNotBlank()) {
+                            "$extraGrounding\n\nTask: $promptText"
+                        } else {
+                            promptText
+                        }
+                        val enableGeminiSearch = useSearch &&
+                            activeModel.provider.type == ProviderType.GEMINI &&
+                            extraGrounding.isBlank()
+                        val buffer = StringBuilder()
+                        withTimeout(30_000L) {
+                            aiRouter.streamChat(
+                                provider = activeModel.provider,
+                                apiKey = apiKey,
+                                modelId = activeModel.model.modelId,
+                                messages = listOf(ChatInputMessage(role = "USER", text = fullPrompt)),
+                                options = ChatOptions(
+                                    systemPrompt = "You are executing step $stepNum of the user's AllChat Routine \"${routine.name}\". Be crisp, structured, and directly actionable.",
+                                    maxTokens = 750,
+                                    enableGeminiGoogleSearch = enableGeminiSearch
+                                )
+                            ).collect { ev ->
+                                if (ev is StreamEvent.TextDelta) buffer.append(ev.text)
+                            }
+                        }
+                        val cleaned = stripReasoningTagsOnly(buffer.toString())
+                        if (cleaned.isNotBlank()) {
+                            lastAiOutput = cleaned
+                            sections += cleaned
+                        }
+                    }
+                }
+                RoutineStepType.READ_ALOUD_TTS -> {
+                    onProgress?.invoke("Step $stepNum/$total · Preparing Read-Aloud TTS…")
+                    val textToSpeak = step.payload.trim().ifBlank { lastAiOutput }
+                    if (textToSpeak.isNotBlank()) {
+                        spokenText = cleanWidgetAnswerText(textToSpeak)
+                    }
+                }
+                RoutineStepType.DEVICE_ACTION -> {
+                    onProgress?.invoke("Step $stepNum/$total · Preparing Device Action…")
+                    val cmd = step.payload.trim()
+                    if (cmd.isNotBlank()) {
+                        val parsed = DeviceActionEngine.parseFromPrompt(cmd, contacts, apps)
+                        if (parsed != null) {
+                            pendingAction = parsed
+                            sections += "**Device Action Ready:** ${parsed.title} — ${parsed.subtitle}"
+                        } else {
+                            sections += "**Device Action:** Could not parse \"$cmd\"."
+                        }
+                    }
+                }
+                RoutineStepType.SAVE_NOTE -> {
+                    onProgress?.invoke("Step $stepNum/$total · Saving Voice Note…")
+                    val noteSource = buildString {
+                        val label = step.payload.trim()
+                        if (label.isNotBlank()) appendLine(label)
+                        if (lastAiOutput.isNotBlank()) appendLine(lastAiOutput)
+                    }.trim().ifBlank { routine.name }
+                    val note = saveVoiceQuickNote(noteSource, activeModel)
+                    savedNote = note
+                    sections += "**Saved Note:** ${note.title}"
+                }
+            }
+        }
+
+        val finalSummary = sections.joinToString("\n\n")
+            .ifBlank { "Routine \"${routine.name}\" completed." }
+
+        RoutineRunResult(
+            routineName = routine.name,
+            summaryText = finalSummary,
+            spokenText = spokenText,
+            pendingDeviceAction = pendingAction,
+            savedNote = savedNote,
+            modelLabel = modelLabel
+        )
+    }
+
+    // --- Voice Quick-Notes Inbox (AI Memo Cleanup -> Structured Markdown in Room) ---
+
+    suspend fun saveVoiceQuickNote(
+        rawTranscript: String,
+        preferredModel: SelectableModel? = null
+    ): VoiceNoteInfo = withContext(Dispatchers.IO) {
+        val cleanRaw = rawTranscript.trim()
+        require(cleanRaw.isNotEmpty()) { "Note text cannot be empty." }
+
+        val model = preferredModel ?: resolveFreshModel()
+        var title = cleanRaw.lines().firstOrNull()?.take(48)?.trim().orEmpty().ifBlank { "Quick Note" }
+        var markdown = buildLocalStructuredNoteFallback(cleanRaw)
+        var tags = listOf("quick-note")
+
+        if (model != null) {
+            val apiKey = getProviderApiKey(model.provider.id)
+            val cleanupPrompt = """
+                Clean up this dictated voice memo or quick note into a crisp, structured Markdown note.
+                Fix speech-to-text typos/filler words, organize key points and any action items into clean Markdown bullets/checkboxes (`- [ ]`), and keep every factual detail intact.
+                Return STRICTLY valid JSON (no markdown fences outside JSON):
+                {
+                  "title": "Short 3-6 word title",
+                  "tags": ["tag1", "tag2"],
+                  "markdown": "## Summary\n...\n\n## Key Points\n- ...\n\n## Action Items\n- [ ] ..."
+                }
+
+                Raw Memo:
+                ${cleanRaw.take(6000)}
+            """.trimIndent()
+
+            val aiRaw = runCatching {
+                withTimeout(20_000L) {
+                    collectSingleCompletion(model, apiKey, cleanupPrompt) {}
+                }
+            }.getOrNull()
+
+            val jsonStr = aiRaw?.let { extractJsonObject(it) }
+            if (jsonStr != null) {
+                runCatching {
+                    val obj = JSONObject(jsonStr)
+                    val parsedTitle = obj.optString("title").trim()
+                    val parsedMd = obj.optString("markdown").trim()
+                    val tagsArr = obj.optJSONArray("tags")
+                    val parsedTags = buildList {
+                        if (tagsArr != null) {
+                            for (i in 0 until tagsArr.length().coerceAtMost(5)) {
+                                val t = tagsArr.optString(i).trim().lowercase().removePrefix("#")
+                                if (t.isNotEmpty()) add(t)
+                            }
+                        }
+                    }
+                    if (parsedTitle.isNotBlank()) title = parsedTitle.take(64)
+                    if (parsedMd.isNotBlank()) markdown = parsedMd
+                    if (parsedTags.isNotEmpty()) tags = parsedTags
+                }
+            }
+        }
+
+        val now = System.currentTimeMillis()
+        val entity = VoiceNoteEntity(
+            title = title,
+            rawTranscript = cleanRaw,
+            markdownContent = markdown,
+            tagsCsv = tags.joinToString(","),
+            createdAt = now,
+            updatedAt = now
+        )
+        val id = voiceNoteDao.insert(entity)
+        entity.copy(id = id).toDomain()
+    }
+
+    private fun buildLocalStructuredNoteFallback(raw: String): String {
+        val sentences = raw.split(Regex("""(?<=[.!?])\s+|\n+"""))
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+        return buildString {
+            appendLine("## Voice Note")
+            appendLine()
+            if (sentences.size <= 1) {
+                appendLine("- $raw")
+            } else {
+                sentences.forEach { appendLine("- $it") }
+            }
+        }.trim()
+    }
+
+    suspend fun updateVoiceNote(note: VoiceNoteInfo) = withContext(Dispatchers.IO) {
+        voiceNoteDao.update(
+            VoiceNoteEntity(
+                id = note.id,
+                title = note.title.trim().ifBlank { "Untitled Note" },
+                rawTranscript = note.rawTranscript,
+                markdownContent = note.markdownContent.trim(),
+                tagsCsv = note.tags.joinToString(",") { it.trim().removePrefix("#") },
+                createdAt = note.createdAt,
+                updatedAt = System.currentTimeMillis()
+            )
+        )
+    }
+
+    suspend fun deleteVoiceNote(id: Long) = withContext(Dispatchers.IO) {
+        voiceNoteDao.deleteById(id)
+    }
+
+    // --- 1. Private Receipt, Bill & Monthly Expense Tracker ---
+
+    val expensesFlow: Flow<List<ExpenseRecord>> = expenseDao.observeAll().map { list ->
+        list.map { it.toDomain() }
+    }
+
+    suspend fun saveExpense(record: ExpenseRecord): Long = withContext(Dispatchers.IO) {
+        expenseDao.insert(
+            ExpenseEntity(
+                id = record.id,
+                merchant = record.merchant.trim().ifBlank { "Merchant" },
+                dateIso = record.dateIso.trim().ifBlank {
+                    java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date())
+                },
+                category = record.category.trim().ifBlank { "General" },
+                amount = record.amount.coerceAtLeast(0.0),
+                currency = record.currency.trim().ifBlank { "INR" },
+                notes = record.notes.trim(),
+                createdAt = record.createdAt
+            )
+        )
+    }
+
+    suspend fun deleteExpense(id: Long) = withContext(Dispatchers.IO) {
+        expenseDao.deleteById(id)
+    }
+
+    suspend fun extractExpenseFromImage(
+        bitmap: Bitmap,
+        preferredModel: SelectableModel?
+    ): ExpenseRecord = withContext(Dispatchers.IO) {
+        val model = preferredModel?.takeIf { it.model.supportsImageInput }
+            ?: observeModelsForCapability(ModelCapability.TEXT_CHAT).first()
+                .firstOrNull { it.model.supportsImageInput }
+            ?: resolveFreshModel()
+            ?: throw IllegalStateException("Configure a Vision-capable model in Settings to scan receipts.")
+        val savedUri = saveBitmapAsAttachment(bitmap, prefix = "receipt")
+        val (b64, mime) = ImageEncoder.encodeFromStoredUri(context, savedUri)
+            ?: throw IllegalStateException("Could not encode receipt image.")
+        val apiKey = getProviderApiKey(model.provider.id)
+        val prompt = """
+            Extract the expense details from this receipt, bill, or UPI payment screenshot.
+            Return STRICTLY valid JSON only (no markdown fences):
+            {
+              "merchant": "Store or payee name",
+              "dateIso": "YYYY-MM-DD",
+              "category": "Food | Travel | Shopping | Bills | Study | Health | General",
+              "amount": 125.50,
+              "currency": "INR",
+              "notes": "Short 1-line item summary"
+            }
+        """.trimIndent()
+        val buf = StringBuilder()
+        withTimeout(35_000L) {
+            aiRouter.streamChat(
+                provider = model.provider,
+                apiKey = apiKey,
+                modelId = model.model.modelId,
+                messages = listOf(
+                    ChatInputMessage(
+                        role = "USER",
+                        text = prompt,
+                        imageBase64 = b64,
+                        imageMimeType = mime
+                    )
+                ),
+                options = ChatOptions(temperature = 0.1f, maxTokens = 400, jsonMode = true)
+            ).collect { ev ->
+                if (ev is StreamEvent.TextDelta) buf.append(ev.text)
+            }
+        }
+        val today = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date())
+        val rawJson = extractJsonObject(buf.toString())
+        val obj = runCatching { JSONObject(rawJson ?: "{}") }.getOrDefault(JSONObject())
+        val record = ExpenseRecord(
+            merchant = obj.optString("merchant").trim().ifBlank { "Scanned Receipt" },
+            dateIso = obj.optString("dateIso").trim().ifBlank { today },
+            category = obj.optString("category").trim().ifBlank { "General" },
+            amount = obj.optDouble("amount", 0.0).takeIf { !it.isNaN() } ?: 0.0,
+            currency = obj.optString("currency").trim().ifBlank { "INR" },
+            notes = obj.optString("notes").trim()
+        )
+        val id = saveExpense(record)
+        record.copy(id = id)
+    }
+
+    // --- 2. Web Page / Topic Change Watcher ---
+
+    val watchlistFlow: Flow<List<WatchlistItemInfo>> = watchlistDao.observeAll().map { list ->
+        list.map { it.toDomain() }
+    }
+
+    suspend fun saveWatchlistItem(title: String, queryOrUrl: String): Long = withContext(Dispatchers.IO) {
+        watchlistDao.insert(
+            WatchlistItemEntity(
+                title = title.trim().ifBlank { queryOrUrl.take(40) },
+                queryOrUrl = queryOrUrl.trim()
+            )
+        )
+    }
+
+    suspend fun deleteWatchlistItem(id: Long) = withContext(Dispatchers.IO) {
+        watchlistDao.deleteById(id)
+    }
+
+    suspend fun checkWatchlistUpdate(
+        item: WatchlistItemInfo,
+        preferredModel: SelectableModel?
+    ): WatchlistItemInfo = withContext(Dispatchers.IO) {
+        val model = preferredModel ?: resolveFreshModel()
+            ?: throw IllegalStateException("Configure an AI model in Settings to run Watchlist checks.")
+        val apiKey = getProviderApiKey(model.provider.id)
+        val fetchedContext = if (item.queryOrUrl.startsWith("http://", true) || item.queryOrUrl.startsWith("https://", true)) {
+            runCatching { webSearchClient.fetchUrlAsMarkdown(item.queryOrUrl).markdown.take(7000) }
+                .getOrElse { "Direct URL fetch unavailable: ${it.message}" }
+        } else {
+            val sp = apiKeyVault.searchProviderFlow.first()
+            val sk = apiKeyVault.getSearchApiKey()
+            if (sk.isNotBlank() && sp != WebSearchProvider.GEMINI_NATIVE) {
+                runCatching {
+                    webSearchClient.searchWeb(item.queryOrUrl, sp, sk, maxResults = 5)
+                        .joinToString("\n") { "- ${it.title} (${it.url}): ${it.snippet}" }
+                }.getOrDefault("")
+            } else ""
+        }
+
+        val prompt = buildString {
+            appendLine("Topic / URL being watched: ${item.title} (${item.queryOrUrl})")
+            if (fetchedContext.isNotBlank()) {
+                appendLine("\nLatest fetched content:\n$fetchedContext")
+            }
+            if (item.lastSummary.isNotBlank()) {
+                appendLine("\nPrevious snapshot summary:\n${item.lastSummary}")
+                appendLine("\nCompare the latest information against the previous snapshot. Highlight ONLY WHAT IS NEW in crisp Markdown bullets under `## What's New`, followed by an updated `## Current Status` summary.")
+            } else {
+                appendLine("\nProduce a concise baseline summary of the current status & latest updates in Markdown bullets.")
+            }
+        }
+        val buf = StringBuilder()
+        withTimeout(30_000L) {
+            aiRouter.streamChat(
+                provider = model.provider,
+                apiKey = apiKey,
+                modelId = model.model.modelId,
+                messages = listOf(ChatInputMessage(role = "USER", text = prompt)),
+                options = ChatOptions(
+                    temperature = 0.2f,
+                    maxTokens = 700,
+                    enableGeminiGoogleSearch = model.provider.type == ProviderType.GEMINI
+                )
+            ).collect { ev ->
+                if (ev is StreamEvent.TextDelta) buf.append(ev.text)
+            }
+        }
+        val resultText = buf.toString().trim().ifBlank { "No updates returned." }
+        val now = System.currentTimeMillis()
+        val updated = WatchlistItemEntity(
+            id = item.id,
+            title = item.title,
+            queryOrUrl = item.queryOrUrl,
+            lastSummary = resultText.take(2000),
+            lastDiffMarkdown = resultText,
+            lastCheckedAt = now,
+            createdAt = item.createdAt
+        )
+        watchlistDao.update(updated)
+        updated.toDomain()
+    }
+
+    // --- 3. Smart Home, Webhook & Tasker / MacroDroid Bridge ---
+
+    val webhooksFlow: Flow<List<WebhookActionInfo>> = webhookDao.observeAll().map { list ->
+        list.map { it.toDomain() }
+    }
+
+    suspend fun saveWebhook(webhook: WebhookActionInfo): Long = withContext(Dispatchers.IO) {
+        webhookDao.insert(
+            WebhookActionEntity(
+                id = webhook.id,
+                name = webhook.name.trim(),
+                triggerPhrase = webhook.triggerPhrase.trim(),
+                method = webhook.method.uppercase().ifBlank { "POST" },
+                url = webhook.url.trim(),
+                headersJson = webhook.headersJson.trim(),
+                bodyTemplate = webhook.bodyTemplate.trim(),
+                createdAt = webhook.createdAt
+            )
+        )
+    }
+
+    suspend fun deleteWebhook(id: Long) = withContext(Dispatchers.IO) {
+        webhookDao.deleteById(id)
+    }
+
+    suspend fun matchWebhookByPhrase(rawInput: String): WebhookActionInfo? = withContext(Dispatchers.IO) {
+        val clean = rawInput.trim().lowercase()
+        if (clean.isEmpty()) return@withContext null
+        webhookDao.getAll().map { it.toDomain() }.firstOrNull { w ->
+            val trig = w.triggerPhrase.trim().lowercase()
+            val name = w.name.trim().lowercase()
+            (trig.isNotEmpty() && (clean == trig || clean == "run $trig" || clean == "trigger $trig")) ||
+                (name.isNotEmpty() && (clean == name || clean == "run $name"))
+        }
+    }
+
+    suspend fun executeWebhook(webhook: WebhookActionInfo): Result<String> = withContext(Dispatchers.IO) {
+        runCatching {
+            val url = webhook.url.trim()
+            require(url.startsWith("http://", true) || url.startsWith("https://", true)) {
+                "Webhook URL must start with http:// or https://"
+            }
+            val builder = okhttp3.Request.Builder().url(url)
+            if (webhook.headersJson.isNotBlank()) {
+                runCatching {
+                    val obj = JSONObject(webhook.headersJson)
+                    obj.keys().forEach { k -> builder.addHeader(k, obj.optString(k)) }
+                }
+            }
+            val method = webhook.method.uppercase()
+            if (method == "GET") {
+                builder.get()
+            } else {
+                val media = "application/json; charset=utf-8".toMediaType()
+                val body = webhook.bodyTemplate.ifBlank { "{}" }.toRequestBody(media)
+                builder.method(method, body)
+            }
+            okHttpClient.newCall(builder.build()).execute().use { resp ->
+                val snippet = resp.body?.string().orEmpty().take(180).trim()
+                val statusLabel = "${resp.code} ${resp.message.ifBlank { if (resp.isSuccessful) "OK" else "ERR" }}"
+                if (snippet.isNotBlank()) "$statusLabel · $snippet" else statusLabel
+            }
+        }
+    }
+
+    // --- 4. Interactive Canvas Version History & Highlight-to-Edit ---
+
+    val canvasVersionsFlow: Flow<List<CanvasVersionInfo>> = canvasVersionDao.observeAll().map { list ->
+        list.map { it.toDomain() }
+    }
+
+    suspend fun saveCanvasVersion(docTitle: String, content: String): CanvasVersionInfo = withContext(Dispatchers.IO) {
+        val existing = canvasVersionDao.getAll()
+        val nextVer = (existing.maxOfOrNull { it.versionNumber } ?: 0) + 1
+        val entity = CanvasVersionEntity(
+            docTitle = docTitle.trim().ifBlank { "Untitled Canvas" },
+            content = content,
+            versionNumber = nextVer
+        )
+        val id = canvasVersionDao.insert(entity)
+        entity.copy(id = id).toDomain()
+    }
+
+    suspend fun aiEditCanvasSelection(
+        fullDocument: String,
+        selectedBlock: String,
+        instruction: String,
+        preferredModel: SelectableModel?
+    ): String = withContext(Dispatchers.IO) {
+        val model = preferredModel ?: resolveFreshModel()
+            ?: throw IllegalStateException("Configure an AI model in Settings to use Highlight-to-Edit.")
+        val apiKey = getProviderApiKey(model.provider.id)
+        val prompt = """
+            You are editing ONLY a highlighted block inside a larger document.
+            Instruction: $instruction
+
+            Full document context (for reference only — DO NOT rewrite unrelated parts):
+            ${fullDocument.take(4000)}
+
+            Highlighted block to transform:
+            ```
+            $selectedBlock
+            ```
+
+            Return ONLY the replacement text for the highlighted block (no commentary or surrounding fences unless the block itself is code).
+        """.trimIndent()
+        val out = withTimeout(25_000L) {
+            collectSingleCompletion(model, apiKey, prompt) {}
+        }.trim()
+        out.ifBlank { selectedBlock }
+    }
+
+    // --- 5. Smart Clipboard History Vault ---
+
+    val clipboardFlow: Flow<List<ClipboardSnippetInfo>> = clipboardDao.observeRecent().map { list ->
+        list.map { it.toDomain() }
+    }
+
+    suspend fun recordClipboardSnippet(rawText: String) = withContext(Dispatchers.IO) {
+        val clean = rawText.trim()
+        if (clean.length < 3) return@withContext
+        val recent = clipboardDao.getRecent()
+        if (recent.firstOrNull()?.content == clean) return@withContext
+        val preview = clean.replace(Regex("""\s+"""), " ").take(110)
+        val isUrl = clean.startsWith("http://", true) || clean.startsWith("https://", true)
+        clipboardDao.insert(
+            ClipboardItemEntity(
+                content = clean.take(8000),
+                preview = preview,
+                isUrl = isUrl
+            )
+        )
+    }
+
+    suspend fun deleteClipboardSnippet(id: Long) = withContext(Dispatchers.IO) {
+        clipboardDao.deleteById(id)
+    }
+
+    suspend fun clearClipboardVault() = withContext(Dispatchers.IO) {
+        clipboardDao.deleteAll()
+    }
+
+    // --- 6. Global Spotlight Search, Topic Map & Auto-Delete Junk Chats ---
+
+    suspend fun spotlightSearch(query: String, filter: String = "ALL"): List<SpotlightResult> =
+        withContext(Dispatchers.IO) {
+            val q = query.trim().lowercase()
+            val results = mutableListOf<SpotlightResult>()
+            val weekCutoff = System.currentTimeMillis() - 7L * 24L * 3600_000L
+            val convMap = conversationDao.getAll().associateBy { it.id }
+
+            if (filter in setOf("ALL", "CODE", "IMAGES", "WEEK")) {
+                messageDao.getAll().asReversed().forEach { msg ->
+                    val hasCode = msg.content.contains("```")
+                    val hasImg = !msg.attachmentUri.isNullOrBlank()
+                    val matchesFilter = when (filter) {
+                        "CODE" -> hasCode
+                        "IMAGES" -> hasImg
+                        "WEEK" -> msg.createdAt >= weekCutoff
+                        else -> true
+                    }
+                    if (matchesFilter && (q.isEmpty() || msg.content.lowercase().contains(q))) {
+                        val convTitle = convMap[msg.conversationId]?.title ?: "Chat"
+                        val idx = if (q.isEmpty()) 0 else msg.content.lowercase().indexOf(q).coerceAtLeast(0)
+                        val start = (idx - 40).coerceAtLeast(0)
+                        val snippet = msg.content.substring(start, (start + 140).coerceAtMost(msg.content.length))
+                            .replace("\n", " ")
+                        results += SpotlightResult(
+                            kind = "MESSAGE",
+                            title = "$convTitle (${msg.role})",
+                            snippet = snippet,
+                            timestamp = msg.createdAt,
+                            conversationId = msg.conversationId,
+                            messageId = msg.id,
+                            hasCode = hasCode,
+                            hasImage = hasImg
+                        )
+                    }
+                }
+            }
+
+            if (filter == "ALL" || filter == "NOTES") {
+                voiceNoteDao.getAll().forEach { note ->
+                    val hay = "${note.title} ${note.markdownContent} ${note.tagsCsv}".lowercase()
+                    if (q.isEmpty() || hay.contains(q)) {
+                        results += SpotlightResult(
+                            kind = "NOTE",
+                            title = note.title,
+                            snippet = note.markdownContent.replace("\n", " ").take(140),
+                            timestamp = note.updatedAt
+                        )
+                    }
+                }
+            }
+
+            if (filter == "ALL" || filter == "EXPENSES") {
+                expenseDao.getAll().forEach { exp ->
+                    val hay = "${exp.merchant} ${exp.category} ${exp.notes} ${exp.amount}".lowercase()
+                    if (q.isEmpty() || hay.contains(q)) {
+                        results += SpotlightResult(
+                            kind = "EXPENSE",
+                            title = "${exp.merchant} · ${exp.currency} ${exp.amount}",
+                            snippet = "${exp.dateIso} · ${exp.category} ${exp.notes}".trim(),
+                            timestamp = exp.createdAt
+                        )
+                    }
+                }
+            }
+
+            if (filter == "ALL") {
+                knowledgeDocDao.getAll().forEach { doc ->
+                    val hay = "${doc.title} ${doc.slug} ${doc.content}".lowercase()
+                    if (q.isEmpty() || hay.contains(q)) {
+                        results += SpotlightResult(
+                            kind = "DOC",
+                            title = "#${doc.slug} · ${doc.title}",
+                            snippet = doc.content.replace("\n", " ").take(140),
+                            timestamp = doc.createdAt
+                        )
+                    }
+                }
+            }
+
+            results.sortedByDescending { it.timestamp }.take(60)
+        }
+
+    suspend fun clusterConversationsByTopic(): List<TopicCluster> = withContext(Dispatchers.IO) {
+        val convs = conversationDao.getAll()
+        val buckets = linkedMapOf<String, MutableList<ConversationEntity>>(
+            "Coding & Dev" to mutableListOf(),
+            "Hardware & Electronics" to mutableListOf(),
+            "Study & Math" to mutableListOf(),
+            "Finance & Bills" to mutableListOf(),
+            "Daily Tasks & Actions" to mutableListOf(),
+            "General & Ideas" to mutableListOf()
+        )
+        for (c in convs) {
+            val t = c.title.lowercase()
+            val key = when {
+                Regex("""\b(code|kotlin|python|react|js|ts|bug|error|api|git|sql|css|html|cors|docker|linux)\b""").containsMatchIn(t) -> "Coding & Dev"
+                Regex("""\b(arduino|esp32|circuit|ble|sensor|voltage|resistor|pcb|motor|led|hardware|gpio)\b""").containsMatchIn(t) -> "Hardware & Electronics"
+                Regex("""\b(exam|math|calculus|physics|pdf|lecture|study|formula|solve|quiz|notes|essay)\b""").containsMatchIn(t) -> "Study & Math"
+                Regex("""\b(upi|expense|bill|receipt|budget|price|tax|salary|cost|invest)\b""").containsMatchIn(t) -> "Finance & Bills"
+                Regex("""\b(call|whatsapp|timer|alarm|map|calendar|email|sms|routine|remind|schedule)\b""").containsMatchIn(t) -> "Daily Tasks & Actions"
+                else -> "General & Ideas"
+            }
+            buckets[key]?.add(c)
+        }
+        buckets.entries
+            .filter { it.value.isNotEmpty() }
+            .map { (topic, list) ->
+                TopicCluster(
+                    topic = topic,
+                    conversationIds = list.map { it.id },
+                    sampleTitles = list.take(4).map { it.title }
+                )
+            }
+    }
+
+    suspend fun pruneOldJunkChatsIfEnabled(): Int = withContext(Dispatchers.IO) {
+        if (!autoDeleteJunkChatsFlow.first()) return@withContext 0
+        pruneOldJunkChatsNow()
+    }
+
+    suspend fun pruneOldJunkChatsNow(): Int = withContext(Dispatchers.IO) {
+        val cutoff = System.currentTimeMillis() - 7L * 24L * 3600_000L
+        val allConvs = conversationDao.getAll()
+        var deleted = 0
+        for (c in allConvs) {
+            if (c.updatedAt < cutoff) {
+                val msgs = messageDao.getMessages(c.id)
+                val userCount = msgs.count { it.role == "USER" }
+                if (userCount <= 1) {
+                    conversationDao.deleteById(c.id)
+                    deleted++
+                }
+            }
+        }
+        deleted
+    }
+
+    // --- 7. Inline Fact-Check Highlighter, Decision Matrix, SVG Vectorizer & Live Interpreter ---
+
+    suspend fun verifyAnswerClaims(
+        answerText: String,
+        preferredModel: SelectableModel?
+    ): List<FactCheckClaim> = withContext(Dispatchers.IO) {
+        val model = preferredModel ?: resolveFreshModel()
+            ?: throw IllegalStateException("Configure an AI model in Settings to verify claims.")
+        val apiKey = getProviderApiKey(model.provider.id)
+        val prompt = """
+            Extract up to 5 key verifiable factual claims (dates, numbers, specs, names, or technical assertions) from this AI answer and verify each one carefully.
+            Return STRICTLY valid JSON:
+            {
+              "claims": [
+                { "statement": "short claim text", "status": "VERIFIED | UNCERTAIN | CONFLICT", "note": "concise verification note", "sourceUrl": "" }
+              ]
+            }
+
+            Answer to verify:
+            ${answerText.take(3500)}
+        """.trimIndent()
+        val buf = StringBuilder()
+        withTimeout(25_000L) {
+            aiRouter.streamChat(
+                provider = model.provider,
+                apiKey = apiKey,
+                modelId = model.model.modelId,
+                messages = listOf(ChatInputMessage(role = "USER", text = prompt)),
+                options = ChatOptions(
+                    temperature = 0.1f,
+                    maxTokens = 700,
+                    jsonMode = true,
+                    enableGeminiGoogleSearch = model.provider.type == ProviderType.GEMINI
+                )
+            ).collect { ev ->
+                if (ev is StreamEvent.TextDelta) buf.append(ev.text)
+            }
+        }
+        val rawJson = extractJsonObject(buf.toString()) ?: return@withContext emptyList()
+        runCatching {
+            val arr = JSONObject(rawJson).optJSONArray("claims") ?: return@runCatching emptyList()
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    add(
+                        FactCheckClaim(
+                            statement = o.optString("statement").trim(),
+                            status = o.optString("status", "UNCERTAIN").uppercase(),
+                            note = o.optString("note").trim(),
+                            sourceUrl = o.optString("sourceUrl").trim().takeIf { it.startsWith("http") }
+                        )
+                    )
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    suspend fun generateDecisionMatrix(
+        comparisonPrompt: String,
+        preferredModel: SelectableModel?
+    ): DecisionMatrixData = withContext(Dispatchers.IO) {
+        val model = preferredModel ?: resolveFreshModel()
+            ?: throw IllegalStateException("Configure an AI model in Settings to build a Decision Matrix.")
+        val apiKey = getProviderApiKey(model.provider.id)
+        val prompt = """
+            Create a structured side-by-side decision comparison matrix for:
+            "$comparisonPrompt"
+            Return STRICTLY valid JSON:
+            {
+              "title": "Short comparison title",
+              "optionA": "Option A name",
+              "optionB": "Option B name",
+              "criteria": [
+                { "name": "Price & Value", "weight": 8, "scoreA": 8.5, "scoreB": 7.0, "noteA": "short pro/con", "noteB": "short pro/con" }
+              ]
+            }
+            Include 5 crisp, relevant criteria (weights 1-10, scores 1-10).
+        """.trimIndent()
+        val raw = withTimeout(25_000L) {
+            collectSingleCompletion(model, apiKey, prompt) {}
+        }
+        val json = extractJsonObject(raw) ?: error("Could not parse comparison JSON.")
+        val o = JSONObject(json)
+        val arr = o.optJSONArray("criteria") ?: JSONArray()
+        val criteria = buildList {
+            for (i in 0 until arr.length()) {
+                val c = arr.getJSONObject(i)
+                add(
+                    DecisionCriterion(
+                        name = c.optString("name", "Criterion ${i + 1}"),
+                        weight = c.optDouble("weight", 5.0).toFloat().coerceIn(1f, 10f),
+                        scoreA = c.optDouble("scoreA", 7.0).toFloat().coerceIn(0f, 10f),
+                        scoreB = c.optDouble("scoreB", 7.0).toFloat().coerceIn(0f, 10f),
+                        noteA = c.optString("noteA"),
+                        noteB = c.optString("noteB")
+                    )
+                )
+            }
+        }
+        DecisionMatrixData(
+            title = o.optString("title", comparisonPrompt.take(40)),
+            optionA = o.optString("optionA", "Option A"),
+            optionB = o.optString("optionB", "Option B"),
+            criteria = criteria.ifEmpty {
+                listOf(DecisionCriterion("Overall Fit", 8f, 7.5f, 7.5f))
+            }
+        )
+    }
+
+    suspend fun generateCleanSvg(
+        description: String,
+        preferredModel: SelectableModel?
+    ): String = withContext(Dispatchers.IO) {
+        val model = preferredModel ?: resolveFreshModel()
+            ?: throw IllegalStateException("Configure an AI model in Settings to vectorize SVG.")
+        val apiKey = getProviderApiKey(model.provider.id)
+        val prompt = """
+            Generate a clean, crisp, minimal, scalable <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256"> icon/logo for:
+            "$description"
+            Use bold geometric shapes, clean paths, and balanced Swiss design.
+            Return ONLY raw <svg ...>...</svg> markup with no prose or markdown fences.
+        """.trimIndent()
+        val raw = withTimeout(25_000L) {
+            collectSingleCompletion(model, apiKey, prompt) {}
+        }
+        val start = raw.indexOf("<svg", ignoreCase = true)
+        val end = raw.lastIndexOf("</svg>", ignoreCase = true)
+        if (start >= 0 && end > start) raw.substring(start, end + 6) else raw.trim()
+    }
+
+    suspend fun translateLiveUtterance(
+        text: String,
+        sourceLang: String,
+        targetLang: String,
+        preferredModel: SelectableModel?
+    ): String = withContext(Dispatchers.IO) {
+        val model = preferredModel ?: resolveFreshModel()
+            ?: throw IllegalStateException("Configure an AI model in Settings for Live Interpreter.")
+        val apiKey = getProviderApiKey(model.provider.id)
+        val prompt = """
+            Translate the following spoken sentence naturally from $sourceLang into $targetLang.
+            Return ONLY the translated spoken phrase with no quotes, labels, or explanation.
+
+            Sentence: $text
+        """.trimIndent()
+        withTimeout(18_000L) {
+            collectSingleCompletion(model, apiKey, prompt) {}
+        }.trim()
+    }
+
+    suspend fun verifyAndFixResponse(
+        originalPrompt: String,
+        draftAnswer: String,
+        preferredModel: SelectableModel?
+    ): String = withContext(Dispatchers.IO) {
+        val model = preferredModel ?: resolveFreshModel() ?: return@withContext draftAnswer
+        val apiKey = getProviderApiKey(model.provider.id)
+        val prompt = """
+            Perform a strict self-correction pass on the draft answer below for coding/math accuracy.
+            Trace edge cases, off-by-one bugs, syntax errors, and arithmetic mistakes.
+            If there are any bugs, output the fully corrected clean final answer and add a brief `### Self-Check Verified` note at the bottom listing what was checked/fixed.
+            If the draft is already 100% correct, output the clean final answer with `### Self-Check Verified: Passed all edge cases.` at the bottom.
+
+            Original Prompt:
+            ${originalPrompt.take(1500)}
+
+            Draft Answer:
+            ${draftAnswer.take(4000)}
+        """.trimIndent()
+        runCatching {
+            withTimeout(28_000L) {
+                collectSingleCompletion(model, apiKey, prompt) {}
+            }.trim().ifBlank { draftAnswer }
+        }.getOrDefault(draftAnswer)
+    }
+
+    suspend fun updateMessageContent(messageId: Long, newContent: String) = withContext(Dispatchers.IO) {
+        messageDao.updateStreamingMessage(
+            id = messageId,
+            content = newContent,
+            promptTokens = null,
+            completionTokens = null,
+            isError = false
+        )
+    }
+
+    // --- Wave 4: Prompt Doctor, Dynamic Mind Map Expansion, Voice Form Filler, CLI Builder,
+    //             TL;DR Thread Checkpoints, 80% Budget Auto-Downgrade, Assistant Forking & Ghost Mode ---
+
+    /**
+     * Resolves an auto-downgraded flash/free model when daily spend >= 80% of [DailyBudgetConfig.dailyCapUsd]
+     * and auto-downgrade is enabled (unless the user explicitly enabled manual flagship override).
+     */
+    suspend fun resolveBudgetDowngradeModel(
+        requestedModel: SelectableModel,
+        availableModels: List<SelectableModel>,
+        forceFlagshipOverride: Boolean = false
+    ): Pair<SelectableModel, String?> = withContext(Dispatchers.IO) {
+        if (forceFlagshipOverride) return@withContext requestedModel to null
+        val budget = dailyBudgetConfigFlow.first()
+        if (budget.dailyCapUsd <= 0.0 || !budget.autoDowngradeEnabled) {
+            return@withContext requestedModel to null
+        }
+        val spent = getTodaySpendUsd()
+        val ratio = spent / budget.dailyCapUsd
+        if (ratio < 0.80) return@withContext requestedModel to null
+
+        val targetDowngrade = budget.downgradeModelDbId?.let { id ->
+            availableModels.firstOrNull { it.model.id == id }
+        } ?: availableModels.firstOrNull { cand ->
+            val idLow = cand.model.modelId.lowercase()
+            val provLow = cand.provider.name.lowercase()
+            cand.model.id != requestedModel.model.id && (
+                idLow.contains("flash") ||
+                    idLow.contains("mini") ||
+                    idLow.contains("haiku") ||
+                    idLow.contains("8b") ||
+                    idLow.contains("free") ||
+                    provLow.contains("ollama") ||
+                    provLow.contains("groq")
+                )
+        }
+        if (targetDowngrade != null && targetDowngrade.model.id != requestedModel.model.id) {
+            val pct = (ratio * 100).toInt()
+            targetDowngrade to "BUDGET $pct% // Auto-downgraded to ${targetDowngrade.model.displayName} (tap Override to force flagship)."
+        } else {
+            requestedModel to null
+        }
+    }
+
+    /**
+     * Picks the lightest/fastest configured model for instant Prompt Doctor rewriting,
+     * falling back to [preferredModel].
+     */
+    private suspend fun pickLightweightHelperModel(preferredModel: SelectableModel?): SelectableModel? {
+        val available = observeModelsForCapability(ModelCapability.TEXT_CHAT).first()
+        val fast = available.firstOrNull { cand ->
+            val low = cand.model.modelId.lowercase()
+            low.contains("flash") || low.contains("mini") || low.contains("haiku") || low.contains("8b") || low.contains("nano")
+        }
+        return fast ?: preferredModel ?: resolveFreshModel()
+    }
+
+    suspend fun enhanceUserPrompt(
+        roughPrompt: String,
+        preferredModel: SelectableModel?
+    ): String = withContext(Dispatchers.IO) {
+        val clean = roughPrompt.trim()
+        if (clean.isEmpty()) return@withContext ""
+        val model = pickLightweightHelperModel(preferredModel)
+            ?: throw IllegalStateException("Configure an AI provider in Settings to use Prompt Doctor.")
+        val apiKey = getProviderApiKey(model.provider.id)
+        val prompt = """
+            You are Prompt Doctor — an expert prompt engineer optimizing rough mobile prompts before they are sent to an AI.
+            Rewrite the rough prompt below into a crisp, clear, well-structured prompt that covers:
+            - Exact goal & context
+            - Key technical/design requirements (e.g. accessibility, validation, responsive layout, edge cases, or constraints when relevant)
+            - Clear expected output format
+
+            Rules:
+            - Keep it concise (4-8 focused lines max), ready to drop directly into a chat input box.
+            - Preserve the user's exact intent without inventing unrelated topics.
+            - Return ONLY the improved prompt text with NO preamble, quotes, or meta-commentary.
+
+            Rough Prompt:
+            $clean
+        """.trimIndent()
+        withTimeout(18_000L) {
+            collectSingleCompletion(model, apiKey, prompt) {}
+        }.trim().ifBlank { clean }
+    }
+
+    suspend fun expandMindMapSubTopic(
+        rootNode: MindMapNode,
+        targetNode: MindMapNode,
+        preferredModel: SelectableModel?
+    ): MindMapNode = withContext(Dispatchers.IO) {
+        val model = preferredModel ?: resolveFreshModel()
+            ?: throw IllegalStateException("Configure an AI model in Settings to expand Mind Map branches.")
+        val apiKey = getProviderApiKey(model.provider.id)
+        val existingLabels = targetNode.children.map { it.label }.joinToString(", ").ifBlank { "none" }
+        val prompt = """
+            Expand the Mind Map sub-topic "${targetNode.label}" (part of root topic "${rootNode.label}").
+            Existing direct children to avoid duplicating: $existingLabels.
+            Generate 3 to 4 crisp, insightful next-level child sub-topics.
+            Return STRICTLY valid JSON only:
+            {
+              "children": [
+                {"label": "Short 2-4 word title", "detail": "One crisp explanatory sentence."}
+              ]
+            }
+        """.trimIndent()
+        val raw = withTimeout(22_000L) {
+            collectSingleCompletion(model, apiKey, prompt) {}
+        }
+        val jsonStr = extractJsonObject(raw) ?: "{}"
+        val newChildren = mutableListOf<MindMapNode>()
+        runCatching {
+            val arr = JSONObject(jsonStr).optJSONArray("children")
+            if (arr != null) {
+                for (i in 0 until arr.length().coerceAtMost(5)) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val lbl = o.optString("label").trim()
+                    if (lbl.isNotEmpty()) {
+                        newChildren += MindMapNode(
+                            id = "${targetNode.id}_exp_${System.currentTimeMillis()}_$i",
+                            label = lbl.take(36),
+                            detail = o.optString("detail").trim()
+                        )
+                    }
+                }
+            }
+        }
+        if (newChildren.isEmpty()) {
+            throw IllegalStateException("Could not parse sub-topic expansion from model output.")
+        }
+        fun graft(node: MindMapNode): MindMapNode {
+            if (node.id == targetNode.id) {
+                return node.copy(children = node.children + newChildren)
+            }
+            return node.copy(children = node.children.map { graft(it) })
+        }
+        graft(rootNode)
+    }
+
+    suspend fun fillStructuredFormFromVoice(
+        template: VoiceFormTemplate,
+        dictatedText: String,
+        preferredModel: SelectableModel?
+    ): FilledFormResult = withContext(Dispatchers.IO) {
+        val clean = dictatedText.trim()
+        require(clean.isNotEmpty()) { "Speak or enter a note first." }
+        val model = pickLightweightHelperModel(preferredModel)
+            ?: throw IllegalStateException("Configure an AI model in Settings to fill forms.")
+        val apiKey = getProviderApiKey(model.provider.id)
+        val fieldsList = template.fields.joinToString("\n") { "- $it" }
+        val prompt = """
+            Map the user's natural spoken dictation into the exact fields of the "${template.name}" structured template.
+            Fill every field cleanly (infer today's date if a Date field is present and unmentioned; use "—" only if genuinely not mentioned).
+            Return STRICTLY valid JSON only where keys match the exact field names below:
+            $fieldsList
+
+            User Dictation:
+            "$clean"
+        """.trimIndent()
+        val raw = withTimeout(22_000L) {
+            collectSingleCompletion(model, apiKey, prompt) {}
+        }
+        val objStr = extractJsonObject(raw) ?: "{}"
+        val values = LinkedHashMap<String, String>()
+        runCatching {
+            val obj = JSONObject(objStr)
+            template.fields.forEach { field ->
+                val v = obj.optString(field, "").trim()
+                    .ifBlank {
+                        // Case-insensitive key lookup fallback
+                        var found = ""
+                        val keys = obj.keys()
+                        while (keys.hasNext()) {
+                            val k = keys.next()
+                            if (k.equals(field, ignoreCase = true)) {
+                                found = obj.optString(k, "").trim()
+                                break
+                            }
+                        }
+                        found.ifBlank { "—" }
+                    }
+                values[field] = v
+            }
+        }.onFailure {
+            template.fields.forEach { values[it] = if (values.isEmpty()) clean else "—" }
+        }
+        val mdTable = buildString {
+            appendLine("### ${template.name}")
+            appendLine("| Field | Value |")
+            appendLine("|---|---|")
+            values.forEach { (k, v) ->
+                appendLine("| **${k.replace("|", "/")}** | ${v.replace("|", "/").replace("\n", " ")} |")
+            }
+        }.trim()
+        FilledFormResult(templateName = template.name, values = values, markdownTable = mdTable)
+    }
+
+    suspend fun buildModularCliCommand(
+        request: String,
+        preferredModel: SelectableModel?
+    ): CliCommandSpec = withContext(Dispatchers.IO) {
+        val clean = request.trim()
+        val model = preferredModel ?: resolveFreshModel()
+        if (model == null) {
+            return@withContext fallbackCliCommandSpec(clean)
+        }
+        val apiKey = getProviderApiKey(model.provider.id)
+        val prompt = """
+            Build a modular, production-safe CLI command (Linux Bash, Windows PowerShell, Git, FFmpeg, or ADB) for:
+            "$clean"
+
+            Break the command into its base executable and an ordered list of flag/argument tokens so every flag has a crisp explanation and every filename/path/package/value is editable inline.
+            Return STRICTLY valid JSON only:
+            {
+              "title": "Short title",
+              "shell": "FFmpeg|ADB|Git|Bash|PowerShell",
+              "baseCommand": "ffmpeg",
+              "summary": "One sentence explaining what this command accomplishes",
+              "tokens": [
+                {
+                  "flag": "-i",
+                  "explanation": "Input source media file path",
+                  "defaultValue": "input.mp4",
+                  "isEditableArg": true,
+                  "argLabel": "Input File"
+                },
+                {
+                  "flag": "-crf",
+                  "explanation": "Constant Rate Factor (18=high quality, 23=balanced, 28=smaller size)",
+                  "defaultValue": "23",
+                  "isEditableArg": true,
+                  "argLabel": "Quality CRF"
+                }
+              ]
+            }
+        """.trimIndent()
+        val raw = runCatching {
+            withTimeout(22_000L) {
+                collectSingleCompletion(model, apiKey, prompt) {}
+            }
+        }.getOrNull() ?: return@withContext fallbackCliCommandSpec(clean)
+
+        val objStr = extractJsonObject(raw) ?: return@withContext fallbackCliCommandSpec(clean)
+        runCatching {
+            val o = JSONObject(objStr)
+            val base = o.optString("baseCommand").trim()
+            val arr = o.optJSONArray("tokens")
+            val tokens = mutableListOf<CliFlagToken>()
+            if (arr != null) {
+                for (i in 0 until arr.length().coerceAtMost(14)) {
+                    val t = arr.optJSONObject(i) ?: continue
+                    tokens += CliFlagToken(
+                        flag = t.optString("flag").trim(),
+                        explanation = t.optString("explanation").trim().ifBlank { "Command parameter" },
+                        defaultValue = t.optString("defaultValue").trim(),
+                        isEditableArg = t.optBoolean("isEditableArg", t.optString("defaultValue").isNotBlank()),
+                        argLabel = t.optString("argLabel").trim()
+                    )
+                }
+            }
+            if (base.isBlank() || tokens.isEmpty()) return@runCatching fallbackCliCommandSpec(clean)
+            CliCommandSpec(
+                title = o.optString("title", clean.take(40)).trim(),
+                shell = o.optString("shell", "Bash").trim(),
+                baseCommand = base,
+                summary = o.optString("summary", "Modular CLI command ready to customize and copy.").trim(),
+                tokens = tokens
+            )
+        }.getOrDefault(fallbackCliCommandSpec(clean))
+    }
+
+    private fun fallbackCliCommandSpec(request: String): CliCommandSpec {
+        val low = request.lowercase()
+        return when {
+            low.contains("adb") || low.contains("bloat") -> CliCommandSpec(
+                title = "Uninstall App for Current User (ADB)",
+                shell = "ADB",
+                baseCommand = "adb",
+                summary = "Removes a preinstalled package for user 0 without requiring root access.",
+                tokens = listOf(
+                    CliFlagToken("shell pm uninstall", "Runs Package Manager uninstall inside the Android shell"),
+                    CliFlagToken("-k", "Keep app data/cache directories (remove flag to wipe cleanly)"),
+                    CliFlagToken("--user", "Target Android user profile ID (0 = primary owner)", "0", true, "User ID"),
+                    CliFlagToken("", "Android application package name (e.g. com.vendor.bloatware)", "com.example.bloatware", true, "Package Name")
+                )
+            )
+            low.contains("git") -> CliCommandSpec(
+                title = "Interactive Squash Last N Commits",
+                shell = "Git",
+                baseCommand = "git",
+                summary = "Opens interactive rebase to combine or reword recent local commits.",
+                tokens = listOf(
+                    CliFlagToken("rebase", "Reapplies commits on top of another base tip"),
+                    CliFlagToken("-i", "Interactive mode: pick, squash, fixup, or reword each commit"),
+                    CliFlagToken("", "Number of commits back from HEAD", "HEAD~5", true, "Commit Range")
+                )
+            )
+            low.contains("powershell") || low.contains("windows") -> CliCommandSpec(
+                title = "Find Largest Files in Folder",
+                shell = "PowerShell",
+                baseCommand = "Get-ChildItem",
+                summary = "Recursively scans a directory and lists the largest files first.",
+                tokens = listOf(
+                    CliFlagToken("-Path", "Root directory to search", "C:\\Users\\Public", true, "Folder Path"),
+                    CliFlagToken("-Recurse -File", "Include all subfolders and skip directory entries"),
+                    CliFlagToken("| Sort-Object Length -Descending | Select-Object -First", "Sort largest-first and cap row count", "15", true, "Top N Files")
+                )
+            )
+            else -> CliCommandSpec(
+                title = "Compress Video to 720p H.264",
+                shell = "FFmpeg",
+                baseCommand = "ffmpeg",
+                summary = "Re-encodes video to crisp 720p MP4 with balanced CRF quality and fast web streaming.",
+                tokens = listOf(
+                    CliFlagToken("-i", "Input source video file path", "input.mp4", true, "Input File"),
+                    CliFlagToken("-vf", "Video filter: scales height to 720px while preserving aspect ratio", "scale=-2:720", true, "Scale Filter"),
+                    CliFlagToken("-c:v", "Video codec (libx264 = universal H.264 compatibility)", "libx264", false),
+                    CliFlagToken("-crf", "Constant Rate Factor (18=near lossless, 23=default, 28=small)", "23", true, "Quality CRF"),
+                    CliFlagToken("-preset", "Encoding speed vs compression ratio (fast, medium, slow)", "medium", true, "Preset"),
+                    CliFlagToken("-c:a aac -b:a", "Encode audio as AAC at target bitrate", "128k", true, "Audio Bitrate"),
+                    CliFlagToken("", "Output compressed MP4 path", "output_720p.mp4", true, "Output File")
+                )
+            )
+        }
+    }
+
+    suspend fun createThreadCheckpoint(
+        conversationId: Long,
+        afterMessage: MessageEntity,
+        messagesUpToHere: List<MessageEntity>,
+        preferredModel: SelectableModel?
+    ): ThreadCheckpoint = withContext(Dispatchers.IO) {
+        val model = pickLightweightHelperModel(preferredModel)
+            ?: throw IllegalStateException("Configure an AI model in Settings to create a TL;DR checkpoint.")
+        val apiKey = getProviderApiKey(model.provider.id)
+        val transcript = messagesUpToHere.takeLast(40).joinToString("\n\n") { m ->
+            "${m.role}: ${m.content.take(800)}"
+        }
+        val prompt = """
+            Create a compact "TL;DR Thread Checkpoint" summarizing the conversation up to this point.
+            Format as 4-6 crisp Markdown bullet points covering:
+            - Core goal & decisions made so far
+            - Important code symbols, configs, numbers, or constraints
+            - Open questions / next steps
+
+            Keep it under 140 words so it acts as a fast context anchor.
+
+            Transcript (${messagesUpToHere.size} messages):
+            $transcript
+        """.trimIndent()
+        val summary = withTimeout(22_000L) {
+            collectSingleCompletion(model, apiKey, prompt) {}
+        }.trim().ifBlank { "• Summarized ${messagesUpToHere.size} earlier messages up to this checkpoint." }
+
+        val cp = ThreadCheckpoint(
+            id = java.util.UUID.randomUUID().toString(),
+            conversationId = conversationId,
+            afterMessageId = afterMessage.id,
+            messageCountCovered = messagesUpToHere.size,
+            summaryMarkdown = summary
+        )
+        val currentMap = threadCheckpointsFlow.first().toMutableMap()
+        val existingList = currentMap[conversationId].orEmpty()
+            .filterNot { it.afterMessageId == afterMessage.id }
+        currentMap[conversationId] = existingList + cp
+        apiKeyVault.saveThreadCheckpoints(currentMap)
+        cp
+    }
+
+    suspend fun deleteThreadCheckpoint(conversationId: Long, checkpointId: String) = withContext(Dispatchers.IO) {
+        val currentMap = threadCheckpointsFlow.first().toMutableMap()
+        val updated = currentMap[conversationId].orEmpty().filterNot { it.id == checkpointId }
+        if (updated.isEmpty()) currentMap.remove(conversationId) else currentMap[conversationId] = updated
+        apiKeyVault.saveThreadCheckpoints(currentMap)
+    }
+
+    /**
+     * Forks an existing Assistant message into a parallel sibling branch sharing the exact same
+     * [MessageEntity.parentMessageId], preserving the original response for `< 1 / N >` switching.
+     */
+    suspend fun editAndForkAssistantMessage(
+        conversationId: Long,
+        originalMessage: MessageEntity,
+        newContent: String
+    ): Long = withContext(Dispatchers.IO) {
+        val clean = newContent.trim()
+        val forkedId = messageDao.insert(
+            MessageEntity(
+                conversationId = conversationId,
+                parentMessageId = originalMessage.parentMessageId,
+                role = "ASSISTANT",
+                content = clean,
+                modelLabel = originalMessage.modelLabel ?: "ASSISTANT (EDITED)"
+            )
+        )
+        conversationDao.touch(conversationId)
+        forkedId
+    }
+
+    /**
+     * Pure volatile Incognito Ghost Chat streaming turn:
+     * NEVER writes to Room DB, search index, or memory bank.
+     */
+    suspend fun streamGhostChatTurn(
+        history: List<Pair<String, String>>,
+        userText: String,
+        model: SelectableModel,
+        options: ChatOptions,
+        onDelta: (String) -> Unit
+    ): String = withContext(Dispatchers.IO) {
+        val freshModel = resolveFreshModel(model.model.id) ?: model
+        val apiKey = getProviderApiKey(freshModel.provider.id)
+        val inputMsgs = buildList {
+            history.takeLast(16).forEach { (role, content) ->
+                add(ChatInputMessage(role = role, text = content))
+            }
+            add(ChatInputMessage(role = "user", text = userText))
+        }
+        val sb = StringBuilder()
+        withTimeout(30_000L) {
+            aiRouter.streamChat(
+                provider = freshModel.provider,
+                apiKey = apiKey,
+                modelId = freshModel.model.modelId,
+                messages = inputMsgs,
+                options = options
+            ).collect { event ->
+                if (event is StreamEvent.TextDelta && event.text.isNotEmpty()) {
+                    sb.append(event.text)
+                    onDelta(sb.toString())
+                }
+            }
+        }
+        sb.toString().trim()
     }
 }

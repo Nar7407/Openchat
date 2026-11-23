@@ -28,9 +28,16 @@ class AllChatRoomConverters {
         MessageEntity::class,
         KnowledgeDocEntity::class,
         GeneratedMediaEntity::class,
-        UserMemoryEntity::class
+        UserMemoryEntity::class,
+        RoutineEntity::class,
+        VoiceNoteEntity::class,
+        ExpenseEntity::class,
+        WatchlistItemEntity::class,
+        WebhookActionEntity::class,
+        CanvasVersionEntity::class,
+        ClipboardItemEntity::class
     ],
-    version = 5,
+    version = 7,
     exportSchema = false
 )
 @TypeConverters(AllChatRoomConverters::class)
@@ -43,6 +50,13 @@ abstract class AllChatDatabase : RoomDatabase() {
     abstract fun knowledgeDocDao(): KnowledgeDocDao
     abstract fun generatedMediaDao(): GeneratedMediaDao
     abstract fun userMemoryDao(): UserMemoryDao
+    abstract fun routineDao(): RoutineDao
+    abstract fun voiceNoteDao(): VoiceNoteDao
+    abstract fun expenseDao(): ExpenseDao
+    abstract fun watchlistDao(): WatchlistDao
+    abstract fun webhookDao(): WebhookDao
+    abstract fun canvasVersionDao(): CanvasVersionDao
+    abstract fun clipboardDao(): ClipboardDao
 
     companion object {
         @Volatile
@@ -134,6 +148,103 @@ abstract class AllChatDatabase : RoomDatabase() {
             }
         }
 
+        internal val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS routines (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        name TEXT NOT NULL,
+                        triggerPhrase TEXT NOT NULL,
+                        stepsJson TEXT NOT NULL,
+                        createdAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS voice_notes (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        title TEXT NOT NULL,
+                        rawTranscript TEXT NOT NULL,
+                        markdownContent TEXT NOT NULL,
+                        tagsCsv TEXT NOT NULL DEFAULT '',
+                        createdAt INTEGER NOT NULL,
+                        updatedAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
+        internal val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS expenses (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        merchant TEXT NOT NULL,
+                        dateIso TEXT NOT NULL,
+                        category TEXT NOT NULL,
+                        amount REAL NOT NULL,
+                        currency TEXT NOT NULL DEFAULT 'INR',
+                        notes TEXT NOT NULL DEFAULT '',
+                        createdAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS watchlist_items (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        title TEXT NOT NULL,
+                        queryOrUrl TEXT NOT NULL,
+                        lastSummary TEXT NOT NULL DEFAULT '',
+                        lastDiffMarkdown TEXT NOT NULL DEFAULT '',
+                        lastCheckedAt INTEGER NOT NULL DEFAULT 0,
+                        createdAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS webhook_actions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        name TEXT NOT NULL,
+                        triggerPhrase TEXT NOT NULL,
+                        method TEXT NOT NULL DEFAULT 'POST',
+                        url TEXT NOT NULL,
+                        headersJson TEXT NOT NULL DEFAULT '',
+                        bodyTemplate TEXT NOT NULL DEFAULT '',
+                        createdAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS canvas_versions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        docTitle TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        versionNumber INTEGER NOT NULL,
+                        createdAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS clipboard_items (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        content TEXT NOT NULL,
+                        preview TEXT NOT NULL,
+                        isUrl INTEGER NOT NULL DEFAULT 0,
+                        createdAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
         fun getInstance(context: Context): AllChatDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
@@ -141,7 +252,14 @@ abstract class AllChatDatabase : RoomDatabase() {
                     AllChatDatabase::class.java,
                     "allchat_local.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
+                    .addMigrations(
+                        MIGRATION_1_2,
+                        MIGRATION_2_3,
+                        MIGRATION_3_4,
+                        MIGRATION_4_5,
+                        MIGRATION_5_6,
+                        MIGRATION_6_7
+                    )
                     .fallbackToDestructiveMigrationOnDowngrade()
                     .build()
                     .also { INSTANCE = it }

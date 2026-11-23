@@ -88,18 +88,58 @@ class MainActivity : ComponentActivity() {
     private fun handleIncomingIntent(intent: Intent?) {
         if (intent == null) return
 
-        // 0. Check ?mode=assistant or allchat://assistant URI
+        // 0. Check custom protocol deep links (allchat:// and web+allchat://)
         val dataUri = intent.data
-        if (dataUri != null) {
-            val modeParam = dataUri.getQueryParameter("mode")?.lowercase()
-            if (modeParam == "assistant" || dataUri.host.equals("assistant", ignoreCase = true)) {
-                pendingAppAction.value = IncomingAppAction.ASSISTANT_OVERLAY
-                return
+        val scheme = dataUri?.scheme?.lowercase()
+        if (dataUri != null && (scheme == "allchat" || scheme == "web+allchat")) {
+            val host = dataUri.host?.lowercase().orEmpty()
+            val modeParam = dataUri.getQueryParameter("mode")?.lowercase().orEmpty()
+            val queryParam = dataUri.getQueryParameter("q")?.trim().orEmpty()
+            when {
+                host == "ask" && queryParam.isNotBlank() -> {
+                    pendingSharePayload.value = IncomingSharePayload.DeepLinkAsk(queryParam)
+                    return
+                }
+                modeParam == "assistant" || host == "assistant" -> {
+                    pendingAppAction.value = IncomingAppAction.ASSISTANT_OVERLAY
+                    return
+                }
+                host == "lens" || modeParam.startsWith("lens") -> {
+                    pendingAppAction.value = when (modeParam) {
+                        "translate" -> IncomingAppAction.LIVE_LENS_TRANSLATE
+                        "solve" -> IncomingAppAction.LIVE_LENS_SOLVE
+                        "code", "diagram" -> IncomingAppAction.LIVE_LENS_CODE
+                        else -> IncomingAppAction.LIVE_LENS_EXPLAIN
+                    }
+                    return
+                }
+                host == "commute" || modeParam == "commute" -> {
+                    pendingAppAction.value = IncomingAppAction.COMMUTE_HUD
+                    return
+                }
+                host == "interpreter" || host == "interpret" || modeParam == "interpreter" -> {
+                    pendingAppAction.value = IncomingAppAction.INTERPRETER
+                    return
+                }
+                host == "toolkit" || modeParam == "toolkit" -> {
+                    pendingAppAction.value = IncomingAppAction.TOOLKIT
+                    return
+                }
             }
-            if (modeParam == "lens" || dataUri.host.equals("lens", ignoreCase = true)) {
-                pendingAppAction.value = IncomingAppAction.LIVE_LENS_EXPLAIN
-                return
+        }
+
+        // 0b. OS-Level "Open With AllChat" File Association (ACTION_VIEW with content:// or file://)
+        if (intent.action == Intent.ACTION_VIEW && dataUri != null && (scheme == "content" || scheme == "file")) {
+            val mime = (intent.type ?: contentResolver.getType(dataUri))?.lowercase().orEmpty()
+            when {
+                mime.startsWith("image/") -> {
+                    pendingSharePayload.value = IncomingSharePayload.ImageUri(dataUri.toString())
+                }
+                else -> {
+                    pendingSharePayload.value = IncomingSharePayload.DocumentUri(dataUri.toString())
+                }
             }
+            return
         }
 
         // 1. Check App Shortcut / Home Screen Widget quick action
@@ -114,6 +154,9 @@ class MainActivity : ComponentActivity() {
                 "assistant" -> IncomingAppAction.ASSISTANT_OVERLAY
                 "lens" -> IncomingAppAction.LIVE_LENS_EXPLAIN
                 "lens_translate" -> IncomingAppAction.LIVE_LENS_TRANSLATE
+                "commute" -> IncomingAppAction.COMMUTE_HUD
+                "interpreter" -> IncomingAppAction.INTERPRETER
+                "toolkit" -> IncomingAppAction.TOOLKIT
                 else -> null
             }
             return

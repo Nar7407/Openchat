@@ -4,8 +4,10 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.remote.ConnectionTestResult
 import com.example.data.repository.AllChatRepository
+import com.example.domain.model.AssistantRoutine
 import com.example.domain.model.AutoRouterConfig
 import com.example.domain.model.CustomAppEntry
+import com.example.domain.model.DailyBudgetConfig
 import com.example.domain.model.DisplayCurrency
 import com.example.domain.model.ModelCapability
 import com.example.domain.model.ModelInfo
@@ -15,8 +17,13 @@ import com.example.domain.model.ProviderConfig
 import com.example.domain.model.ProviderPreset
 import com.example.domain.model.ProviderType
 import com.example.domain.model.QuickContact
+import com.example.domain.model.RoutineStep
+import com.example.domain.model.RoutineStepType
 import com.example.domain.model.SelectableModel
+import com.example.domain.model.SmartZone
 import com.example.domain.model.WebSearchProvider
+import com.example.domain.model.WebhookActionInfo
+import com.example.util.CurlImporter
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -66,7 +73,20 @@ data class SettingsUiState(
     val isImportingHistory: Boolean = false,
     val quickContacts: List<QuickContact> = emptyList(),
     val customApps: List<CustomAppEntry> = emptyList(),
-    val visionFallbackModelIds: List<Long> = emptyList()
+    val visionFallbackModelIds: List<Long> = emptyList(),
+    val routines: List<AssistantRoutine> = emptyList(),
+    val smartZones: List<SmartZone> = emptyList(),
+    val timeProfilesEnabled: Boolean = true,
+    val autoEcoMode: Boolean = true,
+    val autoDeleteJunkChats: Boolean = false,
+    val wakePhraseEnabled: Boolean = false,
+    val ambientWhisperEnabled: Boolean = false,
+    val webhooks: List<WebhookActionInfo> = emptyList(),
+    val webhookTestStatus: Map<Long, String> = emptyMap(),
+    val dailyBudgetConfig: DailyBudgetConfig = DailyBudgetConfig(),
+    val todaySpendUsd: Double = 0.0,
+    val autoLockMinutes: Int = 5,
+    val lockOnAppSwitch: Boolean = false
 ) {
     val visionModels: List<SelectableModel>
         get() = textChatModels.filter { it.model.supportsImageInput }.ifEmpty { textChatModels }
@@ -89,6 +109,17 @@ class SettingsViewModel(
     private val vaultStatusMessage = MutableStateFlow<String?>(null)
     private val vaultErrorMessage = MutableStateFlow<String?>(null)
     private val isImportingHistory = MutableStateFlow(false)
+    private val webhookTestStatus = MutableStateFlow<Map<Long, String>>(emptyMap())
+
+    private val smartTriggersPrefsFlow = combine(
+        repository.smartZonesFlow,
+        repository.timeProfilesEnabledFlow,
+        repository.autoEcoModeFlow,
+        repository.autoDeleteJunkChatsFlow,
+        combine(repository.wakePhraseEnabledFlow, repository.ambientWhisperEnabledFlow) { w, a -> w to a }
+    ) { zones, timeProf, eco, autoDel, (wake, whisper) ->
+        SmartTriggersBundle(zones, timeProf, eco, autoDel, wake, whisper)
+    }
 
     private val vaultPrefsFlow = combine(
         repository.displayCurrencyFlow,
@@ -154,13 +185,49 @@ class SettingsViewModel(
         combine(
             repository.quickContactsFlow,
             repository.customAppsFlow,
-            repository.visionFallbackModelIdsFlow
-        ) { contacts, apps, fallbackIds -> Triple(contacts, apps, fallbackIds) }
-    ) { state, (contacts, apps, fallbackIds) ->
+            repository.visionFallbackModelIdsFlow,
+            repository.routinesFlow
+        ) { contacts, apps, fallbackIds, routines ->
+            DeviceAutomationBundle(contacts, apps, fallbackIds, routines)
+        }
+    ) { state, bundle ->
         state.copy(
-            quickContacts = contacts,
-            customApps = apps,
-            visionFallbackModelIds = fallbackIds
+            quickContacts = bundle.contacts,
+            customApps = bundle.apps,
+            visionFallbackModelIds = bundle.fallbackIds,
+            routines = bundle.routines
+        )
+    }.combine(smartTriggersPrefsFlow) { state, st ->
+        state.copy(
+            smartZones = st.smartZones,
+            timeProfilesEnabled = st.timeProfilesEnabled,
+            autoEcoMode = st.autoEcoMode,
+            autoDeleteJunkChats = st.autoDeleteJunkChats,
+            wakePhraseEnabled = st.wakePhraseEnabled,
+            ambientWhisperEnabled = st.ambientWhisperEnabled
+        )
+    }.combine(
+        combine(repository.webhooksFlow, webhookTestStatus) { hooks, statuses -> hooks to statuses }
+    ) { state, (hooks, statuses) ->
+        state.copy(
+            webhooks = hooks,
+            webhookTestStatus = statuses
+        )
+    }.combine(
+        combine(
+            repository.dailyBudgetConfigFlow,
+            repository.observeTodaySpendUsd(),
+            repository.autoLockMinutesFlow,
+            repository.lockOnAppSwitchFlow
+        ) { budget, spend, lockMins, lockSwitch ->
+            BudgetAndLockBundle(budget, spend, lockMins, lockSwitch)
+        }
+    ) { state, bl ->
+        state.copy(
+            dailyBudgetConfig = bl.budget,
+            todaySpendUsd = bl.todaySpendUsd,
+            autoLockMinutes = bl.autoLockMinutes,
+            lockOnAppSwitch = bl.lockOnAppSwitch
         )
     }.stateIn(
         scope = viewModelScope,
@@ -277,14 +344,93 @@ class SettingsViewModel(
 
     // --- Quick Contacts, Custom App Packages & Live Lens 429 Failover Queue ---
 
-    fun saveQuickContact(name: String, phoneNumber: String) {
+    fun saveQuickContact(
+        name: String,
+        phoneNumber: String,
+        email: String = "",
+        upiId: String = ""
+    ) {
         val cleanName = name.trim()
         val cleanPhone = phoneNumber.trim()
-        if (cleanName.isBlank() || cleanPhone.isBlank()) return
+        val cleanEmail = email.trim()
+        val cleanUpi = upiId.trim()
+        if (cleanName.isBlank() || (cleanPhone.isBlank() && cleanEmail.isBlank() && cleanUpi.isBlank())) return
         viewModelScope.launch {
-            repository.saveQuickContact(QuickContact(name = cleanName, phoneNumber = cleanPhone))
-            vaultStatusMessage.value = "CONTACTS // Saved $cleanName ($cleanPhone)."
+            repository.saveQuickContact(
+                QuickContact(
+                    name = cleanName,
+                    phoneNumber = cleanPhone,
+                    email = cleanEmail,
+                    upiId = cleanUpi
+                )
+            )
+            val details = listOfNotNull(
+                cleanPhone.takeIf { it.isNotBlank() },
+                cleanEmail.takeIf { it.isNotBlank() },
+                cleanUpi.takeIf { it.isNotBlank() }
+            ).joinToString(" · ")
+            vaultStatusMessage.value = "CONTACTS // Saved $cleanName ($details)."
         }
+    }
+
+    fun saveRoutine(routine: AssistantRoutine) {
+        if (routine.name.isBlank() || routine.steps.isEmpty()) return
+        viewModelScope.launch {
+            repository.saveRoutine(routine)
+            vaultStatusMessage.value = "ROUTINES // Saved \"${routine.name.trim()}\" (${routine.steps.size} steps)."
+        }
+    }
+
+    fun deleteRoutine(id: Long) {
+        viewModelScope.launch {
+            repository.deleteRoutine(id)
+            vaultStatusMessage.value = "ROUTINES // Deleted routine."
+        }
+    }
+
+    fun addStarterRoutine(presetKey: String) {
+        val preset = when (presetKey) {
+            "morning" -> AssistantRoutine(
+                name = "Morning Briefing",
+                triggerPhrase = "good morning",
+                steps = listOf(
+                    RoutineStep(
+                        id = "s1",
+                        type = RoutineStepType.AI_WEB_SEARCH,
+                        payload = "Give a crisp 4-bullet briefing on top world & tech headlines today plus one motivational focus tip."
+                    ),
+                    RoutineStep(id = "s2", type = RoutineStepType.READ_ALOUD_TTS, payload = ""),
+                    RoutineStep(id = "s3", type = RoutineStepType.SAVE_NOTE, payload = "Morning Briefing")
+                )
+            )
+            "focus" -> AssistantRoutine(
+                name = "Deep Focus 25m",
+                triggerPhrase = "focus mode",
+                steps = listOf(
+                    RoutineStep(
+                        id = "s1",
+                        type = RoutineStepType.AI_PROMPT,
+                        payload = "Give me a 2-sentence sharp Pomodoro deep-work kickoff checklist."
+                    ),
+                    RoutineStep(id = "s2", type = RoutineStepType.READ_ALOUD_TTS, payload = ""),
+                    RoutineStep(id = "s3", type = RoutineStepType.DEVICE_ACTION, payload = "set timer for 25 minutes")
+                )
+            )
+            else -> AssistantRoutine(
+                name = "Commute & Weather",
+                triggerPhrase = "start commute",
+                steps = listOf(
+                    RoutineStep(
+                        id = "s1",
+                        type = RoutineStepType.AI_WEB_SEARCH,
+                        payload = "Give a concise 2-sentence travel readiness tip and reminder checklist for commuting."
+                    ),
+                    RoutineStep(id = "s2", type = RoutineStepType.READ_ALOUD_TTS, payload = ""),
+                    RoutineStep(id = "s3", type = RoutineStepType.DEVICE_ACTION, payload = "navigate to work")
+                )
+            )
+        }
+        saveRoutine(preset)
     }
 
     fun deleteQuickContact(id: String) {
@@ -314,6 +460,112 @@ class SettingsViewModel(
             repository.setVisionFallbackModelIds(ids)
             vaultStatusMessage.value = "FAILOVER // Updated Live Lens vision priority queue (${ids.size} model${if (ids.size == 1) "" else "s"})."
         }
+    }
+
+    // --- Smart Triggers, Geofence Zones, Junk Chat Pruning & Webhooks ---
+
+    fun setTimeProfilesEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            repository.setTimeProfilesEnabled(enabled)
+            vaultStatusMessage.value = if (enabled) "SMART TRIGGERS // Time-of-Day auto profiles ON." else "SMART TRIGGERS // Time-of-Day auto profiles OFF."
+        }
+    }
+
+    fun setAutoEcoMode(enabled: Boolean) {
+        viewModelScope.launch {
+            repository.setAutoEcoMode(enabled)
+            vaultStatusMessage.value = if (enabled) "ECO MODE // Battery & metered network awareness ON." else "ECO MODE // Disabled."
+        }
+    }
+
+    fun setAutoDeleteJunkChats(enabled: Boolean) {
+        viewModelScope.launch {
+            repository.setAutoDeleteJunkChats(enabled)
+            vaultStatusMessage.value = if (enabled) "CLEANUP // Auto-delete 1-message chats older than 7 days ON." else "CLEANUP // Auto-delete disabled."
+        }
+    }
+
+    fun pruneJunkChatsNow() {
+        viewModelScope.launch {
+            val count = repository.pruneOldJunkChatsNow()
+            vaultStatusMessage.value = "CLEANUP // Pruned $count stale 1-message chat${if (count == 1) "" else "s"}."
+        }
+    }
+
+    fun setWakePhraseEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            repository.setWakePhraseEnabled(enabled)
+            vaultStatusMessage.value = if (enabled) "VOICE // \"Hey AllChat\" wake-phrase armed in Assistant & Commute HUD." else "VOICE // Wake-phrase turned OFF."
+        }
+    }
+
+    fun setAmbientWhisperEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            repository.setAmbientWhisperEnabled(enabled)
+            vaultStatusMessage.value = if (enabled) "AMBIENT // Loud-room Whisper Mode auto-detection ON." else "AMBIENT // Whisper Mode auto-detection OFF."
+        }
+    }
+
+    fun saveSmartZone(zone: SmartZone) {
+        viewModelScope.launch {
+            val current = uiState.value.smartZones.filterNot { it.id == zone.id }
+            repository.saveSmartZones((current + zone).take(5))
+            vaultStatusMessage.value = "GEOFENCE // Saved zone \"${zone.name}\" (${zone.radiusMeters.toInt()}m)."
+        }
+    }
+
+    fun deleteSmartZone(id: String) {
+        viewModelScope.launch {
+            val updated = uiState.value.smartZones.filterNot { it.id == id }
+            repository.saveSmartZones(updated)
+            vaultStatusMessage.value = "GEOFENCE // Removed zone."
+        }
+    }
+
+    fun saveWebhook(webhook: WebhookActionInfo) {
+        if (webhook.name.isBlank() || webhook.url.isBlank()) return
+        viewModelScope.launch {
+            repository.saveWebhook(webhook)
+            vaultStatusMessage.value = "WEBHOOK // Saved \"${webhook.name.trim()}\"."
+        }
+    }
+
+    fun deleteWebhook(id: Long) {
+        viewModelScope.launch {
+            repository.deleteWebhook(id)
+            webhookTestStatus.update { it - id }
+        }
+    }
+
+    fun testWebhook(webhook: WebhookActionInfo) {
+        viewModelScope.launch {
+            webhookTestStatus.update { it + (webhook.id to "Firing…") }
+            val result = repository.executeWebhook(webhook)
+            val label = result.fold(
+                onSuccess = { "OK // $it" },
+                onFailure = { "ERR // ${it.message ?: "Request failed"}" }
+            )
+            webhookTestStatus.update { it + (webhook.id to label) }
+        }
+    }
+
+    fun importProviderFromCurl(rawCurl: String): Boolean {
+        val parsed = CurlImporter.parse(rawCurl) ?: run {
+            vaultErrorMessage.value = "Could not detect a valid http(s) endpoint inside that cURL command."
+            return false
+        }
+        editorState.update { current ->
+            current.copy(
+                name = parsed.name,
+                type = parsed.type,
+                baseUrl = parsed.baseUrl,
+                apiKey = parsed.apiKey.ifBlank { current.apiKey },
+                customModelsText = parsed.modelId.orEmpty().ifBlank { current.customModelsText },
+                helperHint = "Auto-parsed from cURL (${parsed.type.label}). Review and tap Save."
+            )
+        }
+        vaultStatusMessage.value = "CURL IMPORT // Parsed ${parsed.name} (${parsed.baseUrl})."
+        return true
     }
 
     // --- Model Token Pricing ---
@@ -564,5 +816,52 @@ class SettingsViewModel(
         val autoRouterConfig: AutoRouterConfig,
         val textChatModels: List<SelectableModel>,
         val isImportingHistory: Boolean
+    )
+
+    private data class DeviceAutomationBundle(
+        val contacts: List<QuickContact>,
+        val apps: List<CustomAppEntry>,
+        val fallbackIds: List<Long>,
+        val routines: List<AssistantRoutine>
+    )
+
+    fun saveDailyBudgetConfig(config: DailyBudgetConfig) {
+        viewModelScope.launch {
+            repository.saveDailyBudgetConfig(config)
+            vaultStatusMessage.value = if (config.dailyCapUsd > 0.0) {
+                "Daily cap saved ($${String.format(java.util.Locale.US, "%.2f", config.dailyCapUsd)}). Auto-downgrade triggers at 80%."
+            } else {
+                "Daily budget cap disabled."
+            }
+        }
+    }
+
+    fun setAutoLockMinutes(minutes: Int) {
+        viewModelScope.launch {
+            repository.setAutoLockMinutes(minutes)
+            vaultStatusMessage.value = if (minutes > 0) "Vault auto-locks after $minutes min idle." else "Idle auto-lock disabled."
+        }
+    }
+
+    fun setLockOnAppSwitch(enabled: Boolean) {
+        viewModelScope.launch {
+            repository.setLockOnAppSwitch(enabled)
+        }
+    }
+
+    private data class BudgetAndLockBundle(
+        val budget: DailyBudgetConfig,
+        val todaySpendUsd: Double,
+        val autoLockMinutes: Int,
+        val lockOnAppSwitch: Boolean
+    )
+
+    private data class SmartTriggersBundle(
+        val smartZones: List<SmartZone>,
+        val timeProfilesEnabled: Boolean,
+        val autoEcoMode: Boolean,
+        val autoDeleteJunkChats: Boolean,
+        val wakePhraseEnabled: Boolean,
+        val ambientWhisperEnabled: Boolean
     )
 }

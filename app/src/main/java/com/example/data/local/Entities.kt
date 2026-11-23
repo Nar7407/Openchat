@@ -228,3 +228,136 @@ data class UserMemoryEntity(
     )
 }
 
+@Entity(tableName = "routines")
+data class RoutineEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val name: String,
+    val triggerPhrase: String,
+    val stepsJson: String,
+    val createdAt: Long = System.currentTimeMillis()
+)
+
+@Entity(tableName = "voice_notes")
+data class VoiceNoteEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val title: String,
+    val rawTranscript: String,
+    val markdownContent: String,
+    val tagsCsv: String = "",
+    val createdAt: Long = System.currentTimeMillis(),
+    val updatedAt: Long = System.currentTimeMillis()
+) {
+    fun toDomain() = com.example.domain.model.VoiceNoteInfo(
+        id = id,
+        title = title,
+        rawTranscript = rawTranscript,
+        markdownContent = markdownContent,
+        tags = tagsCsv.split(',').map { it.trim() }.filter { it.isNotEmpty() },
+        createdAt = createdAt,
+        updatedAt = updatedAt
+    )
+}
+
+@Entity(tableName = "expenses")
+data class ExpenseEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val merchant: String,
+    val dateIso: String,
+    val category: String,
+    val amount: Double,
+    val currency: String = "INR",
+    val notes: String = "",
+    val createdAt: Long = System.currentTimeMillis()
+) {
+    fun toDomain() = com.example.domain.model.ExpenseRecord(
+        id = id,
+        merchant = merchant,
+        dateIso = dateIso,
+        category = category,
+        amount = amount,
+        currency = currency,
+        notes = notes,
+        createdAt = createdAt
+    )
+}
+
+@Entity(tableName = "watchlist_items")
+data class WatchlistItemEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val title: String,
+    val queryOrUrl: String,
+    val lastSummary: String = "",
+    val lastDiffMarkdown: String = "",
+    val lastCheckedAt: Long = 0L,
+    val createdAt: Long = System.currentTimeMillis()
+) {
+    fun toDomain() = com.example.domain.model.WatchlistItemInfo(
+        id = id,
+        title = title,
+        queryOrUrl = queryOrUrl,
+        lastSummary = lastSummary,
+        lastDiffMarkdown = lastDiffMarkdown,
+        lastCheckedAt = lastCheckedAt,
+        createdAt = createdAt
+    )
+}
+
+@Entity(tableName = "webhook_actions")
+data class WebhookActionEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val name: String,
+    val triggerPhrase: String,
+    val method: String = "POST",
+    val url: String,
+    val headersJson: String = "",
+    val bodyTemplate: String = "",
+    val createdAt: Long = System.currentTimeMillis()
+) {
+    fun toDomain() = com.example.domain.model.WebhookActionInfo(
+        id = id,
+        name = name,
+        triggerPhrase = triggerPhrase,
+        method = method,
+        url = url,
+        headersJson = headersJson,
+        bodyTemplate = bodyTemplate,
+        createdAt = createdAt
+    )
+}
+
+@Entity(tableName = "canvas_versions")
+data class CanvasVersionEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val docTitle: String,
+    val content: String,
+    val versionNumber: Int,
+    val createdAt: Long = System.currentTimeMillis()
+) {
+    fun toDomain() = com.example.domain.model.CanvasVersionInfo(
+        id = id,
+        docTitle = docTitle,
+        content = content,
+        versionNumber = versionNumber,
+        createdAt = createdAt
+    )
+}
+
+@Entity(tableName = "clipboard_items")
+data class ClipboardItemEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val content: String,
+    val preview: String,
+    val isUrl: Boolean = false,
+    val createdAt: Long = System.currentTimeMillis()
+) {
+    fun toDomain() = com.example.domain.model.ClipboardSnippetInfo(
+        id = id,
+        content = content,
+        preview = preview,
+        isUrl = isUrl,
+        createdAt = createdAt
+    )
+}
+
+
+

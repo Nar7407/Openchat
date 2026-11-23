@@ -203,6 +203,8 @@ private object MindMapLayoutEngine {
 @Composable
 fun MindMapDialog(
     rootNode: MindMapNode,
+    isExpandingNode: Boolean = false,
+    onExpandSubTopic: ((MindMapNode) -> Unit)? = null,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
@@ -211,7 +213,10 @@ fun MindMapDialog(
 
     var scale by remember { mutableFloatStateOf(0.85f) }
     var pan by remember { mutableStateOf(Offset(20f, 20f)) }
-    var selectedNode by remember { mutableStateOf<MindMapNode?>(rootNode) }
+    var selectedNodeId by remember { mutableStateOf(rootNode.id) }
+    val selectedNode = remember(rootNode, selectedNodeId) {
+        positioned.firstOrNull { it.node.id == selectedNodeId }?.node ?: rootNode
+    }
     var exportNotice by remember { mutableStateOf<String?>(null) }
 
     val inkColor = SwissInk
@@ -369,7 +374,7 @@ fun MindMapDialog(
                                 val hit = positioned.firstOrNull { n ->
                                     graphX in n.x..(n.x + n.width) && graphY in n.y..(n.y + n.height)
                                 }
-                                if (hit != null) selectedNode = hit.node
+                                if (hit != null) selectedNodeId = hit.node.id
                             }
                         }
                 ) {
@@ -441,23 +446,48 @@ fun MindMapDialog(
                     }
                 }
 
-                // Selected Node Inspector Footer
+                // Selected Node Inspector Footer + Dynamic Sub-Topic Expansion
                 Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(SwissInk))
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(SwissPaper)
                         .padding(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "NODE // ${selectedNode.label}",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = SwissInk,
+                            modifier = Modifier.weight(1f)
+                        )
+                        if (onExpandSubTopic != null) {
+                            Box(
+                                modifier = Modifier
+                                    .background(if (isExpandingNode) SwissInk else SwissSignalRed, RectangleShape)
+                                    .border(1.dp, SwissInk, RectangleShape)
+                                    .clickable(enabled = !isExpandingNode) {
+                                        onExpandSubTopic(selectedNode)
+                                    }
+                                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                                    .testTag("mindmap_expand_subtopic_btn")
+                            ) {
+                                Text(
+                                    text = if (isExpandingNode) "EXPANDING…" else "+ EXPAND THIS SUB-TOPIC",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SwissWhite
+                                )
+                            }
+                        }
+                    }
                     Text(
-                        text = "NODE // ${selectedNode?.label ?: rootNode.label}",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = SwissInk
-                    )
-                    Text(
-                        text = selectedNode?.detail?.takeIf { it.isNotBlank() }
-                            ?: "Drag to pan, pinch to zoom, tap any node to inspect details.",
+                        text = selectedNode.detail.takeIf { it.isNotBlank() }
+                            ?: "Drag to pan, pinch to zoom, tap any node to inspect or dynamically grow child branches.",
                         style = MaterialTheme.typography.bodySmall,
                         color = SwissMuted
                     )

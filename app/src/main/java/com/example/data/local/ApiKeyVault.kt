@@ -13,9 +13,13 @@ import androidx.datastore.preferences.preferencesDataStore
 import com.example.domain.model.AutoRouterConfig
 import com.example.domain.model.CustomAppEntry
 import com.example.domain.model.CustomSlashCommand
+import com.example.domain.model.DailyBudgetConfig
 import com.example.domain.model.DisplayCurrency
 import com.example.domain.model.McpServerConfig
 import com.example.domain.model.QuickContact
+import com.example.domain.model.SmartZone
+import com.example.domain.model.ThreadCheckpoint
+import com.example.domain.model.VoiceFormTemplate
 import com.example.domain.model.WebSearchProvider
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -77,6 +81,18 @@ class ApiKeyVault(private val context: Context) {
         val KEY_CUSTOM_APPS = stringPreferencesKey("custom_apps_json")
         val KEY_VISION_FALLBACK_IDS = stringPreferencesKey("vision_fallback_model_ids_json")
         val KEY_LENS_INTERVAL_SEC = intPreferencesKey("live_lens_interval_sec")
+        val KEY_SMART_ZONES = stringPreferencesKey("smart_geofence_zones_json")
+        val KEY_TIME_PROFILES_ENABLED = booleanPreferencesKey("time_profiles_enabled")
+        val KEY_AUTO_ECO_MODE = booleanPreferencesKey("auto_eco_mode_enabled")
+        val KEY_AUTO_DELETE_JUNK = booleanPreferencesKey("auto_delete_junk_chats_7d")
+        val KEY_LOCAL_WORKSPACE_URI = stringPreferencesKey("local_workspace_tree_uri")
+        val KEY_WAKE_PHRASE_ENABLED = booleanPreferencesKey("wake_phrase_enabled")
+        val KEY_AMBIENT_WHISPER_ENABLED = booleanPreferencesKey("ambient_whisper_enabled")
+        val KEY_DAILY_BUDGET_CONFIG = stringPreferencesKey("daily_budget_config_json")
+        val KEY_VOICE_FORM_TEMPLATES = stringPreferencesKey("voice_form_templates_json")
+        val KEY_AUTO_LOCK_MINUTES = intPreferencesKey("auto_lock_idle_minutes")
+        val KEY_LOCK_ON_APP_SWITCH = booleanPreferencesKey("lock_on_app_switch")
+        val KEY_THREAD_CHECKPOINTS = stringPreferencesKey("thread_checkpoints_json")
     }
 
     private val sessionPinKey = MutableStateFlow<SecretKey?>(null)
@@ -203,8 +219,18 @@ class ApiKeyVault(private val context: Context) {
                     val id = o.optString("id")
                     val name = o.optString("name")
                     val phone = o.optString("phoneNumber")
-                    if (name.isNotBlank() && phone.isNotBlank()) {
-                        add(QuickContact(id = id.ifBlank { "c_$i" }, name = name, phoneNumber = phone))
+                    val email = o.optString("email")
+                    val upiId = o.optString("upiId")
+                    if (name.isNotBlank() && (phone.isNotBlank() || email.isNotBlank() || upiId.isNotBlank())) {
+                        add(
+                            QuickContact(
+                                id = id.ifBlank { "c_$i" },
+                                name = name,
+                                phoneNumber = phone,
+                                email = email,
+                                upiId = upiId
+                            )
+                        )
                     }
                 }
             }
@@ -214,12 +240,26 @@ class ApiKeyVault(private val context: Context) {
     suspend fun saveQuickContact(contact: QuickContact) {
         val current = quickContactsFlow.first().toMutableList()
         val id = contact.id.ifBlank { "qc_${System.currentTimeMillis()}" }
-        val normalized = contact.copy(id = id, name = contact.name.trim(), phoneNumber = contact.phoneNumber.trim())
-        val idx = current.indexOfFirst { it.id == id || it.name.equals(normalized.name, ignoreCase = true) }
+        val existing = current.firstOrNull { it.id == id || it.name.equals(contact.name.trim(), ignoreCase = true) }
+        val normalized = contact.copy(
+            id = existing?.id ?: id,
+            name = contact.name.trim(),
+            phoneNumber = contact.phoneNumber.trim().ifBlank { existing?.phoneNumber.orEmpty() },
+            email = contact.email.trim().ifBlank { existing?.email.orEmpty() },
+            upiId = contact.upiId.trim().ifBlank { existing?.upiId.orEmpty() }
+        )
+        val idx = current.indexOfFirst { it.id == normalized.id }
         if (idx >= 0) current[idx] = normalized else current.add(0, normalized)
         val arr = JSONArray()
         current.forEach { c ->
-            arr.put(JSONObject().put("id", c.id).put("name", c.name).put("phoneNumber", c.phoneNumber))
+            arr.put(
+                JSONObject()
+                    .put("id", c.id)
+                    .put("name", c.name)
+                    .put("phoneNumber", c.phoneNumber)
+                    .put("email", c.email)
+                    .put("upiId", c.upiId)
+            )
         }
         context.keyVaultDataStore.edit { it[KEY_QUICK_CONTACTS] = arr.toString() }
     }
@@ -228,7 +268,14 @@ class ApiKeyVault(private val context: Context) {
         val updated = quickContactsFlow.first().filterNot { it.id == id }
         val arr = JSONArray()
         updated.forEach { c ->
-            arr.put(JSONObject().put("id", c.id).put("name", c.name).put("phoneNumber", c.phoneNumber))
+            arr.put(
+                JSONObject()
+                    .put("id", c.id)
+                    .put("name", c.name)
+                    .put("phoneNumber", c.phoneNumber)
+                    .put("email", c.email)
+                    .put("upiId", c.upiId)
+            )
         }
         context.keyVaultDataStore.edit { it[KEY_QUICK_CONTACTS] = arr.toString() }
     }
@@ -300,6 +347,235 @@ class ApiKeyVault(private val context: Context) {
 
     suspend fun setLiveLensIntervalSec(seconds: Int) {
         context.keyVaultDataStore.edit { it[KEY_LENS_INTERVAL_SEC] = seconds.coerceIn(0, 60) }
+    }
+
+    val timeProfilesEnabledFlow: Flow<Boolean> = context.keyVaultDataStore.data.map { it[KEY_TIME_PROFILES_ENABLED] ?: true }
+    suspend fun setTimeProfilesEnabled(enabled: Boolean) {
+        context.keyVaultDataStore.edit { it[KEY_TIME_PROFILES_ENABLED] = enabled }
+    }
+
+    val autoEcoModeFlow: Flow<Boolean> = context.keyVaultDataStore.data.map { it[KEY_AUTO_ECO_MODE] ?: true }
+    suspend fun setAutoEcoMode(enabled: Boolean) {
+        context.keyVaultDataStore.edit { it[KEY_AUTO_ECO_MODE] = enabled }
+    }
+
+    val autoDeleteJunkChatsFlow: Flow<Boolean> = context.keyVaultDataStore.data.map { it[KEY_AUTO_DELETE_JUNK] ?: false }
+    suspend fun setAutoDeleteJunkChats(enabled: Boolean) {
+        context.keyVaultDataStore.edit { it[KEY_AUTO_DELETE_JUNK] = enabled }
+    }
+
+    val localWorkspaceUriFlow: Flow<String?> = context.keyVaultDataStore.data.map { it[KEY_LOCAL_WORKSPACE_URI] }
+    suspend fun setLocalWorkspaceUri(uri: String?) {
+        context.keyVaultDataStore.edit { prefs ->
+            if (uri.isNullOrBlank()) prefs.remove(KEY_LOCAL_WORKSPACE_URI) else prefs[KEY_LOCAL_WORKSPACE_URI] = uri
+        }
+    }
+
+    val wakePhraseEnabledFlow: Flow<Boolean> = context.keyVaultDataStore.data.map { it[KEY_WAKE_PHRASE_ENABLED] ?: false }
+    suspend fun setWakePhraseEnabled(enabled: Boolean) {
+        context.keyVaultDataStore.edit { it[KEY_WAKE_PHRASE_ENABLED] = enabled }
+    }
+
+    val ambientWhisperEnabledFlow: Flow<Boolean> = context.keyVaultDataStore.data.map { it[KEY_AMBIENT_WHISPER_ENABLED] ?: true }
+    suspend fun setAmbientWhisperEnabled(enabled: Boolean) {
+        context.keyVaultDataStore.edit { it[KEY_AMBIENT_WHISPER_ENABLED] = enabled }
+    }
+
+    val autoLockMinutesFlow: Flow<Int> = context.keyVaultDataStore.data.map { it[KEY_AUTO_LOCK_MINUTES] ?: 5 }
+    suspend fun setAutoLockMinutes(minutes: Int) {
+        context.keyVaultDataStore.edit { it[KEY_AUTO_LOCK_MINUTES] = minutes.coerceIn(0, 60) }
+    }
+
+    val lockOnAppSwitchFlow: Flow<Boolean> = context.keyVaultDataStore.data.map { it[KEY_LOCK_ON_APP_SWITCH] ?: false }
+    suspend fun setLockOnAppSwitch(enabled: Boolean) {
+        context.keyVaultDataStore.edit { it[KEY_LOCK_ON_APP_SWITCH] = enabled }
+    }
+
+    val dailyBudgetConfigFlow: Flow<DailyBudgetConfig> = context.keyVaultDataStore.data.map { prefs ->
+        val raw = prefs[KEY_DAILY_BUDGET_CONFIG].orEmpty()
+        if (raw.isBlank()) return@map DailyBudgetConfig()
+        runCatching {
+            val o = JSONObject(raw)
+            DailyBudgetConfig(
+                dailyCapUsd = o.optDouble("cap", 0.0).coerceAtLeast(0.0),
+                autoDowngradeEnabled = o.optBoolean("autoDowngrade", true),
+                downgradeModelDbId = o.optLong("downgradeModelId", -1L).takeIf { it > 0L }
+            )
+        }.getOrDefault(DailyBudgetConfig())
+    }
+
+    suspend fun saveDailyBudgetConfig(config: DailyBudgetConfig) {
+        val obj = JSONObject()
+            .put("cap", config.dailyCapUsd.coerceAtLeast(0.0))
+            .put("autoDowngrade", config.autoDowngradeEnabled)
+            .put("downgradeModelId", config.downgradeModelDbId ?: -1L)
+        context.keyVaultDataStore.edit { it[KEY_DAILY_BUDGET_CONFIG] = obj.toString() }
+    }
+
+    val voiceFormTemplatesFlow: Flow<List<VoiceFormTemplate>> = context.keyVaultDataStore.data.map { prefs ->
+        val raw = prefs[KEY_VOICE_FORM_TEMPLATES]
+        if (raw == null) return@map defaultVoiceFormTemplates()
+        if (raw.isBlank()) return@map defaultVoiceFormTemplates()
+        runCatching {
+            val arr = JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    val fieldsArr = o.optJSONArray("fields")
+                    val fields = buildList {
+                        if (fieldsArr != null) {
+                            for (j in 0 until fieldsArr.length()) {
+                                val f = fieldsArr.optString(j).trim()
+                                if (f.isNotEmpty()) add(f)
+                            }
+                        }
+                    }
+                    if (fields.isNotEmpty()) {
+                        add(
+                            VoiceFormTemplate(
+                                id = o.optString("id"),
+                                name = o.optString("name"),
+                                category = o.optString("category", "CUSTOM"),
+                                fields = fields
+                            )
+                        )
+                    }
+                }
+            }.ifEmpty { defaultVoiceFormTemplates() }
+        }.getOrDefault(defaultVoiceFormTemplates())
+    }
+
+    suspend fun saveVoiceFormTemplates(templates: List<VoiceFormTemplate>) {
+        val arr = JSONArray()
+        templates.forEach { tpl ->
+            val fieldsArr = JSONArray()
+            tpl.fields.forEach { fieldsArr.put(it) }
+            arr.put(
+                JSONObject()
+                    .put("id", tpl.id.ifBlank { java.util.UUID.randomUUID().toString() })
+                    .put("name", tpl.name)
+                    .put("category", tpl.category)
+                    .put("fields", fieldsArr)
+            )
+        }
+        context.keyVaultDataStore.edit { it[KEY_VOICE_FORM_TEMPLATES] = arr.toString() }
+    }
+
+    private fun defaultVoiceFormTemplates(): List<VoiceFormTemplate> = listOf(
+        VoiceFormTemplate(
+            id = "tpl_bug_report",
+            name = "Bug Report",
+            category = "ENGINEERING",
+            fields = listOf("Title", "Severity", "Platform / Device", "Steps to Reproduce", "Expected vs Actual")
+        ),
+        VoiceFormTemplate(
+            id = "tpl_daily_standup",
+            name = "Daily Standup Log",
+            category = "WORK",
+            fields = listOf("Date", "Completed Yesterday", "Focus Today", "Blockers", "ETA / Notes")
+        ),
+        VoiceFormTemplate(
+            id = "tpl_workout_log",
+            name = "Workout Log",
+            category = "FITNESS",
+            fields = listOf("Exercise", "Sets x Reps", "Weight / Load", "RPE / Effort", "Notes")
+        ),
+        VoiceFormTemplate(
+            id = "tpl_lab_experiment",
+            name = "Lab Experiment Observation",
+            category = "SCIENCE",
+            fields = listOf("Experiment / Sample", "Independent Variable", "Measured Observation", "Anomalies", "Next Step")
+        )
+    )
+
+    val threadCheckpointsFlow: Flow<Map<Long, List<ThreadCheckpoint>>> = context.keyVaultDataStore.data.map { prefs ->
+        val raw = prefs[KEY_THREAD_CHECKPOINTS].orEmpty()
+        if (raw.isBlank()) return@map emptyMap()
+        runCatching {
+            val arr = JSONArray(raw)
+            val grouped = LinkedHashMap<Long, MutableList<ThreadCheckpoint>>()
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                val convId = o.optLong("convId", 0L)
+                if (convId <= 0L) continue
+                val cp = ThreadCheckpoint(
+                    id = o.optString("id"),
+                    conversationId = convId,
+                    afterMessageId = o.optLong("afterMsgId", 0L),
+                    messageCountCovered = o.optInt("count", 0),
+                    summaryMarkdown = o.optString("summary"),
+                    createdAt = o.optLong("createdAt", System.currentTimeMillis())
+                )
+                grouped.getOrPut(convId) { mutableListOf() }.add(cp)
+            }
+            grouped
+        }.getOrDefault(emptyMap())
+    }
+
+    suspend fun saveThreadCheckpoints(map: Map<Long, List<ThreadCheckpoint>>) {
+        val arr = JSONArray()
+        map.values.flatten().takeLast(80).forEach { cp ->
+            arr.put(
+                JSONObject()
+                    .put("id", cp.id)
+                    .put("convId", cp.conversationId)
+                    .put("afterMsgId", cp.afterMessageId)
+                    .put("count", cp.messageCountCovered)
+                    .put("summary", cp.summaryMarkdown)
+                    .put("createdAt", cp.createdAt)
+            )
+        }
+        context.keyVaultDataStore.edit { it[KEY_THREAD_CHECKPOINTS] = arr.toString() }
+    }
+
+    val smartZonesFlow: Flow<List<SmartZone>> = context.keyVaultDataStore.data.map { prefs ->
+        val raw = prefs[KEY_SMART_ZONES].orEmpty()
+        if (raw.isBlank()) return@map emptyList()
+        runCatching {
+            val arr = JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    val chipsArr = o.optJSONArray("chips")
+                    val chips = buildList {
+                        if (chipsArr != null) {
+                            for (j in 0 until chipsArr.length()) {
+                                val c = chipsArr.optString(j).trim()
+                                if (c.isNotEmpty()) add(c)
+                            }
+                        }
+                    }
+                    add(
+                        SmartZone(
+                            id = o.optString("id"),
+                            name = o.optString("name"),
+                            latitude = o.optDouble("lat", 0.0),
+                            longitude = o.optDouble("lng", 0.0),
+                            radiusMeters = o.optDouble("radius", 250.0).toFloat(),
+                            quickChips = chips
+                        )
+                    )
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    suspend fun saveSmartZones(zones: List<SmartZone>) {
+        val arr = JSONArray()
+        zones.forEach { z ->
+            val chips = JSONArray()
+            z.quickChips.forEach { chips.put(it) }
+            arr.put(
+                JSONObject()
+                    .put("id", z.id.ifBlank { java.util.UUID.randomUUID().toString() })
+                    .put("name", z.name)
+                    .put("lat", z.latitude)
+                    .put("lng", z.longitude)
+                    .put("radius", z.radiusMeters.toDouble())
+                    .put("chips", chips)
+            )
+        }
+        context.keyVaultDataStore.edit { it[KEY_SMART_ZONES] = arr.toString() }
     }
 
     val autoRouterConfigFlow: Flow<AutoRouterConfig> = context.keyVaultDataStore.data.map { prefs ->

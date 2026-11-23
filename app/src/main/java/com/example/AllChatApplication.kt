@@ -11,6 +11,7 @@ import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import java.util.concurrent.TimeUnit
 
@@ -51,10 +52,21 @@ class AllChatApplication : Application() {
             knowledgeDocDao = database.knowledgeDocDao(),
             generatedMediaDao = database.generatedMediaDao(),
             userMemoryDao = database.userMemoryDao(),
+            routineDao = database.routineDao(),
+            voiceNoteDao = database.voiceNoteDao(),
+            expenseDao = database.expenseDao(),
+            watchlistDao = database.watchlistDao(),
+            webhookDao = database.webhookDao(),
+            canvasVersionDao = database.canvasVersionDao(),
+            clipboardDao = database.clipboardDao(),
             apiKeyVault = vault,
             aiRouter = router,
             webSearchClient = webSearchClient,
             okHttpClient = okHttpClient
         )
+
+        applicationScope.launch {
+            runCatching { repository.pruneOldJunkChatsIfEnabled() }
+        }
     }
 }

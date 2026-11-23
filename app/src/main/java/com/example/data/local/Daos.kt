@@ -236,6 +236,12 @@ interface MessageDao {
     @Query("SELECT * FROM messages ORDER BY createdAt ASC, id ASC")
     suspend fun getAll(): List<MessageEntity>
 
+    @Query("SELECT COALESCE(SUM(estimatedCostUsd), 0.0) FROM messages WHERE createdAt >= :sinceMs")
+    fun observeSpendSince(sinceMs: Long): Flow<Double>
+
+    @Query("SELECT COALESCE(SUM(estimatedCostUsd), 0.0) FROM messages WHERE createdAt >= :sinceMs")
+    suspend fun getSpendSince(sinceMs: Long): Double
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(message: MessageEntity): Long
 
@@ -337,4 +343,126 @@ interface UserMemoryDao {
     @Query("DELETE FROM user_memories")
     suspend fun deleteAll()
 }
+
+@Dao
+interface RoutineDao {
+    @Query("SELECT * FROM routines ORDER BY createdAt DESC")
+    fun observeAll(): Flow<List<RoutineEntity>>
+
+    @Query("SELECT * FROM routines ORDER BY createdAt DESC")
+    suspend fun getAll(): List<RoutineEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(routine: RoutineEntity): Long
+
+    @Update
+    suspend fun update(routine: RoutineEntity)
+
+    @Query("DELETE FROM routines WHERE id = :id")
+    suspend fun deleteById(id: Long)
+}
+
+@Dao
+interface VoiceNoteDao {
+    @Query("SELECT * FROM voice_notes ORDER BY updatedAt DESC, createdAt DESC")
+    fun observeAll(): Flow<List<VoiceNoteEntity>>
+
+    @Query("SELECT * FROM voice_notes ORDER BY updatedAt DESC, createdAt DESC")
+    suspend fun getAll(): List<VoiceNoteEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(note: VoiceNoteEntity): Long
+
+    @Update
+    suspend fun update(note: VoiceNoteEntity)
+
+    @Query("DELETE FROM voice_notes WHERE id = :id")
+    suspend fun deleteById(id: Long)
+
+    @Query("DELETE FROM voice_notes")
+    suspend fun deleteAll()
+}
+
+@Dao
+interface ExpenseDao {
+    @Query("SELECT * FROM expenses ORDER BY dateIso DESC, createdAt DESC")
+    fun observeAll(): Flow<List<ExpenseEntity>>
+
+    @Query("SELECT * FROM expenses ORDER BY dateIso DESC, createdAt DESC")
+    suspend fun getAll(): List<ExpenseEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(item: ExpenseEntity): Long
+
+    @Query("DELETE FROM expenses WHERE id = :id")
+    suspend fun deleteById(id: Long)
+}
+
+@Dao
+interface WatchlistDao {
+    @Query("SELECT * FROM watchlist_items ORDER BY createdAt DESC")
+    fun observeAll(): Flow<List<WatchlistItemEntity>>
+
+    @Query("SELECT * FROM watchlist_items ORDER BY createdAt DESC")
+    suspend fun getAll(): List<WatchlistItemEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(item: WatchlistItemEntity): Long
+
+    @Update
+    suspend fun update(item: WatchlistItemEntity)
+
+    @Query("DELETE FROM watchlist_items WHERE id = :id")
+    suspend fun deleteById(id: Long)
+}
+
+@Dao
+interface WebhookDao {
+    @Query("SELECT * FROM webhook_actions ORDER BY createdAt DESC")
+    fun observeAll(): Flow<List<WebhookActionEntity>>
+
+    @Query("SELECT * FROM webhook_actions ORDER BY createdAt DESC")
+    suspend fun getAll(): List<WebhookActionEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(item: WebhookActionEntity): Long
+
+    @Query("DELETE FROM webhook_actions WHERE id = :id")
+    suspend fun deleteById(id: Long)
+}
+
+@Dao
+interface CanvasVersionDao {
+    @Query("SELECT * FROM canvas_versions ORDER BY versionNumber ASC, createdAt ASC")
+    fun observeAll(): Flow<List<CanvasVersionEntity>>
+
+    @Query("SELECT * FROM canvas_versions ORDER BY versionNumber ASC, createdAt ASC")
+    suspend fun getAll(): List<CanvasVersionEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(item: CanvasVersionEntity): Long
+
+    @Query("DELETE FROM canvas_versions")
+    suspend fun deleteAll()
+}
+
+@Dao
+interface ClipboardDao {
+    @Query("SELECT * FROM clipboard_items ORDER BY createdAt DESC LIMIT 30")
+    fun observeRecent(): Flow<List<ClipboardItemEntity>>
+
+    @Query("SELECT * FROM clipboard_items ORDER BY createdAt DESC LIMIT 30")
+    suspend fun getRecent(): List<ClipboardItemEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(item: ClipboardItemEntity): Long
+
+    @Query("DELETE FROM clipboard_items WHERE id = :id")
+    suspend fun deleteById(id: Long)
+
+    @Query("DELETE FROM clipboard_items")
+    suspend fun deleteAll()
+}
+
+
 

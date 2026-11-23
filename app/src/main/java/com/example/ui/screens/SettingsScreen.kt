@@ -89,11 +89,15 @@ import com.example.domain.model.ProviderType
 import com.example.domain.model.SelectableModel
 import com.example.domain.model.WebSearchProvider
 import com.example.ui.components.CustomAppsSettingsPanel
+import com.example.ui.components.DailyBudgetGuardPanel
 import com.example.ui.components.ModelPickerButton
 import com.example.ui.components.ModelPricingDialog
 import com.example.ui.components.PasswordPromptDialog
+import com.example.ui.components.PasteCurlImporterBox
 import com.example.ui.components.ProviderCatalogSheet
 import com.example.ui.components.QuickContactsSettingsPanel
+import com.example.ui.components.RoutinesSettingsPanel
+import com.example.ui.components.SmartTriggersSettingsPanel
 import com.example.ui.components.SwissBadge
 import com.example.ui.components.SwissButton
 import com.example.ui.components.SwissButtonVariant
@@ -105,6 +109,7 @@ import com.example.ui.components.SwissToggleCell
 import com.example.ui.components.SwissUtilityHeader
 import com.example.ui.components.VaultSecurityAndBackupPanel
 import com.example.ui.components.VisionFallbackSettingsPanel
+import com.example.ui.components.WebhookRegistryPanel
 import com.example.ui.components.swissGraphPaper
 import com.example.ui.components.swissRegistrationMarks
 import com.example.ui.components.swissTextFieldColors
@@ -257,22 +262,36 @@ fun SettingsScreen(
                     }
                 }
 
-                // Vault Security (PIN Lock), Currency & Encrypted .allchat Backup/Restore
+                // Vault Security (PIN Lock + Auto-Lock), Currency & Encrypted .allchat Backup/Restore
                 item {
                     VaultSecurityAndBackupPanel(
                         displayCurrency = state.displayCurrency,
                         isPinEnabled = state.isPinEnabled,
+                        autoLockMinutes = state.autoLockMinutes,
+                        lockOnAppSwitch = state.lockOnAppSwitch,
                         statusMessage = state.vaultStatusMessage,
                         errorMessage = state.vaultErrorMessage,
                         onSelectCurrency = viewModel::setDisplayCurrency,
                         onRequestSetPin = { showPinSetupDialog = true },
                         onDisablePin = viewModel::disablePin,
                         onLockNow = viewModel::lockVaultNow,
+                        onSetAutoLockMinutes = viewModel::setAutoLockMinutes,
+                        onSetLockOnAppSwitch = viewModel::setLockOnAppSwitch,
                         onRequestExportBackup = { showExportPwdDialog = true },
                         onRequestImportBackup = {
                             openBackupLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
                         },
                         onDismissNotices = viewModel::clearVaultNotices
+                    )
+                }
+
+                // Daily Budget Cap & 80% Auto-Downgrade Guard
+                item {
+                    DailyBudgetGuardPanel(
+                        config = state.dailyBudgetConfig,
+                        todaySpendUsd = state.todaySpendUsd,
+                        availableModels = state.textChatModels,
+                        onSaveConfig = viewModel::saveDailyBudgetConfig
                     )
                 }
 
@@ -309,11 +328,54 @@ fun SettingsScreen(
                     }
                 }
 
-                // Quick Contacts Manager (Zero-Permission Phone Contact Picker + Manual Entry)
+                // 1-Tap Assistant Routines & Macros Builder
+                item {
+                    RoutinesSettingsPanel(
+                        routines = state.routines,
+                        onSaveRoutine = viewModel::saveRoutine,
+                        onDeleteRoutine = viewModel::deleteRoutine,
+                        onAddStarterPreset = viewModel::addStarterRoutine
+                    )
+                }
+
+                // Smart Triggers (Time Profiles, GPS Geofence Zones, Eco Mode, Whisper dB, 7d Auto-Prune)
+                item {
+                    SmartTriggersSettingsPanel(
+                        timeProfilesEnabled = state.timeProfilesEnabled,
+                        autoEcoMode = state.autoEcoMode,
+                        autoDeleteJunkChats = state.autoDeleteJunkChats,
+                        wakePhraseEnabled = state.wakePhraseEnabled,
+                        ambientWhisperEnabled = state.ambientWhisperEnabled,
+                        smartZones = state.smartZones,
+                        onToggleTimeProfiles = viewModel::setTimeProfilesEnabled,
+                        onToggleAutoEco = viewModel::setAutoEcoMode,
+                        onToggleAutoDeleteJunk = viewModel::setAutoDeleteJunkChats,
+                        onPruneJunkNow = viewModel::pruneJunkChatsNow,
+                        onToggleWakePhrase = viewModel::setWakePhraseEnabled,
+                        onToggleAmbientWhisper = viewModel::setAmbientWhisperEnabled,
+                        onSaveSmartZone = viewModel::saveSmartZone,
+                        onDeleteSmartZone = viewModel::deleteSmartZone
+                    )
+                }
+
+                // Smart Home / Webhook / Tasker Bridge
+                item {
+                    WebhookRegistryPanel(
+                        webhooks = state.webhooks,
+                        testStatus = state.webhookTestStatus,
+                        onSaveWebhook = viewModel::saveWebhook,
+                        onDeleteWebhook = viewModel::deleteWebhook,
+                        onTestWebhook = viewModel::testWebhook
+                    )
+                }
+
+                // Quick Contacts Manager (Zero-Permission Phone Contact Picker + Email & UPI IDs)
                 item {
                     QuickContactsSettingsPanel(
                         contacts = state.quickContacts,
-                        onSaveContact = viewModel::saveQuickContact,
+                        onSaveContact = { name, phone, email, upi ->
+                            viewModel.saveQuickContact(name, phone, email, upi)
+                        },
                         onDeleteContact = viewModel::deleteQuickContact,
                         onReportError = viewModel::reportVaultError
                     )
@@ -658,6 +720,7 @@ fun SettingsScreen(
         ProviderEditorDialog(
             editor = state.editor,
             onBrowseCatalog = viewModel::openCatalog,
+            onImportCurl = viewModel::importProviderFromCurl,
             onUpdateFields = { n, t, b, p, k, modelsText ->
                 viewModel.updateEditorFields(
                     name = n,
@@ -1127,6 +1190,7 @@ private fun ProviderPanel(
 private fun ProviderEditorDialog(
     editor: ProviderEditorState,
     onBrowseCatalog: () -> Unit,
+    onImportCurl: (String) -> Boolean,
     onUpdateFields: (
         name: String?,
         type: ProviderType?,
@@ -1175,6 +1239,7 @@ private fun ProviderEditorDialog(
                             .fillMaxWidth()
                             .testTag("editor_browse_catalog_button")
                     )
+                    PasteCurlImporterBox(onImportCurl = onImportCurl)
                 }
 
                 if (editor.helperHint.isNotBlank()) {

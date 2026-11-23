@@ -16,12 +16,17 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.outlined.AccountBalanceWallet
 import androidx.compose.material.icons.outlined.Alarm
 import androidx.compose.material.icons.outlined.Call
 import androidx.compose.material.icons.outlined.Chat
+import androidx.compose.material.icons.outlined.Email
+import androidx.compose.material.icons.outlined.Event
 import androidx.compose.material.icons.outlined.Launch
+import androidx.compose.material.icons.outlined.Map
 import androidx.compose.material.icons.outlined.PersonAdd
 import androidx.compose.material.icons.outlined.PlayCircleOutline
+import androidx.compose.material.icons.outlined.Sms
 import androidx.compose.material.icons.outlined.Timer
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -67,6 +72,11 @@ fun DeviceActionConfirmCard(
         is DeviceAction.SetAlarm -> Icons.Outlined.Alarm
         is DeviceAction.SetTimer -> Icons.Outlined.Timer
         is DeviceAction.OpenApp -> Icons.Outlined.Launch
+        is DeviceAction.OpenMaps -> Icons.Outlined.Map
+        is DeviceAction.CreateCalendarEvent -> Icons.Outlined.Event
+        is DeviceAction.SendSms -> Icons.Outlined.Sms
+        is DeviceAction.SendEmail -> Icons.Outlined.Email
+        is DeviceAction.UpiPay -> Icons.Outlined.AccountBalanceWallet
     }
 
     val ctaLabel = when (action) {
@@ -76,15 +86,23 @@ fun DeviceActionConfirmCard(
         is DeviceAction.SetAlarm -> "SET ALARM"
         is DeviceAction.SetTimer -> "START TIMER"
         is DeviceAction.OpenApp -> "OPEN APP"
+        is DeviceAction.OpenMaps -> if (action.isNavigation) "NAVIGATE" else "OPEN MAPS"
+        is DeviceAction.CreateCalendarEvent -> "ADD EVENT"
+        is DeviceAction.SendSms -> "OPEN SMS"
+        is DeviceAction.SendEmail -> "COMPOSE MAIL"
+        is DeviceAction.UpiPay -> "PAY VIA UPI"
     }
 
     val needsPhoneNumber = when (action) {
         is DeviceAction.DialPhone -> action.phoneNumber.isBlank()
         is DeviceAction.SendWhatsApp -> action.phoneNumber.isBlank()
+        is DeviceAction.SendSms -> action.phoneNumber.isBlank()
         else -> false
     }
+    val needsEmail = action is DeviceAction.SendEmail && action.emailAddress.isBlank()
+    val needsUpi = action is DeviceAction.UpiPay && (action.upiId.isBlank() || !action.upiId.contains("@"))
 
-    var inlinePhoneDraft by remember(action) { mutableStateOf("") }
+    var inlineDraft by remember(action) { mutableStateOf("") }
 
     fun applyPhoneNumber(rawPhone: String, labelOverride: String? = null): DeviceAction {
         val clean = rawPhone.trim()
@@ -95,6 +113,10 @@ fun DeviceActionConfirmCard(
             )
             is DeviceAction.SendWhatsApp -> action.copy(
                 phoneNumber = DeviceActionEngine.normalizeWhatsAppDigits(clean),
+                contactLabel = labelOverride ?: action.contactLabel
+            )
+            is DeviceAction.SendSms -> action.copy(
+                phoneNumber = DeviceActionEngine.normalizePhoneNumber(clean),
                 contactLabel = labelOverride ?: action.contactLabel
             )
             else -> action
@@ -171,25 +193,35 @@ fun DeviceActionConfirmCard(
                 modifier = Modifier
                     .background(SwissSignalRed, RectangleShape)
                     .clickable {
-                        if (needsPhoneNumber && inlinePhoneDraft.isNotBlank() && onUpdateAction != null) {
-                            onUpdateAction(applyPhoneNumber(inlinePhoneDraft))
-                        } else {
-                            onExecute()
+                        when {
+                            needsPhoneNumber && inlineDraft.isNotBlank() && onUpdateAction != null -> {
+                                onUpdateAction(applyPhoneNumber(inlineDraft))
+                            }
+                            needsEmail && inlineDraft.isNotBlank() && onUpdateAction != null && action is DeviceAction.SendEmail -> {
+                                onUpdateAction(action.copy(emailAddress = inlineDraft.trim()))
+                            }
+                            needsUpi && inlineDraft.isNotBlank() && onUpdateAction != null && action is DeviceAction.UpiPay -> {
+                                onUpdateAction(action.copy(upiId = inlineDraft.trim()))
+                            }
+                            else -> onExecute()
                         }
                     }
                     .padding(horizontal = 12.dp, vertical = 9.dp)
                     .testTag("execute_device_action")
             ) {
                 Text(
-                    text = if (needsPhoneNumber && inlinePhoneDraft.isNotBlank()) "APPLY NUMBER" else ctaLabel,
+                    text = when {
+                        (needsPhoneNumber || needsEmail || needsUpi) && inlineDraft.isNotBlank() -> "APPLY"
+                        else -> ctaLabel
+                    },
                     style = MaterialTheme.typography.labelMedium,
                     color = SwissWhite
                 )
             }
         }
 
-        // Inline Quick Contact / Number Picker when a contact name wasn't found in Quick Contacts
-        if (needsPhoneNumber && onUpdateAction != null) {
+        // Inline Quick Contact / Number / Email / UPI ID Picker when recipient info is missing
+        if ((needsPhoneNumber || needsEmail || needsUpi) && onUpdateAction != null) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -206,32 +238,56 @@ fun DeviceActionConfirmCard(
                 val targetName = when (action) {
                     is DeviceAction.DialPhone -> action.contactLabel
                     is DeviceAction.SendWhatsApp -> action.contactLabel
+                    is DeviceAction.SendSms -> action.contactLabel
+                    is DeviceAction.SendEmail -> action.contactLabel
+                    is DeviceAction.UpiPay -> action.payeeName
                     else -> null
                 }
+                val promptLabel = when {
+                    needsUpi -> "UPI ID NEEDED${targetName?.let { " FOR \"$it\"" }.orEmpty()} // PICK SAVED OR ENTER VPA"
+                    needsEmail -> "EMAIL NEEDED${targetName?.let { " FOR \"$it\"" }.orEmpty()} // PICK SAVED OR ENTER BELOW"
+                    else -> "NUMBER NEEDED${targetName?.let { " FOR \"$it\"" }.orEmpty()} // PICK SAVED OR ENTER BELOW"
+                }
                 Text(
-                    text = if (!targetName.isNullOrBlank()) {
-                        "NUMBER NEEDED FOR \"$targetName\" // PICK OR ENTER BELOW"
-                    } else {
-                        "QUICK CONTACT // PICK SAVED OR ENTER PHONE NUMBER"
-                    },
+                    text = promptLabel,
                     style = MaterialTheme.typography.labelSmall,
                     color = SwissSignalRed
                 )
 
-                if (quickContacts.isNotEmpty()) {
+                val matchingContacts = remember(quickContacts, needsPhoneNumber, needsEmail, needsUpi) {
+                    when {
+                        needsUpi -> quickContacts.filter { it.upiId.isNotBlank() }
+                        needsEmail -> quickContacts.filter { it.email.isNotBlank() }
+                        else -> quickContacts.filter { it.phoneNumber.isNotBlank() }
+                    }
+                }
+
+                if (matchingContacts.isNotEmpty()) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        quickContacts.forEach { contact ->
+                        matchingContacts.forEach { contact ->
+                            val chipValue = when {
+                                needsUpi -> contact.upiId
+                                needsEmail -> contact.email
+                                else -> contact.phoneNumber
+                            }
                             Row(
                                 modifier = Modifier
                                     .background(SwissPaper, RectangleShape)
                                     .border(1.dp, SwissInk, RectangleShape)
                                     .clickable {
-                                        onUpdateAction(applyPhoneNumber(contact.phoneNumber, contact.name))
+                                        when {
+                                            needsUpi && action is DeviceAction.UpiPay ->
+                                                onUpdateAction(action.copy(upiId = contact.upiId, payeeName = contact.name))
+                                            needsEmail && action is DeviceAction.SendEmail ->
+                                                onUpdateAction(action.copy(emailAddress = contact.email, contactLabel = contact.name))
+                                            else ->
+                                                onUpdateAction(applyPhoneNumber(contact.phoneNumber, contact.name))
+                                        }
                                     }
                                     .padding(horizontal = 8.dp, vertical = 5.dp),
                                 horizontalArrangement = Arrangement.spacedBy(4.dp),
@@ -243,7 +299,7 @@ fun DeviceActionConfirmCard(
                                     color = SwissInk
                                 )
                                 Text(
-                                    text = contact.phoneNumber,
+                                    text = chipValue,
                                     style = MaterialTheme.typography.labelSmall,
                                     color = SwissMuted
                                 )
@@ -258,31 +314,41 @@ fun DeviceActionConfirmCard(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     OutlinedTextField(
-                        value = inlinePhoneDraft,
-                        onValueChange = { inlinePhoneDraft = it },
+                        value = inlineDraft,
+                        onValueChange = { inlineDraft = it },
                         placeholder = {
                             Text(
-                                "+91 9876543210",
+                                when {
+                                    needsUpi -> "name@okaxis / 9876543210@ybl"
+                                    needsEmail -> "recipient@example.com"
+                                    else -> "+91 9876543210"
+                                },
                                 style = MaterialTheme.typography.bodySmall
                             )
                         },
                         singleLine = true,
                         shape = RectangleShape,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = when {
+                                needsPhoneNumber -> KeyboardType.Phone
+                                needsEmail -> KeyboardType.Email
+                                else -> KeyboardType.Text
+                            }
+                        ),
                         colors = swissTextFieldColors(containerColor = SwissCanvas),
                         modifier = Modifier
                             .weight(1f)
                             .testTag("device_action_inline_phone")
                     )
-                    if (!targetName.isNullOrBlank() && onSaveQuickContact != null) {
+                    if (needsPhoneNumber && !targetName.isNullOrBlank() && onSaveQuickContact != null) {
                         Box(
                             modifier = Modifier
                                 .background(
-                                    if (inlinePhoneDraft.isNotBlank()) SwissInk else SwissMuted.copy(alpha = 0.4f),
+                                    if (inlineDraft.isNotBlank()) SwissInk else SwissMuted.copy(alpha = 0.4f),
                                     RectangleShape
                                 )
-                                .clickable(enabled = inlinePhoneDraft.isNotBlank()) {
-                                    val normalized = DeviceActionEngine.normalizePhoneNumber(inlinePhoneDraft)
+                                .clickable(enabled = inlineDraft.isNotBlank()) {
+                                    val normalized = DeviceActionEngine.normalizePhoneNumber(inlineDraft)
                                     onSaveQuickContact(targetName, normalized)
                                     onUpdateAction(applyPhoneNumber(normalized, targetName))
                                 }
@@ -310,11 +376,18 @@ fun DeviceActionConfirmCard(
                         Box(
                             modifier = Modifier
                                 .background(
-                                    if (inlinePhoneDraft.isNotBlank()) SwissInk else SwissMuted.copy(alpha = 0.4f),
+                                    if (inlineDraft.isNotBlank()) SwissInk else SwissMuted.copy(alpha = 0.4f),
                                     RectangleShape
                                 )
-                                .clickable(enabled = inlinePhoneDraft.isNotBlank()) {
-                                    onUpdateAction(applyPhoneNumber(inlinePhoneDraft))
+                                .clickable(enabled = inlineDraft.isNotBlank()) {
+                                    when {
+                                        needsUpi && action is DeviceAction.UpiPay ->
+                                            onUpdateAction(action.copy(upiId = inlineDraft.trim()))
+                                        needsEmail && action is DeviceAction.SendEmail ->
+                                            onUpdateAction(action.copy(emailAddress = inlineDraft.trim()))
+                                        else ->
+                                            onUpdateAction(applyPhoneNumber(inlineDraft))
+                                    }
                                 }
                                 .padding(horizontal = 10.dp, vertical = 14.dp)
                         ) {

@@ -24,6 +24,8 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -50,6 +52,8 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.outlined.Alarm
+import androidx.compose.material.icons.outlined.AutoFixHigh
+import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material.icons.outlined.Build
 import androidx.compose.material.icons.outlined.Call
 import androidx.compose.material.icons.outlined.CameraAlt
@@ -57,9 +61,13 @@ import androidx.compose.material.icons.outlined.Chat
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Language
+import androidx.compose.material.icons.outlined.NoteAdd
 import androidx.compose.material.icons.outlined.PlayCircleOutline
+import androidx.compose.material.icons.outlined.QrCode2
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.StickyNote2
 import androidx.compose.material.icons.outlined.Translate
+import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material.icons.outlined.VolumeOff
 import androidx.compose.material.icons.outlined.VolumeUp
 import androidx.compose.material3.Icon
@@ -97,9 +105,12 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.local.ConversationEntity
 import com.example.data.local.MessageEntity
 import com.example.data.repository.AllChatRepository
+import com.example.domain.model.AssistantRoutine
 import com.example.domain.model.ChatOptions
 import com.example.domain.model.ConversationTree
+import com.example.domain.model.DailyBudgetConfig
 import com.example.domain.model.ModelCapability
+import com.example.domain.model.NegativeConstraint
 import com.example.domain.model.QuickContact
 import com.example.domain.model.SelectableModel
 import com.example.ui.theme.SwissCanvas
@@ -111,10 +122,14 @@ import com.example.ui.theme.SwissSignalRed
 import com.example.ui.theme.SwissSubtleFill
 import com.example.ui.theme.SwissVerifiedInk
 import com.example.ui.theme.SwissWhite
+import com.example.domain.model.AmbientNoiseLevel
+import com.example.domain.model.SmartContextSnapshot
 import com.example.util.DeviceAction
 import com.example.util.DeviceActionEngine
 import com.example.util.ReadAloudController
+import com.example.util.SmartContextEngine
 import com.example.util.VoiceInputController
+import com.example.util.WakePhraseListener
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
@@ -127,7 +142,7 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.sin
 
-@OptIn(ExperimentalCoroutinesApi::class)
+@OptIn(ExperimentalCoroutinesApi::class, ExperimentalLayoutApi::class)
 @Composable
 fun AssistantOverlaySheet(
     repository: AllChatRepository,
@@ -135,6 +150,7 @@ fun AssistantOverlaySheet(
     onOpenTranslateCamera: () -> Unit,
     onOpenLiveLensExplain: (() -> Unit)? = null,
     onOpenFullApp: (() -> Unit)? = null,
+    onOpenToolkitHub: (() -> Unit)? = null,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
@@ -149,6 +165,18 @@ fun AssistantOverlaySheet(
     val persistedModelDbId by repository.activeModelDbIdFlow.collectAsStateWithLifecycle(initialValue = null)
     val quickContacts by repository.quickContactsFlow.collectAsStateWithLifecycle(initialValue = emptyList())
     val customApps by repository.customAppsFlow.collectAsStateWithLifecycle(initialValue = emptyList())
+    val routines by repository.routinesFlow.collectAsStateWithLifecycle(initialValue = emptyList())
+    val voiceNotes by repository.voiceNotesFlow.collectAsStateWithLifecycle(initialValue = emptyList())
+    val smartZones by repository.smartZonesFlow.collectAsStateWithLifecycle(initialValue = emptyList())
+    val timeProfilesEnabled by repository.timeProfilesEnabledFlow.collectAsStateWithLifecycle(initialValue = true)
+    val autoEcoMode by repository.autoEcoModeFlow.collectAsStateWithLifecycle(initialValue = true)
+    val ambientWhisperEnabled by repository.ambientWhisperEnabledFlow.collectAsStateWithLifecycle(initialValue = false)
+    val wakePhraseEnabled by repository.wakePhraseEnabledFlow.collectAsStateWithLifecycle(initialValue = false)
+    val dailyBudgetConfig by repository.dailyBudgetConfigFlow.collectAsStateWithLifecycle(initialValue = DailyBudgetConfig())
+    val todaySpendUsd by remember(repository) {
+        repository.observeTodaySpendUsd()
+    }.collectAsStateWithLifecycle(initialValue = 0.0)
+    var smartSnapshot by remember { mutableStateOf(SmartContextSnapshot()) }
 
     val activeConvIdFlow = remember(repository) {
         combine(
@@ -176,9 +204,22 @@ fun AssistantOverlaySheet(
         }
     }
 
+    var ghostMode by remember { mutableStateOf(false) }
+    var ghostMessages by remember { mutableStateOf<List<MessageEntity>>(emptyList()) }
+    var activeConstraints by remember { mutableStateOf<Set<NegativeConstraint>>(emptySet()) }
+    var isEnhancingPrompt by remember { mutableStateOf(false) }
+    var followUpChips by remember { mutableStateOf<List<String>>(emptyList()) }
+    var qrBeamPayload by remember { mutableStateOf<String?>(null) }
+    var forceFlagshipOverride by remember { mutableStateOf(false) }
+
+    val displayedMessages = if (ghostMode) ghostMessages else visibleMessages
+    val isBudgetWarning = dailyBudgetConfig.dailyCapUsd > 0.0 && (todaySpendUsd / dailyBudgetConfig.dailyCapUsd) >= 0.80
+
     var selectedModel by remember { mutableStateOf<SelectableModel?>(null) }
     var showModelPicker by remember { mutableStateOf(false) }
     var showHistoryDrawer by remember { mutableStateOf(false) }
+    var showVoiceNotesSheet by remember { mutableStateOf(false) }
+    var isSavingNote by remember { mutableStateOf(false) }
     var historySearch by remember { mutableStateOf("") }
 
     var isListening by remember { mutableStateOf(false) }
@@ -199,7 +240,7 @@ fun AssistantOverlaySheet(
 
     val isScrolledUp by remember {
         derivedStateOf {
-            visibleMessages.isNotEmpty() && listState.canScrollForward
+            displayedMessages.isNotEmpty() && listState.canScrollForward
         }
     }
 
@@ -238,10 +279,10 @@ fun AssistantOverlaySheet(
     }
 
     // Smart auto-scroll on new messages and live streaming deltas
-    val lastMessage = visibleMessages.lastOrNull()
-    LaunchedEffect(visibleMessages.size, lastMessage?.id, lastMessage?.content?.length) {
-        if (visibleMessages.isEmpty()) return@LaunchedEffect
-        val lastIdx = visibleMessages.lastIndex
+    val lastMessage = displayedMessages.lastOrNull()
+    LaunchedEffect(displayedMessages.size, lastMessage?.id, lastMessage?.content?.length) {
+        if (displayedMessages.isEmpty()) return@LaunchedEffect
+        val lastIdx = displayedMessages.lastIndex
         if (autoScrollEnabled) {
             if (isStreaming) {
                 listState.scrollToItem(lastIdx)
@@ -256,6 +297,26 @@ fun AssistantOverlaySheet(
             context = context,
             onSpeakingIdChanged = {}
         )
+    }
+
+    // Refresh Smart Context (Time Profile, Geofence Zone, Eco Mode, optional Ambient dB Whisper)
+    LaunchedEffect(smartZones, timeProfilesEnabled, autoEcoMode, ambientWhisperEnabled) {
+        val ambientDb = if (ambientWhisperEnabled) {
+            runCatching { SmartContextEngine.sampleAmbientDecibels(context) }.getOrNull()
+        } else null
+        val snap = SmartContextEngine.captureSnapshot(
+            context = context,
+            savedZones = smartZones,
+            timeProfilesEnabled = timeProfilesEnabled,
+            autoEcoEnabled = autoEcoMode,
+            ambientDb = ambientDb
+        )
+        smartSnapshot = snap
+        when (snap.noiseLevel) {
+            AmbientNoiseLevel.QUIET_WHISPER -> ttsController.setVolumeGain(0.35f)
+            AmbientNoiseLevel.NOISY_BOOST -> ttsController.setVolumeGain(1.0f)
+            AmbientNoiseLevel.NORMAL -> ttsController.setVolumeGain(0.85f)
+        }
     }
 
     fun cancelInFlightRequest() {
@@ -280,6 +341,81 @@ fun AssistantOverlaySheet(
         }
     }
 
+    fun saveQuickNote(rawMemo: String) {
+        val memo = rawMemo.trim()
+        if (memo.isEmpty()) {
+            showVoiceNotesSheet = true
+            return
+        }
+        scope.launch {
+            isSavingNote = true
+            statusBanner = "NOTE // Cleaning & structuring memo…"
+            runCatching {
+                val freshModel = runCatching { repository.resolveFreshModel(selectedModel?.model?.id) }.getOrNull()
+                repository.saveVoiceQuickNote(memo, freshModel)
+            }.onSuccess { saved ->
+                statusBanner = "OK // Saved note \"${saved.title}\" to Voice Notes Inbox."
+                if (!muteTts) ttsController.speak(System.currentTimeMillis(), "Saved note: ${saved.title}")
+                val convId = activeConvId ?: repository.getOrCreateActiveConversationId(
+                    defaultTitle = "Note: ${saved.title}".take(40)
+                )
+                repository.appendInstantExchange(
+                    conversationId = convId,
+                    userText = "/note $memo",
+                    assistantText = "**Saved Voice Note: ${saved.title}**\n\n${saved.markdownContent}",
+                    modelLabel = "VOICE NOTE"
+                )
+            }.onFailure { err ->
+                errorBanner = err.message ?: "Failed to save note."
+            }
+            isSavingNote = false
+        }
+    }
+
+    fun runRoutine(routine: AssistantRoutine) {
+        cancelInFlightRequest()
+        pendingAction = null
+        errorBanner = null
+        lastFailedPrompt = null
+        autoScrollEnabled = true
+        activeJob = scope.launch {
+            isStreaming = true
+            try {
+                val freshModel = runCatching { repository.resolveFreshModel(selectedModel?.model?.id) }.getOrNull()
+                if (freshModel != null) selectedModel = freshModel
+                val result = repository.executeRoutine(
+                    routine = routine,
+                    preferredModel = freshModel,
+                    onProgress = { status -> statusBanner = status }
+                )
+                val convId = activeConvId ?: repository.getOrCreateActiveConversationId(
+                    defaultTitle = routine.name.take(40),
+                    modelDbId = freshModel?.model?.id
+                )
+                repository.appendInstantExchange(
+                    conversationId = convId,
+                    userText = "⚡ Routine: ${routine.name}",
+                    assistantText = result.summaryText,
+                    modelLabel = result.modelLabel
+                )
+                if (result.pendingDeviceAction != null) {
+                    pendingAction = result.pendingDeviceAction
+                }
+                val speakable = result.spokenText
+                if (!muteTts && !speakable.isNullOrBlank()) {
+                    ttsController.speak(System.currentTimeMillis(), speakable)
+                }
+                statusBanner = "OK // Routine \"${routine.name}\" complete."
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (err: Throwable) {
+                errorBanner = err.message ?: "Routine failed."
+            } finally {
+                isStreaming = false
+            }
+        }
+    }
+
     fun handlePromptSubmission(rawPrompt: String) {
         val clean = rawPrompt.trim()
         if (clean.isEmpty()) return
@@ -289,69 +425,193 @@ fun AssistantOverlaySheet(
         lastFailedPrompt = null
         autoScrollEnabled = true
 
-        // 1. Check Instant Device Action Parser first (Calls, WhatsApp, YouTube, Alarms, Timers, App Launch)
+        followUpChips = emptyList()
+        val lowerClean = clean.lowercase()
+        if (lowerClean == "/ghost" || lowerClean == "/incognito") {
+            ghostMode = !ghostMode
+            if (!ghostMode) ghostMessages = emptyList()
+            statusBanner = if (ghostMode) "GHOST MODE // ON — Nothing saved to DB or history." else "GHOST MODE // OFF — Returned to saved chat."
+            return
+        }
+
+        // 0a. Voice Quick-Notes commands (/note <memo>, /notes, /inbox)
+        if (lowerClean == "/notes" || lowerClean == "/inbox" || lowerClean == "/note") {
+            showVoiceNotesSheet = true
+            return
+        }
+        if (lowerClean.startsWith("/note ")) {
+            saveQuickNote(clean.removePrefix("/note").removePrefix("/NOTE").trim())
+            return
+        }
+
+        // 0b. Custom Assistant Routine trigger phrase match
+        val matchedRoutine = routines.firstOrNull { r ->
+            val trig = r.triggerPhrase.trim().lowercase()
+            trig.isNotEmpty() && (lowerClean == trig || lowerClean == "/routine $trig" || lowerClean == "run $trig")
+        }
+        if (matchedRoutine != null) {
+            runRoutine(matchedRoutine)
+            return
+        }
+
+        // 1. Check Instant Device Action Parser first (Calls, WhatsApp, SMS, Email, UPI, Maps, Calendar, YouTube, Alarms, Timers, App Launch)
         val parsedAction = DeviceActionEngine.parseFromPrompt(clean, quickContacts, customApps)
         if (parsedAction != null) {
             pendingAction = parsedAction
             val spoken = "Ready to ${parsedAction.title}. Tap the confirmation button to execute."
             if (!muteTts) ttsController.speak(System.currentTimeMillis(), spoken)
-            scope.launch {
-                val convId = activeConvId ?: repository.getOrCreateActiveConversationId(
-                    defaultTitle = clean.take(40)
+            if (ghostMode) {
+                val now = System.currentTimeMillis()
+                ghostMessages = ghostMessages + listOf(
+                    MessageEntity(id = -now, conversationId = -1L, role = "USER", content = clean, createdAt = now),
+                    MessageEntity(id = -(now + 1), conversationId = -1L, role = "ASSISTANT", content = spoken, modelLabel = parsedAction.badge, createdAt = now + 1)
                 )
-                repository.appendInstantExchange(
-                    conversationId = convId,
-                    userText = clean,
-                    assistantText = spoken,
-                    modelLabel = parsedAction.badge
-                )
+            } else {
+                scope.launch {
+                    val convId = activeConvId ?: repository.getOrCreateActiveConversationId(
+                        defaultTitle = clean.take(40)
+                    )
+                    repository.appendInstantExchange(
+                        conversationId = convId,
+                        userText = clean,
+                        assistantText = spoken,
+                        modelLabel = parsedAction.badge
+                    )
+                }
             }
             return
         }
 
-        // 2. Append user turn & stream assistant reply into the persisted Room conversation
+        // 2. Check Smart Home / Webhook trigger phrases, then fall through to streaming LLM
         //    reading fresh provider baseUrl / proxyUrl / API key / modelId at exact send time.
         cancelInFlightRequest()
         pendingAction = null
         activeJob = scope.launch {
             isStreaming = true
             try {
+                val matchedWebhook = runCatching { repository.matchWebhookByPhrase(clean) }.getOrNull()
+                if (matchedWebhook != null) {
+                    statusBanner = "WEBHOOK // Firing ${matchedWebhook.name}…"
+                    val res = repository.executeWebhook(matchedWebhook)
+                    val replyText = res.fold(
+                        onSuccess = { "OK // Triggered **${matchedWebhook.name}** (${matchedWebhook.method}): $it" },
+                        onFailure = { "ERR // Webhook **${matchedWebhook.name}** failed: ${it.message}" }
+                    )
+                    if (!ghostMode) {
+                        val convId = activeConvId ?: repository.getOrCreateActiveConversationId(
+                            defaultTitle = "Webhook: ${matchedWebhook.name}".take(40)
+                        )
+                        repository.appendInstantExchange(
+                            conversationId = convId,
+                            userText = clean,
+                            assistantText = replyText,
+                            modelLabel = "WEBHOOK"
+                        )
+                    } else {
+                        val now = System.currentTimeMillis()
+                        ghostMessages = ghostMessages + listOf(
+                            MessageEntity(id = -now, conversationId = -1L, role = "USER", content = clean, createdAt = now),
+                            MessageEntity(id = -(now + 1), conversationId = -1L, role = "ASSISTANT", content = replyText, modelLabel = "WEBHOOK", createdAt = now + 1)
+                        )
+                    }
+                    statusBanner = if (res.isSuccess) "OK // Webhook fired." else "ERR // Webhook failed."
+                    if (!muteTts && res.isSuccess) ttsController.speak(System.currentTimeMillis(), "Triggered ${matchedWebhook.name}.")
+                    return@launch
+                }
                 val freshModel = repository.resolveFreshModel(selectedModel?.model?.id)
                     ?: throw IllegalStateException("No AI model configured. Open Settings to add a provider & API key.")
                 selectedModel = freshModel
-                val convId = activeConvId ?: repository.getOrCreateActiveConversationId(
-                    defaultTitle = clean.take(40),
-                    modelDbId = freshModel.model.id
+
+                val (effectiveModel, budgetNotice) = repository.resolveBudgetDowngradeModel(
+                    requestedModel = freshModel,
+                    availableModels = availableModels,
+                    forceFlagshipOverride = forceFlagshipOverride
                 )
-                val leafId = visibleMessages.lastOrNull()?.id
-                var hadRequestError = false
-                repository.sendChatMessage(
-                    conversationId = convId,
-                    promptText = clean,
-                    attachmentLocalUri = null,
-                    selectableModel = freshModel,
-                    parentMessageId = leafId,
-                    options = ChatOptions(
-                        systemPrompt = "You are AllChat Assistant in Quick Overlay mode. Answer clearly, concisely, and naturally while remembering all prior turns in this conversation. When the user asks to call someone, send a WhatsApp message, play/open YouTube, set an alarm/timer, or open an app, call the execute_device_action tool.",
-                        enableTools = toolsEnabled
-                    ),
-                    enableWebSearch = webSearchEnabled,
-                    onGroundingStatus = { status -> statusBanner = status },
-                    onSentenceReady = { sentence ->
-                        if (!muteTts) ttsController.enqueueSentence(sentence)
-                    },
-                    onDeviceActionTriggered = { triggered ->
-                        pendingAction = triggered
-                    },
-                    onRequestError = { msg ->
-                        hadRequestError = true
-                        errorBanner = msg
-                        lastFailedPrompt = clean
+                if (budgetNotice != null) statusBanner = budgetNotice
+
+                val constraintBlock = activeConstraints.joinToString("\n") { "- ${it.instruction}" }
+                val effectiveSystemPrompt = buildString {
+                    append("You are AllChat Assistant in Quick Overlay mode. Answer clearly, concisely, and naturally while remembering all prior turns in this conversation. When the user asks to call someone, send a WhatsApp message, send an SMS or email, pay via UPI, navigate or search Maps, create a calendar event, play/open YouTube, set an alarm/timer, or open an app, call the execute_device_action tool.")
+                    if (constraintBlock.isNotBlank()) {
+                        append("\n\nStrict User Output Rules:\n")
+                        append(constraintBlock)
                     }
-                )
-                if (!hadRequestError) {
+                }
+
+                if (ghostMode) {
+                    val now = System.currentTimeMillis()
+                    val userId = -now
+                    val aiId = -(now + 1)
+                    val priorHistory = ghostMessages.map { (if (it.role == "USER") "user" else "assistant") to it.content }
+                    ghostMessages = ghostMessages + listOf(
+                        MessageEntity(id = userId, conversationId = -1L, role = "USER", content = clean, createdAt = now),
+                        MessageEntity(id = aiId, conversationId = -1L, role = "ASSISTANT", content = "", modelLabel = "${effectiveModel.model.displayName} (GHOST)", createdAt = now + 1)
+                    )
+                    val finalReply = repository.streamGhostChatTurn(
+                        history = priorHistory,
+                        userText = clean,
+                        model = effectiveModel,
+                        options = ChatOptions(systemPrompt = effectiveSystemPrompt, enableTools = false),
+                        onDelta = { partial ->
+                            ghostMessages = ghostMessages.map { if (it.id == aiId) it.copy(content = partial) else it }
+                        }
+                    )
+                    if (finalReply.isNotBlank()) {
+                        ghostMessages = ghostMessages.map { if (it.id == aiId) it.copy(content = finalReply) else it }
+                        if (!muteTts) ttsController.speak(aiId, finalReply)
+                        scope.launch {
+                            val chips = repository.generateFollowUpChips(clean, finalReply, effectiveModel)
+                            if (chips.isNotEmpty()) followUpChips = chips
+                        }
+                    }
                     errorBanner = null
                     lastFailedPrompt = null
+                } else {
+                    val convId = activeConvId ?: repository.getOrCreateActiveConversationId(
+                        defaultTitle = clean.take(40),
+                        modelDbId = effectiveModel.model.id
+                    )
+                    val leafId = visibleMessages.lastOrNull()?.id
+                    var hadRequestError = false
+                    var streamedAssistantBuf = StringBuilder()
+                    repository.sendChatMessage(
+                        conversationId = convId,
+                        promptText = clean,
+                        attachmentLocalUri = null,
+                        selectableModel = effectiveModel,
+                        parentMessageId = leafId,
+                        options = ChatOptions(
+                            systemPrompt = effectiveSystemPrompt,
+                            enableTools = toolsEnabled
+                        ),
+                        enableWebSearch = webSearchEnabled,
+                        onGroundingStatus = { status -> statusBanner = status },
+                        onSentenceReady = { sentence ->
+                            streamedAssistantBuf.append(sentence).append(" ")
+                            if (!muteTts) ttsController.enqueueSentence(sentence)
+                        },
+                        onDeviceActionTriggered = { triggered ->
+                            pendingAction = triggered
+                        },
+                        onRequestError = { msg ->
+                            hadRequestError = true
+                            errorBanner = msg
+                            lastFailedPrompt = clean
+                        }
+                    )
+                    if (!hadRequestError) {
+                        errorBanner = null
+                        lastFailedPrompt = null
+                        val replyForChips = streamedAssistantBuf.toString().trim().ifBlank {
+                            visibleMessages.lastOrNull { it.role == "ASSISTANT" }?.content.orEmpty()
+                        }
+                        if (replyForChips.length >= 40) {
+                            scope.launch {
+                                val chips = repository.generateFollowUpChips(clean, replyForChips, effectiveModel)
+                                if (chips.isNotEmpty()) followUpChips = chips
+                            }
+                        }
+                    }
                 }
             } catch (ce: CancellationException) {
                 throw ce
@@ -415,6 +675,30 @@ fun AssistantOverlaySheet(
     LaunchedEffect(autoStartMic) {
         if (autoStartMic) {
             startMic()
+        }
+    }
+
+    // Foreground "Hey AllChat" Wake-Phrase Listener when enabled in Settings and idle
+    DisposableEffect(wakePhraseEnabled, isListening, isStreaming, showHistoryDrawer, showModelPicker) {
+        val micGranted = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+        val shouldArm = wakePhraseEnabled && micGranted && !isListening && !isStreaming && !showHistoryDrawer && !showModelPicker
+        val listener = if (shouldArm) {
+            WakePhraseListener(
+                context = context,
+                onWakeDetected = { trailing ->
+                    if (trailing.isNotBlank()) {
+                        handlePromptSubmission(trailing)
+                    } else {
+                        startMic()
+                    }
+                }
+            ).also { it.start() }
+        } else null
+        onDispose {
+            listener?.stop()
         }
     }
 
@@ -507,6 +791,32 @@ fun AssistantOverlaySheet(
                             horizontalArrangement = Arrangement.spacedBy(7.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
+                            // Incognito Ghost Mode Toggle in Assistant Header
+                            Box(
+                                modifier = Modifier
+                                    .border(
+                                        1.dp,
+                                        if (ghostMode) SwissSignalRed else SwissWhite.copy(alpha = 0.65f),
+                                        RectangleShape
+                                    )
+                                    .background(if (ghostMode) SwissSignalRed else Color.Transparent)
+                                    .clickable {
+                                        ghostMode = !ghostMode
+                                        if (!ghostMode) ghostMessages = emptyList()
+                                        followUpChips = emptyList()
+                                        statusBanner = if (ghostMode) "GHOST // Zero DB writes." else "GHOST // Off."
+                                    }
+                                    .padding(horizontal = 6.dp, vertical = 4.dp)
+                                    .testTag("assistant_overlay_ghost_toggle")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Outlined.VisibilityOff,
+                                    contentDescription = if (ghostMode) "Disable Ghost Mode" else "Enable Incognito Ghost Mode",
+                                    tint = SwissWhite,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+
                             // History Clock Icon Button (opens scrollable thread drawer inside Assistant)
                             Box(
                                 modifier = Modifier
@@ -779,11 +1089,138 @@ fun AssistantOverlaySheet(
                             testTag = "assist_chip_youtube"
                         )
                         AssistantQuickChip(
+                            icon = Icons.Outlined.NoteAdd,
+                            label = if (isSavingNote) "SAVING…" else "SAVE NOTE",
+                            accent = isSavingNote,
+                            onClick = {
+                                val candidate = transcriptInput.trim().ifBlank {
+                                    visibleMessages.lastOrNull()?.content?.trim().orEmpty()
+                                }
+                                if (candidate.isNotBlank()) {
+                                    transcriptInput = ""
+                                    saveQuickNote(candidate)
+                                } else {
+                                    showVoiceNotesSheet = true
+                                }
+                            },
+                            testTag = "assist_chip_save_note"
+                        )
+                        AssistantQuickChip(
+                            icon = Icons.Outlined.StickyNote2,
+                            label = "NOTES (${voiceNotes.size})",
+                            onClick = { showVoiceNotesSheet = true },
+                            testTag = "assist_chip_notes_inbox"
+                        )
+                        AssistantQuickChip(
                             icon = Icons.Outlined.Alarm,
                             label = "TIMER 5M",
                             onClick = { handlePromptSubmission("Set a timer for 5 minutes") },
                             testTag = "assist_chip_timer"
                         )
+                        if (onOpenToolkitHub != null) {
+                            AssistantQuickChip(
+                                icon = Icons.Outlined.Bolt,
+                                label = "TOOLKIT",
+                                accent = true,
+                                onClick = {
+                                    voiceController.stop()
+                                    ttsController.stop()
+                                    onOpenToolkitHub()
+                                },
+                                testTag = "assist_chip_toolkit_hub"
+                            )
+                        }
+                    }
+
+                    // Smart Context & Geofence Quick-Chips Strip
+                    val zoneChips = smartSnapshot.matchedZone?.quickChips.orEmpty()
+                    if (timeProfilesEnabled || smartSnapshot.isEcoModeActive || smartSnapshot.ambientDb != null || wakePhraseEnabled || zoneChips.isNotEmpty()) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(SwissCanvas)
+                                .padding(horizontal = 10.dp, vertical = 4.dp)
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            if (wakePhraseEnabled) {
+                                Text(
+                                    text = "HEY ALLCHAT",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SwissSignalRed
+                                )
+                            }
+                            if (timeProfilesEnabled) {
+                                Text(
+                                    text = "CTX // ${smartSnapshot.timeProfile.label.uppercase()}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SwissInk
+                                )
+                            }
+                            if (smartSnapshot.isEcoModeActive) {
+                                Text(
+                                    text = "ECO ${smartSnapshot.batteryPercent}%",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SwissSignalRed
+                                )
+                            }
+                            smartSnapshot.ambientDb?.let { db ->
+                                val modeTag = when (smartSnapshot.noiseLevel) {
+                                    AmbientNoiseLevel.QUIET_WHISPER -> "WHISPER"
+                                    AmbientNoiseLevel.NOISY_BOOST -> "BOOST"
+                                    AmbientNoiseLevel.NORMAL -> "NORM"
+                                }
+                                Text(
+                                    text = "${db}dB $modeTag",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SwissMuted
+                                )
+                            }
+                            smartSnapshot.matchedZone?.let { zone ->
+                                Text(
+                                    text = "@${zone.name.uppercase()}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SwissVerifiedInk
+                                )
+                            }
+                            zoneChips.forEach { chip ->
+                                AssistantQuickChip(
+                                    icon = Icons.Outlined.Bolt,
+                                    label = chip.take(24).uppercase(),
+                                    onClick = { handlePromptSubmission(chip) },
+                                    testTag = "assist_zone_chip"
+                                )
+                            }
+                        }
+                    }
+
+                    // 1-Tap Assistant Routines Strip (when user has configured Routines in Settings)
+                    if (routines.isNotEmpty()) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(SwissSubtleFill)
+                                .padding(horizontal = 10.dp, vertical = 5.dp)
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "ROUTINES //",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissSignalRed
+                            )
+                            routines.forEach { routine ->
+                                AssistantQuickChip(
+                                    icon = Icons.Outlined.Bolt,
+                                    label = routine.name.uppercase(),
+                                    accent = false,
+                                    onClick = { runRoutine(routine) },
+                                    testTag = "assist_routine_chip_${routine.id}"
+                                )
+                            }
+                        }
                     }
 
                     Box(
@@ -793,6 +1230,57 @@ fun AssistantOverlaySheet(
                             .background(SwissInk)
                     )
 
+                    if (ghostMode) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(SwissInk)
+                                .padding(horizontal = 10.dp, vertical = 5.dp)
+                                .testTag("assistant_ghost_banner"),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "GHOST MODE // INCOGNITO · NOT WRITTEN TO DB OR SEARCH",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissWhite,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text(
+                                text = "[ CLEAR ]",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissSignalRed,
+                                modifier = Modifier.clickable { ghostMessages = emptyList() }
+                            )
+                        }
+                    }
+
+                    if (isBudgetWarning) {
+                        val pct = ((todaySpendUsd / dailyBudgetConfig.dailyCapUsd) * 100.0).toInt()
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(Color(0xFFFEF3C7))
+                                .padding(horizontal = 10.dp, vertical = 4.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "BUDGET $pct% // ${if (forceFlagshipOverride) "FLAGSHIP OVERRIDE" else "AUTO-FLASH ACTIVE"}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Color(0xFF92400E)
+                            )
+                            Text(
+                                text = if (forceFlagshipOverride) "[ AUTO-FLASH ]" else "[ OVERRIDE ]",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissSignalRed,
+                                modifier = Modifier.clickable { forceFlagshipOverride = !forceFlagshipOverride }
+                            )
+                        }
+                    }
+
                     // 2. SCROLLABLE MULTI-TURN CONVERSATION AREA (flex: 1)
                     Box(
                         modifier = Modifier
@@ -800,7 +1288,7 @@ fun AssistantOverlaySheet(
                             .fillMaxWidth()
                             .background(SwissCanvas)
                     ) {
-                        if (visibleMessages.isEmpty()) {
+                        if (displayedMessages.isEmpty()) {
                             Box(
                                 modifier = Modifier
                                     .fillMaxSize()
@@ -816,12 +1304,16 @@ fun AssistantOverlaySheet(
                                     verticalArrangement = Arrangement.spacedBy(4.dp)
                                 ) {
                                     Text(
-                                        text = "READY // PERSISTENT MULTI-TURN ASSISTANT",
+                                        text = if (ghostMode) "GHOST MODE // EPHEMERAL RAM SESSION" else "READY // PERSISTENT MULTI-TURN ASSISTANT",
                                         style = MaterialTheme.typography.labelSmall,
                                         color = SwissSignalRed
                                     )
                                     Text(
-                                        text = "Speak or type below. Try \"Call Mom\", \"WhatsApp Rahul saying I'll be late\", \"Play lofi beats on YouTube\", or ask any follow-up question.",
+                                        text = if (ghostMode) {
+                                            "Everything spoken or typed here stays strictly in memory and disappears when you exit Ghost Mode or close the sheet."
+                                        } else {
+                                            "Speak or type below. Try \"Call Mom\", \"WhatsApp Rahul saying I'll be late\", \"Play lofi beats on YouTube\", or ask any follow-up question."
+                                        },
                                         style = MaterialTheme.typography.bodySmall,
                                         color = SwissMuted
                                     )
@@ -837,15 +1329,54 @@ fun AssistantOverlaySheet(
                                     .testTag("assistant_overlay_message_list")
                             ) {
                                 itemsIndexed(
-                                    items = visibleMessages,
+                                    items = displayedMessages,
                                     key = { _, msg -> msg.id }
                                 ) { idx, msg ->
-                                    val isLastStreaming = isStreaming && idx == visibleMessages.lastIndex && msg.role == "ASSISTANT"
+                                    val isLastStreaming = isStreaming && idx == displayedMessages.lastIndex && msg.role == "ASSISTANT"
                                     OverlayMessageCard(
                                         turnNumber = idx + 1,
                                         message = msg,
-                                        isStreamingThis = isLastStreaming
+                                        isStreamingThis = isLastStreaming,
+                                        onBeamQr = { qrBeamPayload = msg.content }
                                     )
+                                }
+
+                                // 3 Ultra-Short Contextual Follow-Up Chips in Assistant Overlay
+                                if (!isStreaming && followUpChips.isNotEmpty()) {
+                                    item(key = "assistant_followup_chips") {
+                                        Column(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(top = 2.dp),
+                                            verticalArrangement = Arrangement.spacedBy(5.dp)
+                                        ) {
+                                            Text(
+                                                text = "NEXT // 1-TAP FOLLOW-UPS",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = SwissMuted
+                                            )
+                                            FlowRow(
+                                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                                            ) {
+                                                followUpChips.forEachIndexed { idx, chip ->
+                                                    Row(
+                                                        modifier = Modifier
+                                                            .background(SwissPaper, RectangleShape)
+                                                            .border(1.dp, SwissInk, RectangleShape)
+                                                            .clickable { handlePromptSubmission(chip) }
+                                                            .padding(horizontal = 9.dp, vertical = 6.dp)
+                                                            .testTag("assistant_followup_chip_$idx"),
+                                                        horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                                        verticalAlignment = Alignment.CenterVertically
+                                                    ) {
+                                                        Text("0${idx + 1}", style = MaterialTheme.typography.labelSmall, color = SwissSignalRed)
+                                                        Text(chip, style = MaterialTheme.typography.labelSmall, color = SwissInk)
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -866,8 +1397,8 @@ fun AssistantOverlaySheet(
                                     .clickable {
                                         autoScrollEnabled = true
                                         scope.launch {
-                                            if (visibleMessages.isNotEmpty()) {
-                                                listState.animateScrollToItem(visibleMessages.lastIndex)
+                                            if (displayedMessages.isNotEmpty()) {
+                                                listState.animateScrollToItem(displayedMessages.lastIndex)
                                             }
                                         }
                                     }
@@ -1008,7 +1539,15 @@ fun AssistantOverlaySheet(
                                 }
                             }
 
-                            // Mic + Text Field + Send/Stop Bar
+                            // Negative-Constraint Quick Pill Bar
+                            NegativeConstraintPillBar(
+                                activeConstraints = activeConstraints,
+                                onToggleConstraint = { rule ->
+                                    activeConstraints = if (rule in activeConstraints) activeConstraints - rule else activeConstraints + rule
+                                }
+                            )
+
+                            // Mic + Text Field + Enhance Prompt Wand + Send/Stop Bar
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 verticalAlignment = Alignment.CenterVertically,
@@ -1030,7 +1569,15 @@ fun AssistantOverlaySheet(
                                     onValueChange = { transcriptInput = it },
                                     placeholder = {
                                         Text(
-                                            if (isListening) "LISTENING // SPEAK COMMAND OR QUESTION…" else "Ask follow-up, call, WhatsApp, YouTube…",
+                                            if (isEnhancingPrompt) {
+                                                "PROMPT DOCTOR // REWRITING…"
+                                            } else if (isListening) {
+                                                "LISTENING // SPEAK COMMAND OR QUESTION…"
+                                            } else if (ghostMode) {
+                                                "GHOST PROMPT // NOT SAVED…"
+                                            } else {
+                                                "Ask follow-up, call, WhatsApp, YouTube…"
+                                            },
                                             style = MaterialTheme.typography.bodySmall
                                         )
                                     },
@@ -1048,6 +1595,36 @@ fun AssistantOverlaySheet(
                                     modifier = Modifier
                                         .weight(1f)
                                         .testTag("assistant_text_input")
+                                )
+
+                                // 1-Tap Prompt Doctor Magic Wand
+                                SwissIconCell(
+                                    icon = Icons.Outlined.AutoFixHigh,
+                                    contentDescription = "Enhance prompt with Prompt Doctor",
+                                    onClick = {
+                                        val rough = transcriptInput.trim()
+                                        if (rough.isNotEmpty() && !isEnhancingPrompt) {
+                                            scope.launch {
+                                                isEnhancingPrompt = true
+                                                statusBanner = "PROMPT DOCTOR // Optimizing…"
+                                                runCatching {
+                                                    repository.enhanceUserPrompt(rough, selectedModel)
+                                                }.onSuccess { enhanced ->
+                                                    if (enhanced.isNotBlank()) {
+                                                        transcriptInput = enhanced
+                                                        statusBanner = "OK // Prompt enhanced. Review & send."
+                                                    }
+                                                }.onFailure { err ->
+                                                    errorBanner = err.message ?: "Prompt Doctor failed."
+                                                }
+                                                isEnhancingPrompt = false
+                                            }
+                                        }
+                                    },
+                                    enabled = transcriptInput.isNotBlank() && !isEnhancingPrompt && !isStreaming,
+                                    accent = isEnhancingPrompt,
+                                    cellSize = 48.dp,
+                                    modifier = Modifier.testTag("assistant_enhance_wand_button")
                                 )
 
                                 if (isStreaming) {
@@ -1130,6 +1707,29 @@ fun AssistantOverlaySheet(
                 }
             }
         }
+    }
+
+    if (showVoiceNotesSheet) {
+        VoiceNotesInboxSheet(
+            notes = voiceNotes,
+            isSavingNote = isSavingNote,
+            onSaveNewMemo = { memo -> saveQuickNote(memo) },
+            onUpdateNote = { updated ->
+                scope.launch { repository.updateVoiceNote(updated) }
+            },
+            onDeleteNote = { id ->
+                scope.launch { repository.deleteVoiceNote(id) }
+            },
+            onDismiss = { showVoiceNotesSheet = false }
+        )
+    }
+
+    qrBeamPayload?.let { payload ->
+        QrStudioDialog(
+            initialPayload = payload,
+            onDismiss = { qrBeamPayload = null },
+            onNotify = { statusBanner = it }
+        )
     }
 }
 
@@ -1310,7 +1910,8 @@ private fun AssistantHistoryDrawerPanel(
 private fun OverlayMessageCard(
     turnNumber: Int,
     message: MessageEntity,
-    isStreamingThis: Boolean
+    isStreamingThis: Boolean,
+    onBeamQr: () -> Unit = {}
 ) {
     val isUser = message.role == "USER"
     val borderColor = if (isUser) SwissInk else SwissInk.copy(alpha = 0.7f)
@@ -1350,6 +1951,16 @@ private fun OverlayMessageCard(
                     text = "STREAMING…",
                     style = MaterialTheme.typography.labelSmall,
                     color = SwissSignalRed
+                )
+            } else if (message.content.isNotBlank()) {
+                Icon(
+                    imageVector = Icons.Outlined.QrCode2,
+                    contentDescription = "Beam via QR",
+                    tint = if (isUser) SwissConcrete else SwissMuted,
+                    modifier = Modifier
+                        .size(16.dp)
+                        .clickable(onClick = onBeamQr)
+                        .testTag("assistant_beam_qr_${message.id}")
                 )
             }
         }

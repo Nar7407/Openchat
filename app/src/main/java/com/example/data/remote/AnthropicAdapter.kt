@@ -175,8 +175,19 @@ class AnthropicAdapter(private val client: OkHttpClient) {
                 add("Respond with strictly valid JSON only. Do not wrap in markdown or add prose outside the JSON object.")
             }
         }.joinToString("\n\n")
+        val usePromptCaching = combinedSys.length > 1000
         if (combinedSys.isNotEmpty()) {
-            bodyObj.put("system", combinedSys)
+            if (usePromptCaching) {
+                val sysBlocks = JSONArray().put(
+                    JSONObject()
+                        .put("type", "text")
+                        .put("text", combinedSys)
+                        .put("cache_control", JSONObject().put("type", "ephemeral"))
+                )
+                bodyObj.put("system", sysBlocks)
+            } else {
+                bodyObj.put("system", combinedSys)
+            }
         }
         options.temperature?.let { bodyObj.put("temperature", it.coerceIn(0f, 1f).toDouble()) }
         options.topP?.let { bodyObj.put("top_p", it.coerceIn(0.01f, 1f).toDouble()) }
@@ -186,12 +197,15 @@ class AnthropicAdapter(private val client: OkHttpClient) {
         val body = bodyObj.toString()
         val prettyRequest = runCatching { bodyObj.toString(2) }.getOrDefault(body)
 
-        val req = Request.Builder()
+        val reqBuilder = Request.Builder()
             .url(url)
             .addHeader("x-api-key", apiKey)
             .addHeader("anthropic-version", anthropicVersion)
             .post(body.toRequestBody(jsonMediaType))
-            .build()
+        if (usePromptCaching) {
+            reqBuilder.addHeader("anthropic-beta", "prompt-caching-2024-07-31")
+        }
+        val req = reqBuilder.build()
 
         return kotlinx.coroutines.flow.flow {
             emit(StreamEvent.DebugRequest(url, prettyRequest))

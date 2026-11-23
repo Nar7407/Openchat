@@ -38,9 +38,17 @@ import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.Close
+import android.graphics.Bitmap
+import android.webkit.WebView
+import androidx.compose.material.icons.outlined.Brush
+import androidx.compose.material.icons.outlined.Calculate
 import androidx.compose.material.icons.outlined.CenterFocusStrong
+import androidx.compose.material.icons.outlined.Code
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Layers
+import androidx.compose.material.icons.outlined.NoteAdd
+import androidx.compose.material.icons.outlined.Palette
+import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Translate
 import androidx.compose.material.icons.outlined.VolumeOff
@@ -98,6 +106,7 @@ fun LiveLensScreen(
     repository: AllChatRepository,
     preferredModel: SelectableModel?,
     initialTranslatorMode: Boolean = false,
+    initialMode: LiveLensMode? = null,
     onNavigateBack: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
@@ -122,7 +131,9 @@ fun LiveLensScreen(
         )
     }
     var lensMode by remember {
-        mutableStateOf(if (initialTranslatorMode) LiveLensMode.LIVE_TRANSLATOR else LiveLensMode.AUTO_EXPLAIN)
+        mutableStateOf(
+            initialMode ?: if (initialTranslatorMode) LiveLensMode.LIVE_TRANSLATOR else LiveLensMode.AUTO_EXPLAIN
+        )
     }
     var targetLanguage by remember { mutableStateOf("English") }
     val languages = remember {
@@ -134,6 +145,11 @@ fun LiveLensScreen(
 
     var useFrontCamera by remember { mutableStateOf(false) }
     var autoCaptureOnSteady by remember { mutableStateOf(false) }
+    var palmGestureFreezeEnabled by remember { mutableStateOf(false) }
+    var lastClearFrame by remember { mutableStateOf<Bitmap?>(null) }
+    var annotatingFrame by remember { mutableStateOf<Bitmap?>(null) }
+    var paletteFrame by remember { mutableStateOf<Bitmap?>(null) }
+    var htmlPreviewSource by remember { mutableStateOf<String?>(null) }
     var muteTts by remember { mutableStateOf(false) }
     var isAnalyzing by remember { mutableStateOf(false) }
     var resultModelLabel by remember { mutableStateOf<String?>(null) }
@@ -189,13 +205,14 @@ fun LiveLensScreen(
         }
     }
 
-    fun captureAndAnalyze() {
+    fun captureAndAnalyze(overrideFrame: Bitmap? = null) {
         if (isAnalyzing) return
-        val frame = runCatching { previewView.bitmap }.getOrNull()
+        val frame = overrideFrame ?: runCatching { previewView.bitmap }.getOrNull()
         if (frame == null) {
             errorText = "Camera frame not ready yet. Point at a subject and tap Scan."
             return
         }
+        lastClearFrame = frame
         isAnalyzing = true
         errorText = null
         ttsController.stop()
@@ -263,6 +280,32 @@ fun LiveLensScreen(
             delay(intervalSec * 1000L)
             if (!isAnalyzing) {
                 captureAndAnalyze()
+            }
+        }
+    }
+
+    // Touchless Palm-Hold Gesture Freeze: covering lens briefly (< 32 avg luma for ~900ms) freezes & scans last clear frame
+    LaunchedEffect(palmGestureFreezeEnabled, hasCameraPermission, lensMode, targetLanguage) {
+        if (!palmGestureFreezeEnabled || !hasCameraPermission) return@LaunchedEffect
+        var darkFrames = 0
+        while (true) {
+            delay(450L)
+            if (isAnalyzing) {
+                darkFrames = 0
+                continue
+            }
+            val bmp = runCatching { previewView.bitmap }.getOrNull() ?: continue
+            val avgLuma = estimateFrameLuma(bmp)
+            if (avgLuma < 34) {
+                darkFrames++
+                if (darkFrames >= 2 && lastClearFrame != null) {
+                    darkFrames = 0
+                    failoverNotice = "PALM HOLD // Touchless capture triggered!"
+                    captureAndAnalyze(lastClearFrame)
+                }
+            } else {
+                darkFrames = 0
+                lastClearFrame = bmp
             }
         }
     }
@@ -463,7 +506,12 @@ fun LiveLensScreen(
                         overflow = TextOverflow.Ellipsis
                     )
                     Text(
-                        text = if (lensMode == LiveLensMode.AUTO_EXPLAIN) "Auto-Explainer" else "Live Translator → $targetLanguage",
+                        text = when (lensMode) {
+                            LiveLensMode.AUTO_EXPLAIN -> "Auto-Explainer"
+                            LiveLensMode.LIVE_TRANSLATOR -> "Live Translator → $targetLanguage"
+                            LiveLensMode.SOLVE_STEP_BY_STEP -> "Solve Step-by-Step (LaTeX)"
+                            LiveLensMode.WHITEBOARD_TO_CODE -> "Whiteboard / UI → Code & Diagram"
+                        },
                         style = MaterialTheme.typography.titleSmall,
                         color = SwissWhite,
                         maxLines = 1,
@@ -533,16 +581,23 @@ fun LiveLensScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(
-                            imageVector = if (mode == LiveLensMode.AUTO_EXPLAIN) Icons.Outlined.CenterFocusStrong else Icons.Outlined.Translate,
+                            imageVector = when (mode) {
+                                LiveLensMode.AUTO_EXPLAIN -> Icons.Outlined.CenterFocusStrong
+                                LiveLensMode.LIVE_TRANSLATOR -> Icons.Outlined.Translate
+                                LiveLensMode.SOLVE_STEP_BY_STEP -> Icons.Outlined.Calculate
+                                LiveLensMode.WHITEBOARD_TO_CODE -> Icons.Outlined.Code
+                            },
                             contentDescription = null,
                             tint = SwissWhite,
-                            modifier = Modifier.size(15.dp)
+                            modifier = Modifier.size(14.dp)
                         )
-                        Spacer(Modifier.size(6.dp))
+                        Spacer(Modifier.size(4.dp))
                         Text(
                             text = mode.label,
                             style = MaterialTheme.typography.labelSmall,
-                            color = SwissWhite
+                            color = SwissWhite,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
                 }
@@ -578,6 +633,17 @@ fun LiveLensScreen(
                             .testTag("lens_interval_$sec")
                     )
                 }
+                Text(
+                    text = if (palmGestureFreezeEnabled) "PALM: ON" else "PALM FREEZE",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = SwissWhite,
+                    modifier = Modifier
+                        .background(if (palmGestureFreezeEnabled) SwissSignalRed else Color.Transparent, RectangleShape)
+                        .border(1.dp, SwissWhite.copy(alpha = 0.5f), RectangleShape)
+                        .clickable { palmGestureFreezeEnabled = !palmGestureFreezeEnabled }
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                        .testTag("lens_palm_freeze_toggle")
+                )
             }
 
             // Target Language Pills in Live Translator Mode
@@ -745,6 +811,23 @@ fun LiveLensScreen(
                                         }
                                 )
                                 Icon(
+                                    imageVector = Icons.Outlined.NoteAdd,
+                                    contentDescription = "Save result to Voice Notes",
+                                    tint = SwissWhite,
+                                    modifier = Modifier
+                                        .size(18.dp)
+                                        .clickable {
+                                            scope.launch {
+                                                runCatching {
+                                                    repository.saveVoiceQuickNote("Live Lens (${lensMode.label}):\n$answer", preferredModel)
+                                                }.onSuccess { note ->
+                                                    failoverNotice = "Saved note: ${note.title}"
+                                                }
+                                            }
+                                        }
+                                        .testTag("live_lens_save_note")
+                                )
+                                Icon(
                                     imageVector = Icons.Outlined.ContentCopy,
                                     contentDescription = "Copy result",
                                     tint = SwissWhite,
@@ -768,15 +851,30 @@ fun LiveLensScreen(
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .heightIn(max = 220.dp)
+                                .heightIn(max = 260.dp)
                                 .verticalScroll(rememberScrollState())
                                 .padding(12.dp)
                         ) {
-                            Text(
-                                text = answer,
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = SwissInk
-                            )
+                            if (lensMode == LiveLensMode.SOLVE_STEP_BY_STEP || lensMode == LiveLensMode.WHITEBOARD_TO_CODE) {
+                                LatexMathMarkdownView(content = answer)
+                                val htmlSnippet = extractHtmlBlock(answer)
+                                if (htmlSnippet != null) {
+                                    Spacer(Modifier.height(8.dp))
+                                    SwissButton(
+                                        text = "LIVE HTML PREVIEW",
+                                        leadingIcon = Icons.Outlined.PlayArrow,
+                                        variant = SwissButtonVariant.PRIMARY,
+                                        onClick = { htmlPreviewSource = htmlSnippet },
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                }
+                            } else {
+                                Text(
+                                    text = answer,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = SwissInk
+                                )
+                            }
                         }
                     }
                 }
@@ -814,12 +912,35 @@ fun LiveLensScreen(
                     )
                 }
 
-                // Primary Scan / Translate Button
+                SwissIconCell(
+                    icon = Icons.Outlined.Brush,
+                    contentDescription = "Circle-to-Ask markup",
+                    onClick = {
+                        runCatching { previewView.bitmap }.getOrNull()?.let { annotatingFrame = it }
+                    },
+                    inverted = true,
+                    cellSize = 48.dp,
+                    modifier = Modifier.testTag("live_lens_circle_ask_btn")
+                )
+                SwissIconCell(
+                    icon = Icons.Outlined.Palette,
+                    contentDescription = "Steal color palette",
+                    onClick = {
+                        runCatching { previewView.bitmap }.getOrNull()?.let { paletteFrame = it }
+                    },
+                    inverted = true,
+                    cellSize = 48.dp,
+                    modifier = Modifier.testTag("live_lens_palette_btn")
+                )
+
+                // Primary Scan / Translate / Solve / Code Button
                 SwissButton(
                     text = when {
-                        isAnalyzing -> "Scanning View…"
-                        lensMode == LiveLensMode.LIVE_TRANSLATOR -> "Translate View ($targetLanguage)"
-                        else -> "Explain View Now"
+                        isAnalyzing -> "Scanning…"
+                        lensMode == LiveLensMode.LIVE_TRANSLATOR -> "Translate ($targetLanguage)"
+                        lensMode == LiveLensMode.SOLVE_STEP_BY_STEP -> "Solve Step-by-Step"
+                        lensMode == LiveLensMode.WHITEBOARD_TO_CODE -> "Digitize to Code"
+                        else -> "Explain View"
                     },
                     variant = SwissButtonVariant.PRIMARY,
                     enabled = hasCameraPermission && !isAnalyzing,
@@ -1015,4 +1136,127 @@ fun LiveLensScreen(
             }
         )
     }
+
+    // Circle-to-Ask & Censor Brush Markup Annotator
+    annotatingFrame?.let { frameBmp ->
+        ImageAnnotatorDialog(
+            sourceBitmap = frameBmp,
+            onDismiss = { annotatingFrame = null },
+            onApplyAnnotatedBitmap = { annotated ->
+                annotatingFrame = null
+                captureAndAnalyze(annotated)
+            },
+            onExtractPalette = { bmp ->
+                annotatingFrame = null
+                paletteFrame = bmp
+            }
+        )
+    }
+
+    // Steal Color Palette & WCAG Swatches Dialog
+    paletteFrame?.let { frameBmp ->
+        ColorPaletteDialog(
+            initialBitmap = frameBmp,
+            onDismiss = { paletteFrame = null },
+            onNotify = { msg -> failoverNotice = msg }
+        )
+    }
+
+    // Live HTML Preview Sandbox for Whiteboard-to-Code
+    htmlPreviewSource?.let { html ->
+        AlertDialog(
+            onDismissRequest = { htmlPreviewSource = null },
+            containerColor = SwissCanvas,
+            shape = RectangleShape,
+            title = {
+                Column {
+                    Text(
+                        text = "WHITEBOARD // LIVE HTML SANDBOX",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = SwissSignalRed
+                    )
+                    Text(
+                        text = "Interactive Preview",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = SwissInk
+                    )
+                }
+            },
+            text = {
+                AndroidView(
+                    factory = { ctx ->
+                        WebView(ctx).apply {
+                            layoutParams = ViewGroup.LayoutParams(
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                920
+                            )
+                            settings.javaScriptEnabled = true
+                            settings.domStorageEnabled = false
+                            settings.allowFileAccess = false
+                            settings.allowContentAccess = false
+                            loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
+                        }
+                    },
+                    update = { webView ->
+                        webView.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(380.dp)
+                        .border(1.dp, SwissInk, RectangleShape)
+                )
+            },
+            confirmButton = {
+                SwissButton(
+                    text = "Close Preview",
+                    variant = SwissButtonVariant.PRIMARY,
+                    minHeight = 40.dp,
+                    onClick = { htmlPreviewSource = null }
+                )
+            }
+        )
+    }
 }
+
+private fun estimateFrameLuma(bitmap: Bitmap): Int {
+    val w = bitmap.width.coerceAtLeast(1)
+    val h = bitmap.height.coerceAtLeast(1)
+    val stepX = (w / 12).coerceAtLeast(1)
+    val stepY = (h / 12).coerceAtLeast(1)
+    var sum = 0L
+    var count = 0L
+    var y = 0
+    while (y < h) {
+        var x = 0
+        while (x < w) {
+            val pixel = bitmap.getPixel(x, y)
+            val r = (pixel shr 16) and 0xFF
+            val g = (pixel shr 8) and 0xFF
+            val b = pixel and 0xFF
+            sum += (0.299 * r + 0.587 * g + 0.114 * b).toLong()
+            count++
+            x += stepX
+        }
+        y += stepY
+    }
+    return if (count > 0L) (sum / count).toInt() else 128
+}
+
+private fun extractHtmlBlock(markdown: String): String? {
+    val fenced = Regex("```(?:html|htm)\\s*\\n([\\s\\S]*?)```", RegexOption.IGNORE_CASE)
+        .find(markdown)?.groupValues?.getOrNull(1)?.trim()
+    if (!fenced.isNullOrBlank()) return fenced
+
+    val docIdx = markdown.indexOf("<!DOCTYPE html", ignoreCase = true)
+    if (docIdx >= 0) {
+        val endIdx = markdown.indexOf("</html>", startIndex = docIdx, ignoreCase = true)
+        return if (endIdx > docIdx) markdown.substring(docIdx, endIdx + 7).trim() else markdown.substring(docIdx).trim()
+    }
+    val htmlIdx = markdown.indexOf("<html", ignoreCase = true)
+    if (htmlIdx >= 0) {
+        val endIdx = markdown.indexOf("</html>", startIndex = htmlIdx, ignoreCase = true)
+        return if (endIdx > htmlIdx) markdown.substring(htmlIdx, endIdx + 7).trim() else markdown.substring(htmlIdx).trim()
+    }
+    return null
+}
+

@@ -231,6 +231,7 @@ sealed interface IncomingSharePayload {
     data class Text(val text: String) : IncomingSharePayload
     data class ImageUri(val uriString: String) : IncomingSharePayload
     data class DocumentUri(val uriString: String) : IncomingSharePayload
+    data class DeepLinkAsk(val query: String) : IncomingSharePayload
 }
 
 enum class IncomingAppAction {
@@ -241,12 +242,19 @@ enum class IncomingAppAction {
     CAMERA_VISION,
     ASSISTANT_OVERLAY,
     LIVE_LENS_EXPLAIN,
-    LIVE_LENS_TRANSLATE
+    LIVE_LENS_TRANSLATE,
+    LIVE_LENS_SOLVE,
+    LIVE_LENS_CODE,
+    COMMUTE_HUD,
+    INTERPRETER,
+    TOOLKIT
 }
 
 enum class LiveLensMode(val label: String) {
     AUTO_EXPLAIN("AUTO-EXPLAIN"),
-    LIVE_TRANSLATOR("LIVE TRANSLATOR")
+    LIVE_TRANSLATOR("TRANSLATE"),
+    SOLVE_STEP_BY_STEP("SOLVE MATH"),
+    WHITEBOARD_TO_CODE("CODE / DIAGRAM")
 }
 
 data class UserMemoryInfo(
@@ -350,7 +358,9 @@ data class ClipboardPromptHint(
 data class QuickContact(
     val id: String = "",
     val name: String,
-    val phoneNumber: String
+    val phoneNumber: String,
+    val email: String = "",
+    val upiId: String = ""
 )
 
 data class CustomAppEntry(
@@ -364,6 +374,265 @@ data class LiveLensAnalysisResult(
     val answer: String,
     val failoverNotice: String? = null
 )
+
+enum class RoutineStepType(val label: String) {
+    AI_PROMPT("AI Prompt"),
+    AI_WEB_SEARCH("AI + Web Search"),
+    READ_ALOUD_TTS("Read Aloud (TTS)"),
+    DEVICE_ACTION("Device Action"),
+    SAVE_NOTE("Save to Notes")
+}
+
+data class RoutineStep(
+    val id: String = "",
+    val type: RoutineStepType,
+    val payload: String = ""
+)
+
+data class AssistantRoutine(
+    val id: Long = 0L,
+    val name: String,
+    val triggerPhrase: String,
+    val steps: List<RoutineStep> = emptyList(),
+    val createdAt: Long = System.currentTimeMillis()
+)
+
+data class VoiceNoteInfo(
+    val id: Long = 0L,
+    val title: String,
+    val rawTranscript: String,
+    val markdownContent: String,
+    val tags: List<String> = emptyList(),
+    val createdAt: Long = System.currentTimeMillis(),
+    val updatedAt: Long = createdAt
+)
+
+data class SmartZone(
+    val id: String = "",
+    val name: String,
+    val latitude: Double,
+    val longitude: Double,
+    val radiusMeters: Float = 250f,
+    val quickChips: List<String> = emptyList()
+)
+
+enum class TimeProfileMode(val label: String, val systemInstruction: String) {
+    STUDY_WORK(
+        "STUDY / WORK",
+        "Structured Study/Work Profile active: give clear step-by-step reasoning, crisp formulas, and actionable takeaways."
+    ),
+    NIGHT(
+        "NIGHT MODE",
+        "Night Profile active: keep replies concise, calm, and easy to scan."
+    ),
+    DAY(
+        "DAY MODE",
+        ""
+    )
+}
+
+enum class AmbientNoiseLevel(val label: String) {
+    QUIET_WHISPER("QUIET // WHISPER"),
+    NORMAL("NORMAL"),
+    NOISY_BOOST("NOISY // TTS BOOST")
+}
+
+data class SmartContextSnapshot(
+    val timeProfile: TimeProfileMode = TimeProfileMode.DAY,
+    val matchedZone: SmartZone? = null,
+    val batteryPercent: Int = 100,
+    val isCharging: Boolean = false,
+    val isSlowNetwork: Boolean = false,
+    val isEcoModeActive: Boolean = false,
+    val ambientDb: Int? = null,
+    val noiseLevel: AmbientNoiseLevel = AmbientNoiseLevel.NORMAL
+)
+
+data class ExpenseRecord(
+    val id: Long = 0L,
+    val merchant: String,
+    val dateIso: String,
+    val category: String,
+    val amount: Double,
+    val currency: String = "INR",
+    val notes: String = "",
+    val createdAt: Long = System.currentTimeMillis()
+)
+
+data class WatchlistItemInfo(
+    val id: Long = 0L,
+    val title: String,
+    val queryOrUrl: String,
+    val lastSummary: String = "",
+    val lastDiffMarkdown: String = "",
+    val lastCheckedAt: Long = 0L,
+    val createdAt: Long = System.currentTimeMillis()
+)
+
+data class WebhookActionInfo(
+    val id: Long = 0L,
+    val name: String,
+    val triggerPhrase: String,
+    val method: String = "POST",
+    val url: String,
+    val headersJson: String = "",
+    val bodyTemplate: String = "",
+    val createdAt: Long = System.currentTimeMillis()
+)
+
+data class CanvasVersionInfo(
+    val id: Long = 0L,
+    val docTitle: String,
+    val content: String,
+    val versionNumber: Int,
+    val createdAt: Long = System.currentTimeMillis()
+)
+
+data class ClipboardSnippetInfo(
+    val id: Long = 0L,
+    val content: String,
+    val preview: String,
+    val isUrl: Boolean = false,
+    val createdAt: Long = System.currentTimeMillis()
+)
+
+data class DecisionCriterion(
+    val name: String,
+    val weight: Float = 5f,
+    val scoreA: Float = 7f,
+    val scoreB: Float = 7f,
+    val noteA: String = "",
+    val noteB: String = ""
+)
+
+data class DecisionMatrixData(
+    val title: String,
+    val optionA: String,
+    val optionB: String,
+    val criteria: List<DecisionCriterion>
+)
+
+data class FactCheckClaim(
+    val statement: String,
+    val status: String, // "VERIFIED", "UNCERTAIN", "CONFLICT"
+    val note: String,
+    val sourceUrl: String? = null
+)
+
+data class WorkspaceFileEntry(
+    val uriString: String,
+    val name: String,
+    val relativePath: String,
+    val mimeType: String,
+    val sizeBytes: Long
+)
+
+data class SpotlightResult(
+    val kind: String, // "MESSAGE", "NOTE", "DOC", "EXPENSE", "CANVAS"
+    val title: String,
+    val snippet: String,
+    val timestamp: Long,
+    val conversationId: Long? = null,
+    val messageId: Long? = null,
+    val hasCode: Boolean = false,
+    val hasImage: Boolean = false
+)
+
+data class TopicCluster(
+    val topic: String,
+    val conversationIds: List<Long>,
+    val sampleTitles: List<String>
+)
+
+enum class NegativeConstraint(
+    val chipLabel: String,
+    val instruction: String
+) {
+    NO_YAPPING(
+        "NO YAPPING",
+        "Zero filler, greetings, apologies, or fluff. Answer directly with maximum signal."
+    ),
+    CODE_ONLY(
+        "CODE ONLY",
+        "Output ONLY clean, ready-to-run code blocks with minimal inline comments and no prose outside code."
+    ),
+    STEP_BY_STEP(
+        "STEP-BY-STEP",
+        "Structure your response as numbered, concise step-by-step instructions."
+    ),
+    ELI5(
+        "ELI5",
+        "Explain like I'm 5 using simple everyday words and one clear real-world analogy."
+    ),
+    TABLE_FORMAT(
+        "TABLE FORMAT",
+        "Present the core answer as a crisp Markdown comparison table with clear headers."
+    )
+}
+
+data class DailyBudgetConfig(
+    val dailyCapUsd: Double = 0.0, // 0.0 = unlimited / disabled
+    val autoDowngradeEnabled: Boolean = true,
+    val downgradeModelDbId: Long? = null
+)
+
+data class VoiceFormTemplate(
+    val id: String,
+    val name: String,
+    val category: String,
+    val fields: List<String>
+)
+
+data class FilledFormResult(
+    val templateName: String,
+    val values: Map<String, String>,
+    val markdownTable: String
+)
+
+data class CliFlagToken(
+    val flag: String,
+    val explanation: String,
+    val defaultValue: String = "",
+    val isEditableArg: Boolean = false,
+    val argLabel: String = ""
+)
+
+data class CliCommandSpec(
+    val title: String,
+    val shell: String, // "FFmpeg", "ADB", "Git", "Bash", "PowerShell"
+    val baseCommand: String,
+    val summary: String,
+    val tokens: List<CliFlagToken>
+) {
+    fun assemble(overrides: Map<Int, String>): String = buildString {
+        append(baseCommand.trim())
+        tokens.forEachIndexed { idx, tok ->
+            val rawVal = overrides[idx] ?: tok.defaultValue
+            val cleanFlag = tok.flag.trim()
+            val cleanVal = rawVal.trim()
+            if (cleanFlag.isNotEmpty()) {
+                append(' ')
+                append(cleanFlag)
+            }
+            if (cleanVal.isNotEmpty()) {
+                append(' ')
+                val needsQuotes = cleanVal.contains(' ') && !(cleanVal.startsWith("\"") && cleanVal.endsWith("\""))
+                append(if (needsQuotes) "\"$cleanVal\"" else cleanVal)
+            }
+        }
+    }.trim()
+}
+
+data class ThreadCheckpoint(
+    val id: String,
+    val conversationId: Long,
+    val afterMessageId: Long,
+    val messageCountCovered: Int,
+    val summaryMarkdown: String,
+    val createdAt: Long = System.currentTimeMillis()
+)
+
+
 
 
 

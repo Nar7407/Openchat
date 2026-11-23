@@ -16,8 +16,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -26,6 +28,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
@@ -35,12 +40,22 @@ import androidx.navigation.toRoute
 import com.example.data.repository.AllChatRepository
 import com.example.domain.model.IncomingAppAction
 import com.example.domain.model.IncomingSharePayload
+import com.example.domain.model.LiveLensMode
 import com.example.ui.components.AssistantOverlaySheet
+import com.example.ui.components.CommuteHudDialog
+import com.example.ui.components.FaceToFaceInterpreterDialog
 import com.example.ui.components.FloatingSidebarDock
 import com.example.ui.components.LiveLensScreen
 import com.example.ui.components.PinLockOverlay
+import com.example.ui.components.PowerToolAction
+import com.example.ui.components.PowerToolkitHubDialog
+import com.example.ui.components.ScreenScanSheet
 import com.example.ui.components.SwissButton
 import com.example.ui.components.SwissButtonVariant
+import com.example.ui.components.VoiceNotesInboxSheet
+import com.example.util.DeviceAction
+import com.example.util.DeviceActionEngine
+import com.example.util.ReadAloudController
 import com.example.ui.screens.ArenaScreen
 import com.example.ui.screens.ChatScreen
 import com.example.ui.screens.CodeDebuggerScreen
@@ -82,7 +97,7 @@ import kotlinx.serialization.Serializable
 @Serializable data object RewriteRoute
 @Serializable data object DebuggerRoute
 @Serializable data object YouTubeRoute
-@Serializable data class LiveLensRoute(val startInTranslator: Boolean = false)
+@Serializable data class LiveLensRoute(val startInTranslator: Boolean = false, val initialModeName: String = "")
 @Serializable data object SettingsRoute
 
 @Composable
@@ -94,10 +109,20 @@ fun AllChatApp(
     onAppActionConsumed: () -> Unit = {}
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val isLocked by repository.isLockedFlow.collectAsStateWithLifecycle()
+    val isPinEnabled by repository.isPinEnabledFlow.collectAsStateWithLifecycle(initialValue = false)
+    val autoLockMinutes by repository.autoLockMinutesFlow.collectAsStateWithLifecycle(initialValue = 5)
+    val lockOnAppSwitch by repository.lockOnAppSwitchFlow.collectAsStateWithLifecycle(initialValue = false)
+    var backgroundedAtMs by remember { mutableLongStateOf(0L) }
     val themeId by repository.themePresetIdFlow.collectAsStateWithLifecycle(initialValue = SwissThemePreset.SWISS_SIGNAL.id)
     var pendingDocShareUri by remember { mutableStateOf<String?>(null) }
     var showAssistantOverlay by remember { mutableStateOf(false) }
+    var showScreenScanSheet by remember { mutableStateOf(false) }
+    var showVoiceNotesSheet by remember { mutableStateOf(false) }
+    var showToolkitHub by remember { mutableStateOf(false) }
+    var showCommuteHud by remember { mutableStateOf(false) }
+    var showInterpreter by remember { mutableStateOf(false) }
 
     LaunchedEffect(themeId) {
         SwissThemeState.activePreset = SwissThemePreset.fromId(themeId)
@@ -105,6 +130,32 @@ fun AllChatApp(
 
     LaunchedEffect(Unit) {
         repository.initializeLockState()
+        runCatching { repository.pruneOldJunkChatsIfEnabled() }
+    }
+
+    // Automatic Vault Lock after N minutes of idle/background or immediately on app switch
+    DisposableEffect(lifecycleOwner, isPinEnabled, autoLockMinutes, lockOnAppSwitch) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (!isPinEnabled) return@LifecycleEventObserver
+            when (event) {
+                Lifecycle.Event.ON_STOP -> {
+                    backgroundedAtMs = System.currentTimeMillis()
+                    if (lockOnAppSwitch) {
+                        repository.lockNow()
+                    }
+                }
+                Lifecycle.Event.ON_START -> {
+                    val awayMs = if (backgroundedAtMs > 0L) System.currentTimeMillis() - backgroundedAtMs else 0L
+                    if (autoLockMinutes > 0 && awayMs >= autoLockMinutes * 60_000L) {
+                        repository.lockNow()
+                    }
+                    backgroundedAtMs = 0L
+                }
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     if (isLocked) {
@@ -151,6 +202,11 @@ fun AllChatApp(
                 navController.popBackStack(ChatRoute, inclusive = false)
                 onSharedPayloadConsumed()
             }
+            is IncomingSharePayload.DeepLinkAsk -> {
+                navController.popBackStack(ChatRoute, inclusive = false)
+                chatViewModel.sendMessage(incomingSharePayload.query)
+                onSharedPayloadConsumed()
+            }
             null -> Unit
         }
     }
@@ -195,6 +251,26 @@ fun AllChatApp(
             }
             IncomingAppAction.LIVE_LENS_TRANSLATE -> {
                 navigateTo(LiveLensRoute(startInTranslator = true))
+                onAppActionConsumed()
+            }
+            IncomingAppAction.LIVE_LENS_SOLVE -> {
+                navigateTo(LiveLensRoute(initialModeName = LiveLensMode.SOLVE_STEP_BY_STEP.name))
+                onAppActionConsumed()
+            }
+            IncomingAppAction.LIVE_LENS_CODE -> {
+                navigateTo(LiveLensRoute(initialModeName = LiveLensMode.WHITEBOARD_TO_CODE.name))
+                onAppActionConsumed()
+            }
+            IncomingAppAction.COMMUTE_HUD -> {
+                showCommuteHud = true
+                onAppActionConsumed()
+            }
+            IncomingAppAction.INTERPRETER -> {
+                showInterpreter = true
+                onAppActionConsumed()
+            }
+            IncomingAppAction.TOOLKIT -> {
+                showToolkitHub = true
                 onAppActionConsumed()
             }
             null -> Unit
@@ -345,7 +421,8 @@ fun AllChatApp(
                     ImageScreen(
                         viewModel = imageViewModel,
                         onNavigateBack = { navController.popBackStack() },
-                        onOpenSettings = { navigateTo(SettingsRoute) }
+                        onOpenSettings = { navigateTo(SettingsRoute) },
+                        onGenerateSvg = { desc -> chatViewModel.generateCleanSvg(desc) }
                     )
                 }
                 composable<VideoRoute> {
@@ -378,10 +455,14 @@ fun AllChatApp(
                 }
                 composable<LiveLensRoute> { backStackEntry ->
                     val route = backStackEntry.toRoute<LiveLensRoute>()
+                    val parsedMode = route.initialModeName.takeIf { it.isNotBlank() }?.let { name ->
+                        runCatching { LiveLensMode.valueOf(name) }.getOrNull()
+                    }
                     LiveLensScreen(
                         repository = repository,
                         preferredModel = chatState.selectedModel,
                         initialTranslatorMode = route.startInTranslator,
+                        initialMode = parsedMode,
                         onNavigateBack = { navController.popBackStack() },
                         onOpenSettings = { navigateTo(SettingsRoute) }
                     )
@@ -400,12 +481,17 @@ fun AllChatApp(
                 isMiniWindowMode = chatState.miniModeEnabled,
                 onToggleMiniWindowMode = { chatViewModel.toggleMiniMode() },
                 onOpenLiveTranslator = { navigateTo(LiveLensRoute(startInTranslator = true)) },
+                onOpenScanScreen = { showScreenScanSheet = true },
+                onOpenVoiceNotes = { showVoiceNotesSheet = true },
                 onOpenAssistantOverlay = { showAssistantOverlay = true },
                 onOpenMiniChat = { navController.popBackStack(ChatRoute, inclusive = false) },
                 onTriggerDeviceAction = { action ->
                     chatViewModel.setPendingDeviceAction(action)
                     navController.popBackStack(ChatRoute, inclusive = false)
                 },
+                onOpenToolkitHub = { showToolkitHub = true },
+                onOpenCommuteHud = { showCommuteHud = true },
+                onOpenInterpreter = { showInterpreter = true },
                 modifier = Modifier.align(Alignment.CenterEnd)
             )
 
@@ -422,7 +508,74 @@ fun AllChatApp(
                         showAssistantOverlay = false
                         navigateTo(LiveLensRoute(startInTranslator = false))
                     },
+                    onOpenToolkitHub = {
+                        showAssistantOverlay = false
+                        showToolkitHub = true
+                    },
                     onDismiss = { showAssistantOverlay = false }
+                )
+            }
+
+            if (showScreenScanSheet) {
+                ScreenScanSheet(
+                    repository = repository,
+                    preferredModel = chatState.selectedModel,
+                    onDismiss = { showScreenScanSheet = false }
+                )
+            }
+
+            if (showVoiceNotesSheet) {
+                VoiceNotesInboxSheet(
+                    notes = chatState.voiceNotes,
+                    isSavingNote = chatState.isSavingNote,
+                    onSaveNewMemo = { memo -> chatViewModel.saveVoiceQuickNote(memo) },
+                    onUpdateNote = { note -> chatViewModel.updateVoiceNote(note) },
+                    onDeleteNote = { id -> chatViewModel.deleteVoiceNote(id) },
+                    onDismiss = { showVoiceNotesSheet = false }
+                )
+            }
+
+            if (showToolkitHub) {
+                PowerToolkitHubDialog(
+                    onDismiss = { showToolkitHub = false },
+                    onSelectTool = { tool ->
+                        showToolkitHub = false
+                        when (tool) {
+                            PowerToolAction.COMMUTE_HUD -> showCommuteHud = true
+                            PowerToolAction.FACE_INTERPRETER -> showInterpreter = true
+                            else -> {
+                                navController.popBackStack(ChatRoute, inclusive = false)
+                                chatViewModel.launchPowerTool(tool)
+                            }
+                        }
+                    }
+                )
+            }
+
+            if (showCommuteHud) {
+                val hudTts = remember(context) { ReadAloudController(context, onSpeakingIdChanged = {}) }
+                androidx.compose.runtime.DisposableEffect(hudTts) {
+                    onDispose { hudTts.release() }
+                }
+                val lastReply = chatState.messages.lastOrNull { it.role == "ASSISTANT" && !it.isError }?.content.orEmpty()
+                CommuteHudDialog(
+                    wakePhraseEnabled = chatState.wakePhraseEnabled,
+                    lastAssistantReply = lastReply,
+                    onSubmitVoicePrompt = { spoken -> chatViewModel.sendMessage(spoken) },
+                    onReadLastReply = {
+                        if (lastReply.isNotBlank()) hudTts.speak(System.currentTimeMillis(), lastReply)
+                    },
+                    onQuickNavigateHome = {
+                        DeviceActionEngine.execute(context, DeviceAction.OpenMaps("Home", isNavigation = true))
+                    },
+                    onDismiss = { showCommuteHud = false }
+                )
+            }
+
+            if (showInterpreter) {
+                FaceToFaceInterpreterDialog(
+                    onTranslate = { text, src, tgt -> chatViewModel.translateInterpreterUtterance(text, src, tgt) },
+                    onDismiss = { showInterpreter = false }
                 )
             }
         }

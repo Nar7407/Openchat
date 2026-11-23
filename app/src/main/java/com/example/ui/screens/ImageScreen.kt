@@ -37,6 +37,7 @@ import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.UploadFile
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -100,6 +101,7 @@ fun ImageScreen(
     viewModel: ImageViewModel,
     onNavigateBack: () -> Unit,
     onOpenSettings: () -> Unit,
+    onGenerateSvg: (suspend (String) -> Result<String>)? = null,
     modifier: Modifier = Modifier
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
@@ -107,6 +109,8 @@ fun ImageScreen(
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
     var maskStrokes by remember { mutableStateOf<List<MaskStroke>>(emptyList()) }
+    var generatedSvgCode by remember { mutableStateOf<String?>(null) }
+    var isVectorizingSvg by remember { mutableStateOf(false) }
 
     val editPhotoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
@@ -328,6 +332,25 @@ fun ImageScreen(
                                         )
                                     }
                                 }
+
+                                if (onGenerateSvg != null && state.studioMode == ImageStudioMode.GENERATE) {
+                                    SwissButton(
+                                        text = if (isVectorizingSvg) "Vectorizing SVG…" else "Convert Prompt to Clean <SVG> Logo",
+                                        variant = SwissButtonVariant.OUTLINE,
+                                        enabled = !isVectorizingSvg && state.prompt.isNotBlank(),
+                                        minHeight = 42.dp,
+                                        onClick = {
+                                            scope.launch {
+                                                isVectorizingSvg = true
+                                                onGenerateSvg(state.prompt)
+                                                    .onSuccess { svg -> generatedSvgCode = svg }
+                                                    .onFailure { err -> viewModel.setStatusMessage(err.message ?: "SVG generation failed.") }
+                                                isVectorizingSvg = false
+                                            }
+                                        },
+                                        modifier = Modifier.fillMaxWidth().testTag("generate_svg_button")
+                                    )
+                                }
                             }
 
                             if (state.isGenerating) {
@@ -545,6 +568,43 @@ fun ImageScreen(
                 }
             }
         }
+    }
+
+    generatedSvgCode?.let { svg ->
+        val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+        AlertDialog(
+            onDismissRequest = { generatedSvgCode = null },
+            containerColor = SwissCanvas,
+            shape = RectangleShape,
+            title = { Text("VECTORIZER // CLEAN <SVG> OUTPUT", style = MaterialTheme.typography.titleMedium, color = SwissInk) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    androidx.compose.ui.viewinterop.AndroidView(
+                        factory = { ctx ->
+                            android.webkit.WebView(ctx).apply {
+                                loadDataWithBaseURL(null, "<html><body style='margin:0;display:flex;align-items:center;justify-content:center;background:#fff;'>$svg</body></html>", "text/html", "UTF-8", null)
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth().height(180.dp).border(1.dp, SwissInk)
+                    )
+                    Text(svg.take(600), style = MaterialTheme.typography.bodySmall, color = SwissMuted, maxLines = 6, overflow = TextOverflow.Ellipsis)
+                }
+            },
+            confirmButton = {
+                SwissButton(
+                    text = "Copy SVG",
+                    variant = SwissButtonVariant.PRIMARY,
+                    onClick = {
+                        clipboard.setText(androidx.compose.ui.text.AnnotatedString(svg))
+                        viewModel.setStatusMessage("SVG // Copied vector markup to clipboard.")
+                        generatedSvgCode = null
+                    }
+                )
+            },
+            dismissButton = {
+                SwissButton(text = "Close", onClick = { generatedSvgCode = null })
+            }
+        )
     }
 }
 

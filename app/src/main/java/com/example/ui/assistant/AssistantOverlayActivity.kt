@@ -54,6 +54,14 @@ class AssistantOverlayActivity : ComponentActivity() {
                         startActivity(mainIntent)
                         finish()
                     },
+                    onOpenToolkitHub = {
+                        val toolkitIntent = Intent(this, MainActivity::class.java).apply {
+                            putExtra(AllChatWidgetProvider.EXTRA_ALLCHAT_ACTION, "toolkit")
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                        }
+                        startActivity(toolkitIntent)
+                        finish()
+                    },
                     onDismiss = { finish() }
                 )
             }

@@ -4,10 +4,14 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.provider.AlarmClock
+import android.provider.CalendarContract
 import android.provider.MediaStore
 import com.example.domain.model.CustomAppEntry
 import com.example.domain.model.QuickContact
 import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Date
 import java.util.Locale
 
 sealed interface DeviceAction {
@@ -91,6 +95,95 @@ sealed interface DeviceAction {
         override val badge: String = "APP // LAUNCH"
         override val title: String = "Launch $appName"
         override val subtitle: String = packageName ?: fallbackUri ?: "Android App Intent"
+    }
+
+    data class OpenMaps(
+        val query: String,
+        val isNavigation: Boolean = false
+    ) : DeviceAction {
+        override val badge: String = if (isNavigation) "MAPS // NAVIGATE" else "MAPS // SEARCH"
+        override val title: String = if (isNavigation) {
+            "Navigate to ${query.take(40)}"
+        } else {
+            "Search Maps: ${query.take(40)}"
+        }
+        override val subtitle: String = if (isNavigation) {
+            "google.navigation:q=$query"
+        } else {
+            "geo:0,0?q=$query"
+        }
+    }
+
+    data class CreateCalendarEvent(
+        val eventTitle: String,
+        val startTimeMillis: Long,
+        val endTimeMillis: Long,
+        val location: String? = null,
+        val description: String? = null
+    ) : DeviceAction {
+        override val badge: String = "CALENDAR // EVENT"
+        override val title: String = "Schedule: ${eventTitle.take(42)}"
+        override val subtitle: String = buildString {
+            val fmt = SimpleDateFormat("EEE, dd MMM · HH:mm", Locale.US)
+            append(fmt.format(Date(startTimeMillis)))
+            if (!location.isNullOrBlank()) append(" · $location")
+        }
+    }
+
+    data class SendSms(
+        val phoneNumber: String,
+        val message: String,
+        val contactLabel: String? = null
+    ) : DeviceAction {
+        override val badge: String = "SMS // MESSAGE"
+        override val title: String = when {
+            !contactLabel.isNullOrBlank() -> "SMS $contactLabel"
+            phoneNumber.isNotBlank() -> "SMS $phoneNumber"
+            else -> "Send SMS Message"
+        }
+        override val subtitle: String = buildString {
+            if (phoneNumber.isNotBlank()) append("$phoneNumber · ")
+            else append("Pick contact or enter number · ")
+            append(message.ifBlank { "Compose SMS" })
+        }
+    }
+
+    data class SendEmail(
+        val emailAddress: String,
+        val subject: String,
+        val body: String,
+        val contactLabel: String? = null
+    ) : DeviceAction {
+        override val badge: String = "EMAIL // COMPOSE"
+        override val title: String = when {
+            !contactLabel.isNullOrBlank() -> "Email $contactLabel"
+            emailAddress.isNotBlank() -> "Email $emailAddress"
+            else -> "Compose Email"
+        }
+        override val subtitle: String = buildString {
+            if (emailAddress.isNotBlank()) append("$emailAddress · ")
+            else append("Enter recipient email · ")
+            append(subject.ifBlank { body.take(40).ifBlank { "Open Mail Composer" } })
+        }
+    }
+
+    data class UpiPay(
+        val upiId: String,
+        val payeeName: String,
+        val amount: String,
+        val note: String = ""
+    ) : DeviceAction {
+        override val badge: String = "UPI // CONFIRM PAY"
+        override val title: String = buildString {
+            append("Pay ")
+            if (amount.isNotBlank()) append("₹$amount ") else append("UPI ")
+            append("to ${payeeName.ifBlank { upiId.ifBlank { "Recipient" } }}")
+        }
+        override val subtitle: String = buildString {
+            if (upiId.isNotBlank()) append("upi://pay?pa=$upiId")
+            else append("Pick saved UPI contact or enter UPI ID (name@bank)")
+            if (note.isNotBlank()) append(" · $note")
+        }
     }
 
     companion object {
@@ -330,6 +423,26 @@ object DeviceActionEngine {
             }
         }
 
+        // 5.5 UPI Payment Confirmation Card:
+        //     "Pay ₹500 to Rahul via UPI", "UPI pay 250 to mom@okaxis for groceries", "Send 100 rs to Mom on UPI"
+        parseUpiPrompt(text, contacts)?.let { return it }
+
+        // 5.6 Google Maps Directions & Nearby Search:
+        //     "Navigate to Mumbai Airport", "Directions to Pune Station", "Find coffee shops near me", "Open maps for Taj Mahal"
+        parseMapsPrompt(text)?.let { return it }
+
+        // 5.7 Calendar Event Insert:
+        //     "Schedule Team Standup tomorrow at 10:30 am", "Add calendar event Dentist on 2026-11-25 at 4pm"
+        parseCalendarPrompt(text)?.let { return it }
+
+        // 5.8 Send SMS:
+        //     "Send SMS to Mom saying reached safely", "Text +91 9876543210: Call me back"
+        parseSmsPrompt(text, contacts)?.let { return it }
+
+        // 5.9 Send Email:
+        //     "Send email to rahul@example.com subject Project Update body Attached the report"
+        parseEmailPrompt(text, contacts)?.let { return it }
+
         // 6. Open / Launch Any App (curated + custom user packages + raw package IDs)
         val openMatch = Regex("""^(?:open|launch|start|run)\s+(.+)$""", RegexOption.IGNORE_CASE).find(text)
         if (openMatch != null) {
@@ -339,6 +452,225 @@ object DeviceActionEngine {
         }
 
         return null
+    }
+
+    private fun parseMapsPrompt(text: String): DeviceAction.OpenMaps? {
+        val navMatch = Regex(
+            """^(?:navigate|directions|get\s+directions|route|drive|take\s+me)\s+(?:to\s+)(.+)$""",
+            RegexOption.IGNORE_CASE
+        ).find(text)
+        if (navMatch != null) {
+            val dest = navMatch.groupValues[1].trim().trimEnd('.', '!', '?')
+            if (dest.length >= 2) return DeviceAction.OpenMaps(query = dest, isNavigation = true)
+        }
+
+        val mapsSearchMatch = Regex(
+            """^(?:open\s+(?:google\s+)?maps\s+(?:for|to|search)\s+|search\s+(?:google\s+)?maps\s+(?:for\s+)?|show\s+)(.+?)(?:\s+on\s+(?:google\s+)?maps)?$""",
+            RegexOption.IGNORE_CASE
+        ).find(text)
+        if (mapsSearchMatch != null && text.contains("map", ignoreCase = true)) {
+            val q = mapsSearchMatch.groupValues[1].trim().trimEnd('.', '!', '?')
+            if (q.length >= 2 && !q.equals("maps", ignoreCase = true)) {
+                return DeviceAction.OpenMaps(query = q, isNavigation = false)
+            }
+        }
+
+        val nearbyMatch = Regex(
+            """^(?:find|search|locate|show)\s+(.+?)\s+(?:near\s+me|nearby)\s*$""",
+            RegexOption.IGNORE_CASE
+        ).find(text)
+        if (nearbyMatch != null) {
+            val q = nearbyMatch.groupValues[1].trim().trimEnd('.', '!', '?')
+            if (q.length >= 2) return DeviceAction.OpenMaps(query = "$q near me", isNavigation = false)
+        }
+        return null
+    }
+
+    private fun parseCalendarPrompt(text: String): DeviceAction.CreateCalendarEvent? {
+        val lower = text.lowercase(Locale.US)
+        val looksCalendar = lower.startsWith("schedule ") ||
+            lower.startsWith("add calendar") ||
+            lower.startsWith("create calendar") ||
+            lower.startsWith("add event") ||
+            lower.startsWith("create event") ||
+            lower.startsWith("book meeting") ||
+            lower.startsWith("create meeting") ||
+            lower.contains("on my calendar") ||
+            lower.contains("to my calendar")
+        if (!looksCalendar) return null
+
+        val cal = Calendar.getInstance()
+        cal.set(Calendar.SECOND, 0)
+        cal.set(Calendar.MILLISECOND, 0)
+
+        var dateMatched = false
+        val isoDate = Regex("""(\d{4})-(\d{1,2})-(\d{1,2})""").find(lower)
+        if (isoDate != null) {
+            val y = isoDate.groupValues[1].toIntOrNull()
+            val m = isoDate.groupValues[2].toIntOrNull()
+            val d = isoDate.groupValues[3].toIntOrNull()
+            if (y != null && m != null && d != null && m in 1..12 && d in 1..31) {
+                cal.set(Calendar.YEAR, y)
+                cal.set(Calendar.MONTH, m - 1)
+                cal.set(Calendar.DAY_OF_MONTH, d)
+                dateMatched = true
+            }
+        } else if (lower.contains("day after tomorrow")) {
+            cal.add(Calendar.DAY_OF_YEAR, 2)
+            dateMatched = true
+        } else if (lower.contains("tomorrow")) {
+            cal.add(Calendar.DAY_OF_YEAR, 1)
+            dateMatched = true
+        } else if (lower.contains("today")) {
+            dateMatched = true
+        }
+
+        val hm = parseAlarmHourMinute(lower)
+        if (hm != null) {
+            cal.set(Calendar.HOUR_OF_DAY, hm.first)
+            cal.set(Calendar.MINUTE, hm.second)
+            if (!dateMatched && cal.timeInMillis < System.currentTimeMillis()) {
+                cal.add(Calendar.DAY_OF_YEAR, 1)
+            }
+        } else {
+            cal.add(Calendar.HOUR_OF_DAY, 1)
+            cal.set(Calendar.MINUTE, 0)
+        }
+
+        val title = text
+            .replace(Regex("""^(?:schedule|add\s+calendar\s+event|create\s+calendar\s+event|add\s+event|create\s+event|book\s+meeting|create\s+meeting)\s+""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""\s+(?:on|for)\s+\d{4}-\d{1,2}-\d{1,2}""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""\s+(?:today|tomorrow|day\s+after\s+tomorrow)\b""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""\s+(?:at|from)\s+\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)?""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""\s+(?:on|to)\s+my\s+calendar\s*$""", RegexOption.IGNORE_CASE), "")
+            .trim()
+            .trimEnd('.', '!', '?')
+            .ifBlank { "New Event" }
+
+        val startMs = cal.timeInMillis
+        val endMs = startMs + 60L * 60L * 1000L
+        return DeviceAction.CreateCalendarEvent(
+            eventTitle = title,
+            startTimeMillis = startMs,
+            endTimeMillis = endMs
+        )
+    }
+
+    private fun parseSmsPrompt(text: String, contacts: List<QuickContact>): DeviceAction.SendSms? {
+        val lower = text.lowercase(Locale.US)
+        if (lower.contains("whatsapp")) return null
+
+        val pA = Regex(
+            """^(?:send\s+)?(?:an?\s+)?(?:sms|text\s+message|text)\s+(?:to\s+)?([^:]+?)(?:\s+(?:saying|that|with\s+message|message)\s+|:\s*)(.+)$""",
+            RegexOption.IGNORE_CASE
+        ).find(text)
+        val pB = Regex(
+            """^(?:send\s+)?(?:an?\s+)?sms\s+(?:to\s+)?(.+)$""",
+            RegexOption.IGNORE_CASE
+        ).find(text)
+
+        val (rawTarget, rawMsg) = when {
+            pA != null -> pA.groupValues[1].trim() to pA.groupValues[2].trim()
+            pB != null -> pB.groupValues[1].trim() to ""
+            else -> return null
+        }
+
+        val cleanTarget = rawTarget.trim().trimEnd(':', ',', '.', '!')
+        val phoneMatch = Regex("""(\+?\d[\d\s\-()]{5,18}\d)""").find(cleanTarget)
+        if (phoneMatch != null) {
+            return DeviceAction.SendSms(
+                phoneNumber = normalizePhoneNumber(phoneMatch.value),
+                message = rawMsg.trim()
+            )
+        }
+        val matched = resolveContact(cleanTarget, contacts)
+        return if (matched != null) {
+            DeviceAction.SendSms(
+                phoneNumber = normalizePhoneNumber(matched.phoneNumber),
+                message = rawMsg.trim(),
+                contactLabel = matched.name
+            )
+        } else {
+            DeviceAction.SendSms(
+                phoneNumber = "",
+                message = rawMsg.trim(),
+                contactLabel = cleanTarget.takeIf { it.isNotBlank() }
+            )
+        }
+    }
+
+    private fun parseEmailPrompt(text: String, contacts: List<QuickContact>): DeviceAction.SendEmail? {
+        val lower = text.lowercase(Locale.US)
+        if (!lower.startsWith("send email") && !lower.startsWith("send an email") &&
+            !lower.startsWith("email ") && !lower.startsWith("mail ") && !lower.startsWith("compose email")
+        ) {
+            return null
+        }
+        if (Regex("""^(?:open|launch)\s+(?:gmail|email|mail)\s*$""", RegexOption.IGNORE_CASE).matches(text)) {
+            return null
+        }
+
+        val directEmail = Regex("""([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})""").find(text)?.value.orEmpty()
+        val subjectMatch = Regex("""subject\s*[:\-]?\s*(.+?)(?:\s+(?:body|saying|message)\s*[:\-]?\s*|$)""", RegexOption.IGNORE_CASE).find(text)
+        val bodyMatch = Regex("""(?:body|saying|message)\s*[:\-]?\s*(.+)$""", RegexOption.IGNORE_CASE).find(text)
+        val aboutMatch = if (subjectMatch == null) {
+            Regex("""(?:about|regarding)\s+(.+)$""", RegexOption.IGNORE_CASE).find(text)
+        } else null
+
+        val targetRaw = text
+            .replace(Regex("""^(?:send\s+(?:an?\s+)?email|compose\s+email|email|mail)\s+(?:to\s+)?""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""\s+(?:subject|about|regarding|body|saying|message)\b.*$""", RegexOption.IGNORE_CASE), "")
+            .trim()
+            .trimEnd(':', ',', '.', '!')
+
+        val matched = if (directEmail.isBlank() && targetRaw.isNotBlank()) resolveContact(targetRaw, contacts) else null
+        val resolvedEmail = directEmail.ifBlank { matched?.email.orEmpty() }
+        val subject = subjectMatch?.groupValues?.get(1)?.trim()
+            ?: aboutMatch?.groupValues?.get(1)?.trim()
+            ?: ""
+        val body = bodyMatch?.groupValues?.get(1)?.trim().orEmpty()
+
+        return DeviceAction.SendEmail(
+            emailAddress = resolvedEmail,
+            subject = subject,
+            body = body,
+            contactLabel = matched?.name ?: targetRaw.takeIf { it.isNotBlank() && !it.contains("@") }
+        )
+    }
+
+    private fun parseUpiPrompt(text: String, contacts: List<QuickContact>): DeviceAction.UpiPay? {
+        val lower = text.lowercase(Locale.US)
+        val looksUpi = lower.contains("upi") ||
+            Regex("""^(?:pay|send)\s+(?:₹|rs\.?|inr\s*)?\d+(?:\.\d{1,2})?\s*(?:rs\.?|rupees?|inr)?\s+to\s+""", RegexOption.IGNORE_CASE).containsMatchIn(text)
+        if (!looksUpi) return null
+
+        val upiRegex = Regex("""([a-zA-Z0-9._-]{2,}@[a-zA-Z0-9]{2,})""")
+        val directUpi = upiRegex.find(text)?.value.orEmpty()
+        val amountMatch = Regex("""(?:₹|rs\.?|inr\s*)?(\d+(?:\.\d{1,2})?)\s*(?:rs\.?|rupees?|inr)?""", RegexOption.IGNORE_CASE).find(text)
+        val amount = amountMatch?.groupValues?.get(1).orEmpty()
+        val noteMatch = Regex("""\s+(?:for|note|memo)\s+(.+)$""", RegexOption.IGNORE_CASE).find(text)
+        val note = noteMatch?.groupValues?.get(1)?.trim()?.trimEnd('.', '!', '?').orEmpty()
+
+        val payeeMatch = Regex(
+            """\bto\s+([A-Za-z0-9._@\s-]{2,36}?)(?:\s+(?:via|on|using|for|note|memo)\b|$)""",
+            RegexOption.IGNORE_CASE
+        ).find(text)
+        val rawPayee = payeeMatch?.groupValues?.get(1)?.trim()?.trimEnd(',', '.', '!').orEmpty()
+
+        val matchedContact = if (rawPayee.isNotBlank() && !rawPayee.contains("@")) {
+            resolveContact(rawPayee, contacts)
+        } else null
+
+        val resolvedUpi = directUpi.ifBlank { matchedContact?.upiId.orEmpty() }
+        val resolvedName = matchedContact?.name ?: rawPayee.takeIf { it.isNotBlank() && !it.contains("@") }
+            ?: resolvedUpi.substringBefore("@").ifBlank { "UPI Payee" }
+
+        return DeviceAction.UpiPay(
+            upiId = resolvedUpi,
+            payeeName = resolvedName,
+            amount = amount,
+            note = note
+        )
     }
 
     private fun parseWhatsAppPrompt(text: String, contacts: List<QuickContact>): DeviceAction.SendWhatsApp? {
@@ -527,6 +859,116 @@ object DeviceActionEngine {
                     } else {
                         throw IllegalStateException("${action.appName} is not installed or cannot be launched directly.")
                     }
+                }
+
+                is DeviceAction.OpenMaps -> {
+                    val encoded = URLEncoder.encode(action.query.trim(), "UTF-8")
+                    val primaryUri = if (action.isNavigation) {
+                        Uri.parse("google.navigation:q=$encoded")
+                    } else {
+                        Uri.parse("geo:0,0?q=$encoded")
+                    }
+                    val mapsIntent = Intent(Intent.ACTION_VIEW, primaryUri).apply {
+                        setPackage("com.google.android.apps.maps")
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    val genericGeoIntent = Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=$encoded")).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    val webFallback = Intent(
+                        Intent.ACTION_VIEW,
+                        Uri.parse("https://www.google.com/maps/search/?api=1&query=$encoded")
+                    ).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    runCatching { context.startActivity(mapsIntent) }
+                        .recoverCatching { context.startActivity(genericGeoIntent) }
+                        .onFailure { context.startActivity(webFallback) }
+                    if (action.isNavigation) "Started navigation to ${action.query}" else "Opened Maps for ${action.query}"
+                }
+
+                is DeviceAction.CreateCalendarEvent -> {
+                    val intent = Intent(Intent.ACTION_INSERT).apply {
+                        data = CalendarContract.Events.CONTENT_URI
+                        putExtra(CalendarContract.Events.TITLE, action.eventTitle)
+                        putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, action.startTimeMillis)
+                        putExtra(CalendarContract.EXTRA_EVENT_END_TIME, action.endTimeMillis)
+                        if (!action.location.isNullOrBlank()) {
+                            putExtra(CalendarContract.Events.EVENT_LOCATION, action.location)
+                        }
+                        if (!action.description.isNullOrBlank()) {
+                            putExtra(CalendarContract.Events.DESCRIPTION, action.description)
+                        }
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    context.startActivity(intent)
+                    "Opened Calendar to add \"${action.eventTitle}\""
+                }
+
+                is DeviceAction.SendSms -> {
+                    val clean = action.phoneNumber.replace(Regex("""[^\d+*#]"""), "")
+                    if (clean.isBlank()) {
+                        throw IllegalArgumentException("Enter or select a phone number first to send SMS.")
+                    }
+                    val smsIntent = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:$clean")).apply {
+                        putExtra("sms_body", action.message)
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    val fallbackIntent = Intent(
+                        Intent.ACTION_VIEW,
+                        Uri.parse("sms:$clean?body=${URLEncoder.encode(action.message, "UTF-8")}")
+                    ).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    runCatching { context.startActivity(smsIntent) }
+                        .onFailure { context.startActivity(fallbackIntent) }
+                    "Opened SMS composer for ${action.contactLabel ?: clean}"
+                }
+
+                is DeviceAction.SendEmail -> {
+                    val recipient = action.emailAddress.trim()
+                    if (recipient.isBlank()) {
+                        throw IllegalArgumentException("Enter a recipient email address first.")
+                    }
+                    val queryParts = buildList {
+                        if (action.subject.isNotBlank()) add("subject=${URLEncoder.encode(action.subject, "UTF-8")}")
+                        if (action.body.isNotBlank()) add("body=${URLEncoder.encode(action.body, "UTF-8")}")
+                    }
+                    val mailUri = Uri.parse(
+                        "mailto:$recipient" + if (queryParts.isNotEmpty()) "?${queryParts.joinToString("&")}" else ""
+                    )
+                    val emailIntent = Intent(Intent.ACTION_SENDTO, mailUri).apply {
+                        putExtra(Intent.EXTRA_EMAIL, arrayOf(recipient))
+                        if (action.subject.isNotBlank()) putExtra(Intent.EXTRA_SUBJECT, action.subject)
+                        if (action.body.isNotBlank()) putExtra(Intent.EXTRA_TEXT, action.body)
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    context.startActivity(emailIntent)
+                    "Opened Email composer for ${action.contactLabel ?: recipient}"
+                }
+
+                is DeviceAction.UpiPay -> {
+                    val vpa = action.upiId.trim()
+                    if (vpa.isBlank() || !vpa.contains("@")) {
+                        throw IllegalArgumentException("Enter a valid UPI ID (e.g. name@okaxis) before paying.")
+                    }
+                    val upiUri = Uri.Builder()
+                        .scheme("upi")
+                        .authority("pay")
+                        .appendQueryParameter("pa", vpa)
+                        .appendQueryParameter("pn", action.payeeName.ifBlank { vpa.substringBefore("@") })
+                        .apply {
+                            if (action.amount.isNotBlank()) appendQueryParameter("am", action.amount.trim())
+                            if (action.note.isNotBlank()) appendQueryParameter("tn", action.note.trim())
+                        }
+                        .appendQueryParameter("cu", "INR")
+                        .build()
+                    val upiIntent = Intent(Intent.ACTION_VIEW, upiUri)
+                    val chooser = Intent.createChooser(upiIntent, "Pay via UPI").apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    context.startActivity(chooser)
+                    "Opened UPI payment sheet for ${action.payeeName.ifBlank { vpa }}"
                 }
             }
         }

@@ -17,6 +17,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -94,6 +95,17 @@ import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.outlined.UnfoldLess
 import androidx.compose.material.icons.outlined.UnfoldMore
 import androidx.compose.material.icons.outlined.Videocam
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import androidx.compose.material.icons.outlined.AutoFixHigh
+import androidx.compose.material.icons.outlined.Bolt
+import androidx.compose.material.icons.outlined.Book
+import androidx.compose.material.icons.outlined.BookmarkAdd
+import androidx.compose.material.icons.outlined.Brush
+import androidx.compose.material.icons.outlined.EditNote
+import androidx.compose.material.icons.outlined.FactCheck
+import androidx.compose.material.icons.outlined.QrCode2
+import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material.icons.outlined.VolumeOff
 import androidx.compose.material.icons.outlined.VolumeUp
 import androidx.compose.material3.AlertDialog
@@ -123,7 +135,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -183,11 +199,13 @@ import com.example.ui.components.SwissPanelHeader
 import com.example.ui.components.SwissRuleDivider
 import com.example.ui.components.SwissToggleCell
 import com.example.ui.components.ThemeSwitcherSheet
+import com.example.ui.components.VoiceNotesInboxSheet
 import com.example.ui.components.swissGraphPaper
 import com.example.ui.components.swissRegistrationMarks
 import com.example.ui.components.swissTextFieldColors
 import com.example.ui.theme.SwissCanvas
 import com.example.ui.theme.SwissConcrete
+import com.example.ui.theme.SwissGridLine
 import com.example.ui.theme.SwissInk
 import com.example.ui.theme.SwissMuted
 import com.example.ui.theme.SwissPaper
@@ -196,11 +214,43 @@ import com.example.ui.theme.SwissSubtleFill
 import com.example.ui.theme.SwissVerifiedInk
 import com.example.ui.theme.SwissVerifiedTint
 import com.example.ui.theme.SwissWhite
+import com.example.domain.model.AmbientNoiseLevel
+import com.example.domain.model.FactCheckClaim
+import com.example.ui.components.BleInspectorDialog
+import com.example.ui.components.CliCommandBuilderDialog
+import com.example.ui.components.ClipboardVaultDialog
+import com.example.ui.components.ColorPaletteDialog
+import com.example.ui.components.CommuteHudDialog
+import com.example.ui.components.CsvChartExplorerDialog
+import com.example.ui.components.DecisionMatrixDialog
+import com.example.ui.components.ExpenseTrackerDialog
+import com.example.ui.components.FaceToFaceInterpreterDialog
+import com.example.ui.components.ImageAnnotatorDialog
+import com.example.ui.components.InteractiveCanvasDialog
+import com.example.ui.components.InteractiveGraphPlotterDialog
+import com.example.ui.components.LocalWorkspaceDialog
+import com.example.ui.components.NegativeConstraintPillBar
+import com.example.ui.components.PowerToolAction
+import com.example.ui.components.PowerToolkitHubDialog
+import com.example.ui.components.PrivacyRedactorDialog
+import com.example.ui.components.QrStudioDialog
+import com.example.ui.components.ReadAloudKaraokeBar
+import com.example.ui.components.ReadingRoomDialog
+import com.example.ui.components.SpotlightSearchDialog
+import com.example.ui.components.ThreadCheckpointDividerCard
+import com.example.ui.components.VideoFrameExtractorDialog
+import com.example.ui.components.VoiceFormFillerDialog
+import com.example.ui.components.WatchlistDialog
 import com.example.ui.viewmodel.ChatUiEvent
 import com.example.ui.viewmodel.ChatViewModel
 import com.example.util.DeviceActionEngine
+import com.example.util.MathExpressionEvaluator
 import com.example.util.ReadAloudController
+import com.example.util.SmartContextEngine
+import com.example.util.TtsPlaybackState
 import com.example.util.VoiceInputController
+import com.example.util.WakePhraseListener
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
 import java.util.Locale
@@ -254,6 +304,7 @@ fun ChatScreen(
     var showMcpSheet by remember { mutableStateOf(false) }
     var showInitDialog by remember { mutableStateOf(false) }
     var showMemoryBank by remember { mutableStateOf(false) }
+    var showVoiceNotesSheet by remember { mutableStateOf(false) }
     var editorInitialText by remember { mutableStateOf<String?>(null) }
     var shareDialogPayload by remember { mutableStateOf<Pair<String, String>?>(null) }
     var exportStudioPayload by remember { mutableStateOf<Pair<String, String>?>(null) }
@@ -261,13 +312,72 @@ fun ChatScreen(
     var snipSourceUri by remember { mutableStateOf<Uri?>(null) }
     val liveCamController = remember { LiveCamController() }
 
-    // Smart "Paste & Ask" Clipboard Detector when returning to AllChat
-    DisposableEffect(lifecycleOwner, context) {
+    // Power-User Mega Suite Modal & Adaptive Split States
+    var ttsPlaybackState by remember { mutableStateOf(TtsPlaybackState()) }
+    var showToolkitHub by remember { mutableStateOf(false) }
+    var qrDialogPayload by remember { mutableStateOf<String?>(null) }
+    var showVideoExtractor by remember { mutableStateOf(false) }
+    var showColorPalette by remember { mutableStateOf(false) }
+    var paletteInitialBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var redactorInitialText by remember { mutableStateOf<String?>(null) }
+    var plotterInitialExpr by remember { mutableStateOf<String?>(null) }
+    var showCsvExplorer by remember { mutableStateOf(false) }
+    var decisionInitialPrompt by remember { mutableStateOf<String?>(null) }
+    var readingRoomPayload by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var canvasInitialContent by remember { mutableStateOf<String?>(null) }
+    var showExpensesDialog by remember { mutableStateOf(false) }
+    var showWatchlistDialog by remember { mutableStateOf(false) }
+    var showSpotlightDialog by remember { mutableStateOf(false) }
+    var showClipboardVault by remember { mutableStateOf(false) }
+    var showBleInspector by remember { mutableStateOf(false) }
+    var showLocalWorkspace by remember { mutableStateOf(false) }
+    var showCommuteHud by remember { mutableStateOf(false) }
+    var showInterpreter by remember { mutableStateOf(false) }
+    var showVoiceFormFiller by remember { mutableStateOf(false) }
+    var cliBuilderQuery by remember { mutableStateOf<String?>(null) }
+    var annotatingBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var splitCanvasPinned by remember { mutableStateOf(false) }
+    var splitCanvasDraft by remember { mutableStateOf("") }
+    var splitPaneTab by remember { mutableIntStateOf(0) } // 0 = Canvas, 1 = Plotter
+    var splitPlotExpr by remember { mutableStateOf("sin(x) + 0.2*x") }
+    var cooldownNowMs by remember { mutableStateOf(System.currentTimeMillis()) }
+
+    LaunchedEffect(state.cooldownMap) {
+        if (state.cooldownMap.isEmpty()) return@LaunchedEffect
+        while (true) {
+            cooldownNowMs = System.currentTimeMillis()
+            if (state.cooldownMap.values.none { it > cooldownNowMs }) break
+            delay(1000L)
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        viewModel.refreshWorkspaceFiles(context)
+    }
+
+    LaunchedEffect(state.ambientWhisperEnabled, state.smartZones, state.timeProfilesEnabled, state.autoEcoMode) {
+        val ambientDb = if (state.ambientWhisperEnabled) {
+            runCatching { SmartContextEngine.sampleAmbientDecibels(context) }.getOrNull()
+        } else null
+        viewModel.refreshSmartContext(context, ambientDb)
+    }
+
+    // Smart "Paste & Ask" Clipboard Detector + Smart Context Refresh when returning to AllChat
+    DisposableEffect(lifecycleOwner, context, state.ambientWhisperEnabled) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
                 val clipText = cm?.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()
                 viewModel.inspectClipboardOnResume(clipText)
+                if (!clipText.isNullOrBlank()) {
+                    viewModel.recordClipboard(clipText)
+                }
+                scope.launch {
+                    val ambientDb = if (state.ambientWhisperEnabled) {
+                        runCatching { SmartContextEngine.sampleAmbientDecibels(context) }.getOrNull()
+                    } else null
+                    viewModel.refreshSmartContext(context, ambientDb)
+                }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -289,7 +399,8 @@ fun ChatScreen(
     val ttsController = remember(context) {
         ReadAloudController(
             context = context,
-            onSpeakingIdChanged = { id -> speakingMessageId = id }
+            onSpeakingIdChanged = { id -> speakingMessageId = id },
+            onPlaybackStateChanged = { st -> ttsPlaybackState = st }
         )
     }
 
@@ -297,6 +408,50 @@ fun ChatScreen(
         onDispose {
             voiceController.release()
             ttsController.release()
+        }
+    }
+
+    // Apply Ambient Whisper / Noisy-Room Auto-Volume gain to Read-Aloud TTS
+    LaunchedEffect(state.smartContext.noiseLevel) {
+        when (state.smartContext.noiseLevel) {
+            AmbientNoiseLevel.QUIET_WHISPER -> ttsController.setVolumeGain(0.35f)
+            AmbientNoiseLevel.NOISY_BOOST -> ttsController.setVolumeGain(1.0f)
+            AmbientNoiseLevel.NORMAL -> ttsController.setVolumeGain(0.85f)
+        }
+    }
+
+    // Foreground "Hey AllChat" Wake-Phrase Listener when toggled ON in Settings
+    DisposableEffect(
+        state.wakePhraseEnabled,
+        isDictating,
+        state.isStreaming,
+        state.liveVoiceActive,
+        showCommuteHud
+    ) {
+        val micGranted = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+        val shouldArm = state.wakePhraseEnabled &&
+            micGranted &&
+            !isDictating &&
+            !state.isStreaming &&
+            !state.liveVoiceActive &&
+            !showCommuteHud
+        val wakeListener = if (shouldArm) {
+            WakePhraseListener(
+                context = context,
+                onWakeDetected = { trailing ->
+                    if (trailing.isNotBlank()) {
+                        viewModel.sendMessageWithWorkspaceContext(context, trailing)
+                    } else {
+                        voiceController.start()
+                    }
+                }
+            ).also { it.start() }
+        } else null
+        onDispose {
+            wakeListener?.stop()
         }
     }
 
@@ -418,6 +573,10 @@ fun ChatScreen(
                 ChatUiEvent.OpenInitAgentsDialog -> showInitDialog = true
                 ChatUiEvent.OpenCustomCommandsSheet -> showCustomCommandsSheet = true
                 ChatUiEvent.OpenMemoryBank -> showMemoryBank = true
+                ChatUiEvent.OpenVoiceNotes -> showVoiceNotesSheet = true
+                is ChatUiEvent.SpeakRoutineText -> {
+                    ttsController.speak(System.currentTimeMillis(), event.text)
+                }
                 ChatUiEvent.StartVoiceDictation -> {
                     val granted = ContextCompat.checkSelfPermission(
                         context,
@@ -453,6 +612,33 @@ fun ChatScreen(
                     pendingExportMarkdown = event.markdown
                     exportMdLauncher.launch(event.suggestedFileName)
                 }
+                is ChatUiEvent.OpenQrDialog -> qrDialogPayload = event.initialPayload
+                is ChatUiEvent.OpenPlotter -> plotterInitialExpr = event.initialExpression
+                is ChatUiEvent.OpenDecisionMatrix -> {
+                    decisionInitialPrompt = event.initialPrompt
+                    if (event.initialPrompt.isNotBlank()) {
+                        viewModel.buildDecisionMatrix(event.initialPrompt)
+                    }
+                }
+                is ChatUiEvent.OpenCanvas -> canvasInitialContent = event.initialContent
+                ChatUiEvent.OpenExpenses -> showExpensesDialog = true
+                ChatUiEvent.OpenWatchlist -> showWatchlistDialog = true
+                ChatUiEvent.OpenBleInspector -> showBleInspector = true
+                ChatUiEvent.OpenCommuteHud -> showCommuteHud = true
+                ChatUiEvent.OpenInterpreter -> showInterpreter = true
+                ChatUiEvent.OpenSpotlight -> showSpotlightDialog = true
+                is ChatUiEvent.OpenRedactor -> redactorInitialText = event.initialText
+                ChatUiEvent.OpenCsvExplorer -> showCsvExplorer = true
+                ChatUiEvent.OpenLocalWorkspace -> showLocalWorkspace = true
+                ChatUiEvent.OpenVideoFrameExtractor -> showVideoExtractor = true
+                ChatUiEvent.OpenColorPalette -> {
+                    paletteInitialBitmap = null
+                    showColorPalette = true
+                }
+                ChatUiEvent.OpenClipboardVault -> showClipboardVault = true
+                ChatUiEvent.OpenToolkitHub -> showToolkitHub = true
+                ChatUiEvent.OpenVoiceFormFiller -> showVoiceFormFiller = true
+                is ChatUiEvent.OpenCliBuilder -> cliBuilderQuery = event.initialQuery
                 ChatUiEvent.ExitApp -> {
                     (context as? Activity)?.finishAffinity()
                 }
@@ -460,10 +646,25 @@ fun ChatScreen(
         }
     }
 
-    var autoScrollEnabled by remember(state.activeConversation?.id) { mutableStateOf(true) }
+    val displayedNodes = remember(state.ghostModeEnabled, state.ghostMessages, state.branchNodes) {
+        if (state.ghostModeEnabled) {
+            state.ghostMessages.map { msg ->
+                BranchMessageNode(
+                    message = msg,
+                    parentKey = -1L,
+                    siblingIds = listOf(msg.id),
+                    siblingIndex = 0
+                )
+            }
+        } else {
+            state.branchNodes
+        }
+    }
+
+    var autoScrollEnabled by remember(state.activeConversation?.id, state.ghostModeEnabled) { mutableStateOf(true) }
     val showJumpToLatest by remember {
         derivedStateOf {
-            state.branchNodes.isNotEmpty() && listState.canScrollForward
+            displayedNodes.isNotEmpty() && listState.canScrollForward
         }
     }
 
@@ -480,7 +681,7 @@ fun ChatScreen(
     }
 
     // Re-engage auto-scroll whenever the user submits a fresh message
-    val lastNode = state.branchNodes.lastOrNull()
+    val lastNode = displayedNodes.lastOrNull()
     LaunchedEffect(lastNode?.message?.id) {
         if (lastNode?.message?.role == "USER") {
             autoScrollEnabled = true
@@ -488,12 +689,12 @@ fun ChatScreen(
     }
 
     // Smart auto-scroll when a new turn arrives or while streaming (only if not paused by user)
-    LaunchedEffect(state.branchNodes.size, lastNode?.message?.id, lastNode?.message?.content?.length) {
-        if (state.branchNodes.isNotEmpty() && autoScrollEnabled) {
+    LaunchedEffect(displayedNodes.size, lastNode?.message?.id, lastNode?.message?.content?.length) {
+        if (displayedNodes.isNotEmpty() && autoScrollEnabled) {
             if (state.isStreaming) {
-                listState.scrollToItem(state.branchNodes.lastIndex)
+                listState.scrollToItem(displayedNodes.lastIndex)
             } else {
-                listState.animateScrollToItem(state.branchNodes.lastIndex)
+                listState.animateScrollToItem(displayedNodes.lastIndex)
             }
         }
     }
@@ -791,6 +992,7 @@ fun ChatScreen(
                 .background(SwissCanvas)
         ) {
             val isCompactViewport = maxHeight < 520.dp || maxWidth < 360.dp
+            val isWideScreen = maxWidth >= 720.dp
             val effectiveMiniMode = state.miniModeEnabled || isCompactViewport
 
             val estimatedCtxTokens = remember(state.branchNodes, state.activeConversation) {
@@ -1004,6 +1206,14 @@ fun ChatScreen(
                                     )
                                 }
                                 Text(
+                                    text = if (state.ghostModeEnabled) "[ GHOST:ON ]" else "[ GHOST ]",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (state.ghostModeEnabled) SwissSignalRed else SwissInk,
+                                    modifier = Modifier
+                                        .clickable { viewModel.toggleGhostMode() }
+                                        .testTag("toggle_ghost_mode_button")
+                                )
+                                Text(
                                     text = "[ /HELP ]",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = SwissInk,
@@ -1011,6 +1221,16 @@ fun ChatScreen(
                                         .clickable { showHelpSheet = true }
                                         .testTag("open_help_header_button")
                                 )
+                                if (isWideScreen) {
+                                    Text(
+                                        text = if (splitCanvasPinned) "[ SPLIT:ON ]" else "[ SPLIT ]",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (splitCanvasPinned) SwissSignalRed else SwissInk,
+                                        modifier = Modifier
+                                            .clickable { splitCanvasPinned = !splitCanvasPinned }
+                                            .testTag("toggle_split_workspace_button")
+                                    )
+                                }
                                 Text(
                                     text = "[ PRESETS ]",
                                     style = MaterialTheme.typography.labelSmall,
@@ -1019,6 +1239,77 @@ fun ChatScreen(
                                         .clickable { showPersonaManager = true }
                                         .testTag("open_personas_header_button")
                                 )
+                            }
+                        }
+
+                        // Smart Context + Provider Health / 60s Rate-Limit Cooldown Strip
+                        val activeCooldowns = state.cooldownMap.mapNotNull { (modelId, untilMs) ->
+                            val remSec = ((untilMs - cooldownNowMs) / 1000L).toInt()
+                            if (remSec > 0) {
+                                val label = state.availableModels.firstOrNull { it.model.id == modelId }?.model?.displayName ?: "Model #$modelId"
+                                "$label (${remSec}s)"
+                            } else null
+                        }
+                        val smartCtx = state.smartContext
+                        val hasSmartStrip = state.timeProfilesEnabled ||
+                            smartCtx.isEcoModeActive ||
+                            smartCtx.matchedZone != null ||
+                            smartCtx.ambientDb != null ||
+                            state.wakePhraseEnabled ||
+                            activeCooldowns.isNotEmpty()
+                        if (hasSmartStrip) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(SwissCanvas)
+                                    .horizontalScroll(rememberScrollState())
+                                    .padding(horizontal = 12.dp, vertical = 3.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                if (state.wakePhraseEnabled) {
+                                    Text(
+                                        text = "HEY ALLCHAT: ON",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = SwissSignalRed
+                                    )
+                                }
+                                if (state.timeProfilesEnabled) {
+                                    Text(
+                                        text = "PROFILE // ${smartCtx.timeProfile.label.uppercase()}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = SwissInk
+                                    )
+                                }
+                                if (smartCtx.isEcoModeActive) {
+                                    Text(
+                                        text = "ECO ${smartCtx.batteryPercent}%",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = SwissSignalRed
+                                    )
+                                }
+                                smartCtx.matchedZone?.let { zone ->
+                                    Text(
+                                        text = "@${zone.name.uppercase()}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = SwissVerifiedInk
+                                    )
+                                    zone.quickChips.forEach { chip ->
+                                        Text(
+                                            text = "[ ${chip.take(20).uppercase()} ]",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = SwissInk,
+                                            modifier = Modifier.clickable { viewModel.sendMessage(chip) }
+                                        )
+                                    }
+                                }
+                                if (activeCooldowns.isNotEmpty()) {
+                                    Text(
+                                        text = "429 COOLDOWN // ${activeCooldowns.joinToString(", ")}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = SwissSignalRed
+                                    )
+                                }
                             }
                         }
 
@@ -1065,7 +1356,87 @@ fun ChatScreen(
                         }
                     }
 
-                    if (state.isStreaming || state.isGeneratingStudy || state.isGeneratingMindMap) {
+                    // Incognito Ghost Mode Banner
+                    if (state.ghostModeEnabled) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(SwissInk)
+                                .padding(horizontal = 12.dp, vertical = 6.dp)
+                                .testTag("ghost_mode_banner"),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Outlined.VisibilityOff,
+                                    contentDescription = "Ghost mode active",
+                                    tint = SwissSignalRed,
+                                    modifier = Modifier.size(15.dp)
+                                )
+                                Text(
+                                    text = "GHOST MODE // INCOGNITO · ZERO DB OR SEARCH WRITES",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SwissWhite,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            Text(
+                                text = "[ EXIT ]",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissSignalRed,
+                                modifier = Modifier.clickable { viewModel.toggleGhostMode() }
+                            )
+                        }
+                    }
+
+                    // 80% Daily Budget Warning Amber Badge + Auto-Downgrade Flagship Override
+                    if (state.isBudgetWarningActive) {
+                        val budgetPct = (state.budgetUsageRatio * 100.0).toInt()
+                        val amberBg = Color(0xFFFEF3C7)
+                        val amberFg = Color(0xFF92400E)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(amberBg)
+                                .border(1.dp, Color(0xFFD97706), RectangleShape)
+                                .padding(horizontal = 12.dp, vertical = 5.dp)
+                                .testTag("budget_warning_banner"),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = String.format(
+                                    Locale.US,
+                                    "BUDGET %d%% // $%.2f / $%.2f · %s",
+                                    budgetPct,
+                                    state.todaySpendUsd,
+                                    state.dailyBudgetConfig.dailyCapUsd,
+                                    if (state.forceFlagshipOverride) "FLAGSHIP MANUAL" else "AUTO-FLASH ACTIVE"
+                                ),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = amberFg,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text(
+                                text = if (state.forceFlagshipOverride) "[ AUTO-FLASH ]" else "[ OVERRIDE: FLAGSHIP ]",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissSignalRed,
+                                modifier = Modifier
+                                    .clickable { viewModel.toggleForceFlagshipOverride() }
+                                    .testTag("budget_flagship_override_button")
+                            )
+                        }
+                    }
+
+                    if (state.isStreaming || state.isGeneratingStudy || state.isGeneratingMindMap || state.isEnhancingPrompt || state.summarizingCheckpointMsgId != null) {
                         LinearProgressIndicator(
                             color = SwissSignalRed,
                             trackColor = SwissConcrete,
@@ -1141,14 +1512,19 @@ fun ChatScreen(
                 )
             }
 
-            // Messages Viewport
-            Box(
+            // Messages Viewport (Adaptive Side-by-Side Split-Tab Workspace on Tablets / Foldables)
+            Row(
                 modifier = Modifier
                     .weight(1f)
-                    .fillMaxWidth(),
+                    .fillMaxWidth()
+            ) {
+            Box(
+                modifier = Modifier
+                    .weight(if (isWideScreen && splitCanvasPinned) 1.15f else 1f)
+                    .fillMaxHeight(),
                 contentAlignment = Alignment.Center
             ) {
-                if (state.branchNodes.isEmpty()) {
+                if (displayedNodes.isEmpty()) {
                     ChatEmptyState(
                         hasConfiguredModels = state.availableModels.isNotEmpty(),
                         onOpenSettings = onOpenSettings,
@@ -1161,7 +1537,7 @@ fun ChatScreen(
                         state = listState,
                         contentPadding = PaddingValues(
                             start = 12.dp,
-                            end = if (state.branchNodes.count { it.message.role == "USER" } >= 3) 26.dp else 12.dp,
+                            end = if (displayedNodes.count { it.message.role == "USER" } >= 3) 26.dp else 12.dp,
                             top = 14.dp,
                             bottom = 14.dp
                         ),
@@ -1171,50 +1547,79 @@ fun ChatScreen(
                             .widthIn(max = 780.dp)
                     ) {
                         itemsIndexed(
-                            items = state.branchNodes,
+                            items = displayedNodes,
                             key = { _, node -> node.message.id }
                         ) { index, node ->
                             val msg = node.message
-                            val isLastAssistant = index == state.branchNodes.lastIndex && msg.role == "ASSISTANT"
-                            ChatMessageCell(
-                                index = index + 1,
-                                node = node,
-                                displayCurrency = state.displayCurrency,
-                                showDetails = state.showDetails,
-                                showThinking = state.showThinking,
-                                isStreamingThis = isLastAssistant && state.isStreaming,
-                                isSpeakingThis = speakingMessageId == msg.id,
-                                canModify = !state.isStreaming,
-                                isGeneratingStudy = state.isGeneratingStudy,
-                                isGeneratingMindMap = state.isGeneratingMindMap,
-                                onCopy = {
-                                    clipboard.setText(AnnotatedString(msg.content))
-                                    viewModel.showNotice("COPIED // Message copied to clipboard.")
-                                },
-                                onQuoteSwipe = {
-                                    viewModel.setQuotedMessage(msg)
-                                    viewModel.showNotice("QUOTE // Replying to message #${index + 1}.")
-                                },
-                                onToggleSpeak = { ttsController.toggleSpeak(msg.id, msg.content) },
-                                onEditUserMessage = { editingForkMessage = msg },
-                                onRegenerateBranch = { viewModel.regenerateAsBranch(msg) },
-                                onGenerateStudyPack = { viewModel.generateStudyPackForMessage(msg) },
-                                onGenerateMindMap = { viewModel.generateMindMapForMessage(msg) },
-                                onExportMessage = {
-                                    exportStudioPayload = (state.activeConversation?.title ?: "AllChat Response") to msg.content
-                                },
-                                onSwitchBranch = { targetId -> viewModel.switchBranch(node.parentKey, targetId) },
-                                onInspectJson = { inspectingMessage = msg },
-                                onOpenCitationUrl = { url ->
-                                    runCatching {
-                                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
-                                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            val isLastAssistant = index == displayedNodes.lastIndex && msg.role == "ASSISTANT"
+                            val checkpointAfter = if (!state.ghostModeEnabled) {
+                                state.threadCheckpoints.firstOrNull { it.afterMessageId == msg.id }
+                            } else null
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                ChatMessageCell(
+                                    index = index + 1,
+                                    node = node,
+                                    displayCurrency = state.displayCurrency,
+                                    showDetails = state.showDetails,
+                                    showThinking = state.showThinking,
+                                    isStreamingThis = isLastAssistant && state.isStreaming,
+                                    isSpeakingThis = speakingMessageId == msg.id,
+                                    canModify = !state.isStreaming && !state.ghostModeEnabled,
+                                    isGeneratingStudy = state.isGeneratingStudy,
+                                    isGeneratingMindMap = state.isGeneratingMindMap,
+                                    canCheckpoint = !state.ghostModeEnabled && index >= 2 && !state.isStreaming && msg.role == "ASSISTANT",
+                                    isSummarizingCheckpoint = state.summarizingCheckpointMsgId == msg.id,
+                                    factClaims = state.factCheckByMessageId[msg.id].orEmpty(),
+                                    isFactChecking = msg.id in state.checkingFactMessageIds,
+                                    onCopy = {
+                                        clipboard.setText(AnnotatedString(msg.content))
+                                        viewModel.showNotice("COPIED // Message copied to clipboard.")
+                                    },
+                                    onBeamQr = { qrDialogPayload = msg.content },
+                                    onQuoteSwipe = {
+                                        viewModel.setQuotedMessage(msg)
+                                        viewModel.showNotice("QUOTE // Replying to message #${index + 1}.")
+                                    },
+                                    onToggleSpeak = { ttsController.toggleSpeak(msg.id, msg.content) },
+                                    onEditUserMessage = { editingForkMessage = msg },
+                                    onEditAssistantMessage = { editingForkMessage = msg },
+                                    onSummarizeCheckpoint = { viewModel.createCheckpointAt(msg) },
+                                    onRegenerateBranch = { viewModel.regenerateAsBranch(msg) },
+                                    onGenerateStudyPack = { viewModel.generateStudyPackForMessage(msg) },
+                                    onGenerateMindMap = { viewModel.generateMindMapForMessage(msg) },
+                                    onOpenReadingRoom = {
+                                        readingRoomPayload = (state.activeConversation?.title ?: "Reading Room") to msg.content
+                                    },
+                                    onOpenCanvas = {
+                                        if (isWideScreen && splitCanvasPinned) {
+                                            splitCanvasDraft = msg.content
+                                        } else {
+                                            canvasInitialContent = msg.content
                                         }
-                                        context.startActivity(intent)
-                                    }
-                                },
-                                onOpenProxySettings = onOpenSettings
-                            )
+                                    },
+                                    onVerifyClaims = { viewModel.verifyMessageClaims(msg) },
+                                    onExportMessage = {
+                                        exportStudioPayload = (state.activeConversation?.title ?: "AllChat Response") to msg.content
+                                    },
+                                    onSwitchBranch = { targetId -> viewModel.switchBranch(node.parentKey, targetId) },
+                                    onInspectJson = { inspectingMessage = msg },
+                                    onOpenCitationUrl = { url ->
+                                        runCatching {
+                                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                            }
+                                            context.startActivity(intent)
+                                        }
+                                    },
+                                    onOpenProxySettings = onOpenSettings
+                                )
+                                if (checkpointAfter != null) {
+                                    ThreadCheckpointDividerCard(
+                                        checkpoint = checkpointAfter,
+                                        onDelete = { viewModel.deleteCheckpoint(checkpointAfter.id) }
+                                    )
+                                }
+                            }
                         }
 
                         // Smart 1-Tap Follow-Up Suggestion Pills below last AI response
@@ -1266,10 +1671,10 @@ fun ChatScreen(
 
                     // In-Chat Message Minimap / Jump-to-Question Scrubber Rail
                     ChatMinimapScrubber(
-                        branchNodes = state.branchNodes,
+                        branchNodes = displayedNodes,
                         currentVisibleIndex = listState.firstVisibleItemIndex,
                         onJumpToIndex = { targetIdx ->
-                            autoScrollEnabled = targetIdx >= state.branchNodes.lastIndex
+                            autoScrollEnabled = targetIdx >= displayedNodes.lastIndex
                             scope.launch { listState.animateScrollToItem(targetIdx) }
                         },
                         modifier = Modifier.align(Alignment.CenterEnd)
@@ -1291,8 +1696,8 @@ fun ChatScreen(
                                 .clickable {
                                     autoScrollEnabled = true
                                     scope.launch {
-                                        if (state.branchNodes.isNotEmpty()) {
-                                            listState.animateScrollToItem(state.branchNodes.lastIndex)
+                                        if (displayedNodes.isNotEmpty()) {
+                                            listState.animateScrollToItem(displayedNodes.lastIndex)
                                         }
                                     }
                                 }
@@ -1312,6 +1717,192 @@ fun ChatScreen(
                                 style = MaterialTheme.typography.labelSmall,
                                 color = SwissWhite
                             )
+                        }
+                    }
+                }
+            }
+
+                // True Side-by-Side Adaptive Split Workspace Pane (Tablet / Foldable >= 720dp)
+                if (isWideScreen && splitCanvasPinned) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .width(1.dp)
+                            .background(SwissInk)
+                    )
+                    Column(
+                        modifier = Modifier
+                            .weight(0.85f)
+                            .fillMaxHeight()
+                            .background(SwissPaper)
+                            .testTag("wide_split_workspace_pane")
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(SwissInk)
+                                .padding(horizontal = 10.dp, vertical = 6.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text(
+                                    text = "[ CANVAS ]",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (splitPaneTab == 0) SwissSignalRed else SwissWhite,
+                                    modifier = Modifier
+                                        .clickable { splitPaneTab = 0 }
+                                        .testTag("split_tab_canvas")
+                                )
+                                Text(
+                                    text = "[ PLOTTER ]",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (splitPaneTab == 1) SwissSignalRed else SwissWhite,
+                                    modifier = Modifier
+                                        .clickable { splitPaneTab = 1 }
+                                        .testTag("split_tab_plotter")
+                                )
+                            }
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text(
+                                    text = "[ FULL ]",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SwissWhite,
+                                    modifier = Modifier.clickable {
+                                        if (splitPaneTab == 0) {
+                                            canvasInitialContent = splitCanvasDraft
+                                        } else {
+                                            plotterInitialExpr = splitPlotExpr
+                                        }
+                                    }
+                                )
+                                Text(
+                                    text = "[ X ]",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SwissSignalRed,
+                                    modifier = Modifier.clickable { splitCanvasPinned = false }
+                                )
+                            }
+                        }
+
+                        if (splitPaneTab == 0) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(10.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                OutlinedTextField(
+                                    value = splitCanvasDraft,
+                                    onValueChange = { splitCanvasDraft = it },
+                                    label = { Text("LIVE DOCUMENT CANVAS // SIDE-BY-SIDE") },
+                                    shape = RectangleShape,
+                                    colors = swissTextFieldColors(containerColor = SwissCanvas),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .fillMaxWidth()
+                                        .testTag("split_canvas_editor")
+                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    SwissToggleCell(
+                                        label = "SAVE V+",
+                                        selected = false,
+                                        onClick = {
+                                            if (splitCanvasDraft.isNotBlank()) {
+                                                viewModel.saveCanvasVersion("Split Canvas", splitCanvasDraft)
+                                            }
+                                        },
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    SwissToggleCell(
+                                        label = "SEND TO CHAT",
+                                        selected = true,
+                                        useSignalRedWhenSelected = true,
+                                        onClick = {
+                                            if (splitCanvasDraft.isNotBlank()) {
+                                                viewModel.sendMessage("Review and improve this canvas draft:\n\n$splitCanvasDraft")
+                                            }
+                                        },
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                }
+                            }
+                        } else {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(10.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                OutlinedTextField(
+                                    value = splitPlotExpr,
+                                    onValueChange = { splitPlotExpr = it },
+                                    label = { Text("f(x) =  (sin, cos, x^2, exp, sqrt)") },
+                                    singleLine = true,
+                                    shape = RectangleShape,
+                                    colors = swissTextFieldColors(containerColor = SwissCanvas),
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                                Canvas(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .fillMaxWidth()
+                                        .background(SwissCanvas)
+                                        .border(1.dp, SwissInk, RectangleShape)
+                                ) {
+                                    val w = size.width
+                                    val h = size.height
+                                    val midX = w / 2f
+                                    val midY = h / 2f
+                                    val xSpan = 10f
+                                    for (g in -5..5) {
+                                        val gx = midX + (g / xSpan) * (w / 2f)
+                                        drawLine(SwissGridLine, Offset(gx, 0f), Offset(gx, h), 1f)
+                                        val gy = midY - (g / xSpan) * (h / 2f)
+                                        drawLine(SwissGridLine, Offset(0f, gy), Offset(w, gy), 1f)
+                                    }
+                                    drawLine(SwissInk, Offset(0f, midY), Offset(w, midY), 1.5f)
+                                    drawLine(SwissInk, Offset(midX, 0f), Offset(midX, h), 1.5f)
+                                    val path = Path()
+                                    var started = false
+                                    val steps = 220
+                                    for (i in 0..steps) {
+                                        val xVal = -xSpan + (2f * xSpan * i / steps)
+                                        val yVal = MathExpressionEvaluator.evaluate(splitPlotExpr, xVal.toDouble())
+                                        if (yVal != null && yVal.isFinite()) {
+                                            val px = (i.toFloat() / steps) * w
+                                            val py = midY - (yVal.toFloat() / xSpan) * (h / 2f)
+                                            if (py in -h..2f * h) {
+                                                if (!started) {
+                                                    path.moveTo(px, py)
+                                                    started = true
+                                                } else {
+                                                    path.lineTo(px, py)
+                                                }
+                                            } else {
+                                                started = false
+                                            }
+                                        } else {
+                                            started = false
+                                        }
+                                    }
+                                    if (started) {
+                                        drawPath(path, color = SwissSignalRed, style = Stroke(width = 3f))
+                                    }
+                                }
+                                SwissToggleCell(
+                                    label = "ASK AI ABOUT f(x)",
+                                    selected = true,
+                                    useSignalRedWhenSelected = true,
+                                    onClick = {
+                                        viewModel.sendMessage("Analyze the function f(x) = $splitPlotExpr: domain, roots, extrema, and asymptotes.")
+                                    },
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            }
                         }
                     }
                 }
@@ -1337,7 +1928,7 @@ fun ChatScreen(
                             action = devAction,
                             quickContacts = state.quickContacts,
                             onUpdateAction = viewModel::setPendingDeviceAction,
-                            onSaveQuickContact = viewModel::saveQuickContact,
+                            onSaveQuickContact = { name, phone -> viewModel.saveQuickContact(name, phone) },
                             onExecute = {
                                 DeviceActionEngine.execute(context, devAction)
                                     .onSuccess { msg ->
@@ -1588,6 +2179,28 @@ fun ChatScreen(
                                     )
                                 }
                                 SwissIconCell(
+                                    icon = Icons.Outlined.Brush,
+                                    contentDescription = "Circle-to-Ask or Censor image",
+                                    onClick = {
+                                        val bmp = runCatching {
+                                            val parsed = Uri.parse(uriStr)
+                                            if (parsed.scheme == "file" || uriStr.startsWith("/")) {
+                                                BitmapFactory.decodeFile(parsed.path ?: uriStr)
+                                            } else {
+                                                context.contentResolver.openInputStream(parsed)?.use { BitmapFactory.decodeStream(it) }
+                                            }
+                                        }.getOrNull()
+                                        if (bmp != null) {
+                                            annotatingBitmap = bmp
+                                        } else {
+                                            viewModel.showToast("Unable to decode image for markup.")
+                                        }
+                                    },
+                                    accent = true,
+                                    cellSize = 36.dp,
+                                    modifier = Modifier.testTag("annotate_attachment_button")
+                                )
+                                SwissIconCell(
                                     icon = Icons.Filled.Close,
                                     contentDescription = "Remove attachment",
                                     onClick = viewModel::clearAttachment,
@@ -1650,6 +2263,54 @@ fun ChatScreen(
                         },
                         onOpenKnowledgeBase = onOpenKnowledge
                     )
+                }
+
+                val lastMentionWord = lastWord.takeIf { it.startsWith("@") && !it.startsWith("@http", ignoreCase = true) }
+                val matchingWorkspaceFiles = remember(lastMentionWord, state.workspaceFiles) {
+                    if (lastMentionWord == null || state.workspaceFiles.isEmpty()) {
+                        emptyList()
+                    } else {
+                        val needle = lastMentionWord.removePrefix("@").trim()
+                        state.workspaceFiles.filter {
+                            needle.isEmpty() ||
+                                it.name.contains(needle, ignoreCase = true) ||
+                                it.relativePath.contains(needle, ignoreCase = true)
+                        }.take(8)
+                    }
+                }
+
+                AnimatedVisibility(visible = !typingSlashCommand && !typingHashDoc && matchingWorkspaceFiles.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(SwissPaper)
+                            .border(1.dp, SwissInk, RectangleShape)
+                            .horizontalScroll(rememberScrollState())
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "@FILES",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SwissSignalRed
+                        )
+                        matchingWorkspaceFiles.forEach { fileEntry ->
+                            Text(
+                                text = "@${fileEntry.name}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissInk,
+                                modifier = Modifier
+                                    .background(SwissCanvas, RectangleShape)
+                                    .border(1.dp, SwissInk, RectangleShape)
+                                    .clickable {
+                                        val prefixLen = inputText.length - (lastMentionWord?.length ?: 0)
+                                        inputText = inputText.substring(0, prefixLen) + "@${fileEntry.name} "
+                                    }
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
                 }
 
                 AnimatedVisibility(visible = !typingSlashCommand && !typingHashDoc && (showPersonaQuickBar || typingMention)) {
@@ -1925,6 +2586,68 @@ fun ChatScreen(
                         onClick = { showMemoryBank = true },
                         modifier = Modifier.testTag("composer_memory_chip")
                     )
+
+                    SwissToggleCell(
+                        label = if (state.isSavingNote) "SAVING…" else "NOTES (${state.voiceNotes.size})",
+                        selected = state.isSavingNote,
+                        onClick = { showVoiceNotesSheet = true },
+                        modifier = Modifier.testTag("composer_voice_notes_chip")
+                    )
+
+                    SwissToggleCell(
+                        label = "TOOLKIT (18)",
+                        selected = true,
+                        useSignalRedWhenSelected = true,
+                        onClick = { showToolkitHub = true },
+                        modifier = Modifier.testTag("composer_toolkit_hub_chip")
+                    )
+
+                    SwissToggleCell(
+                        label = if (state.tokenDietEnabled) "DIET: ON" else "DIET",
+                        selected = state.tokenDietEnabled,
+                        useSignalRedWhenSelected = true,
+                        onClick = viewModel::toggleTokenDiet,
+                        modifier = Modifier.testTag("composer_token_diet_chip")
+                    )
+
+                    SwissToggleCell(
+                        label = if (state.guidedModeEnabled) "GUIDED: ON" else "GUIDED",
+                        selected = state.guidedModeEnabled,
+                        useSignalRedWhenSelected = true,
+                        onClick = viewModel::toggleGuidedMode,
+                        modifier = Modifier.testTag("composer_guided_mode_chip")
+                    )
+
+                    SwissToggleCell(
+                        label = if (state.verifyFixEnabled) "VERIFY: ON" else "VERIFY",
+                        selected = state.verifyFixEnabled,
+                        useSignalRedWhenSelected = true,
+                        onClick = viewModel::toggleVerifyFix,
+                        modifier = Modifier.testTag("composer_verify_fix_chip")
+                    )
+
+                    SwissToggleCell(
+                        label = "@FILES (${state.workspaceFiles.size})",
+                        selected = state.workspaceFiles.isNotEmpty(),
+                        onClick = { showLocalWorkspace = true },
+                        modifier = Modifier.testTag("composer_workspace_chip")
+                    )
+
+                    SwissToggleCell(
+                        label = "VAULT (${state.clipboardHistory.size})",
+                        selected = state.clipboardHistory.isNotEmpty(),
+                        onClick = { showClipboardVault = true },
+                        modifier = Modifier.testTag("composer_clipboard_vault_chip")
+                    )
+
+                    state.routines.forEach { routine ->
+                        SwissToggleCell(
+                            label = "⚡ ${routine.name.uppercase()}",
+                            selected = false,
+                            onClick = { viewModel.runRoutine(routine) },
+                            modifier = Modifier.testTag("composer_routine_chip_${routine.id}")
+                        )
+                    }
                 }
                 Box(
                     modifier = Modifier
@@ -1932,6 +2655,43 @@ fun ChatScreen(
                         .height(1.dp)
                         .background(SwissConcrete)
                 )
+                }
+
+                // Read-Aloud Karaoke Mini Audio Player Bar
+                val ambientLabel = state.smartContext.ambientDb?.let { db ->
+                    when (state.smartContext.noiseLevel) {
+                        AmbientNoiseLevel.QUIET_WHISPER -> "${db}dB WHISPER"
+                        AmbientNoiseLevel.NOISY_BOOST -> "${db}dB BOOST"
+                        AmbientNoiseLevel.NORMAL -> "${db}dB"
+                    }
+                }
+                ReadAloudKaraokeBar(
+                    state = ttsPlaybackState,
+                    ambientDbLabel = ambientLabel,
+                    onTogglePauseResume = { ttsController.togglePauseResume() },
+                    onRewind = { ttsController.rewindSentence() },
+                    onSkip = { ttsController.skipSentence() },
+                    onCycleSpeed = {
+                        val speeds = listOf(0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
+                        val curIdx = speeds.indexOfFirst { kotlin.math.abs(it - ttsPlaybackState.speed) < 0.05f }
+                        val nextSpeed = speeds[(curIdx + 1) % speeds.size]
+                        ttsController.setPlaybackSpeed(nextSpeed)
+                    },
+                    onStop = { ttsController.stop() }
+                )
+
+                // Negative-Constraint Quick Pill Bar directly above the keyboard
+                if (!effectiveMiniMode) {
+                    NegativeConstraintPillBar(
+                        activeConstraints = state.activeConstraints,
+                        onToggleConstraint = viewModel::toggleConstraint
+                    )
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(1.dp)
+                            .background(SwissConcrete)
+                    )
                 }
 
                 Row(
@@ -1956,8 +2716,12 @@ fun ChatScreen(
                         onValueChange = { inputText = it },
                         placeholder = {
                             Text(
-                                if (isDictating) {
+                                if (state.isEnhancingPrompt) {
+                                    "PROMPT DOCTOR // OPTIMIZING…"
+                                } else if (isDictating) {
                                     "LISTENING // SPEAK NOW…"
+                                } else if (state.ghostModeEnabled) {
+                                    "GHOST PROMPT // NOT SAVED…"
                                 } else if (state.selectedModel != null) {
                                     "PROMPT // ${state.selectedModel?.model?.displayName}…"
                                 } else {
@@ -1974,6 +2738,21 @@ fun ChatScreen(
                         modifier = Modifier
                             .weight(1f)
                             .testTag("chat_prompt_input")
+                    )
+
+                    // 1-Tap Prompt Doctor ("✨ Enhance Prompt") Magic Wand
+                    SwissIconCell(
+                        icon = Icons.Outlined.AutoFixHigh,
+                        contentDescription = "Enhance prompt with Prompt Doctor",
+                        onClick = {
+                            viewModel.enhancePrompt(inputText) { rewritten ->
+                                inputText = rewritten
+                            }
+                        },
+                        enabled = inputText.isNotBlank() && !state.isEnhancingPrompt && !state.isStreaming,
+                        accent = state.isEnhancingPrompt,
+                        cellSize = 48.dp,
+                        modifier = Modifier.testTag("enhance_prompt_wand_button")
                     )
 
                     // Voice-to-Prompt Microphone Button
@@ -2017,12 +2796,10 @@ fun ChatScreen(
                                 if (isDictating) voiceController.stop()
                                 val prompt = inputText
                                 inputText = ""
-                                if (state.liveCamEnabled) {
-                                    val frame = liveCamController.grabCurrentFrameBitmap()
-                                    viewModel.sendMessageWithOptionalLiveFrame(prompt, frame)
-                                } else {
-                                    viewModel.sendMessage(prompt)
-                                }
+                                val frame = if (state.liveCamEnabled) {
+                                    liveCamController.grabCurrentFrameBitmap()
+                                } else null
+                                viewModel.sendMessageWithWorkspaceContext(context, prompt, frame)
                             },
                             enabled = inputText.isNotBlank() ||
                                 state.pendingAttachmentUri != null ||
@@ -2071,6 +2848,18 @@ fun ChatScreen(
                             .fillMaxWidth()
                             .border(1.dp, SwissInk, RectangleShape)
                     ) {
+                        StudioToolRow(
+                            index = "★",
+                            title = "Power Toolkit Hub (18 Studios)",
+                            subtitle = "QR Drop Zone, Voice Form Filler, CLI Builder, Plotter, Canvas, CSV, BLE, Commute & more",
+                            icon = Icons.Outlined.Bolt,
+                            onClick = {
+                                showPlusMenu = false
+                                showToolkitHub = true
+                            },
+                            testTag = "plus_menu_power_toolkit"
+                        )
+                        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(SwissInk))
                         StudioToolRow(
                             index = "00",
                             title = "Arena Compare",
@@ -2322,9 +3111,33 @@ fun ChatScreen(
                         )
                         Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(SwissInk))
                         StudioToolRow(
-                            index = "18",
+                            index = "19",
+                            title = "Voice Form Filler (/form)",
+                            subtitle = "Dictate into structured Standup, Bug Report, Workout, or Lab Log templates",
+                            icon = Icons.Outlined.EditNote,
+                            onClick = {
+                                showPlusMenu = false
+                                showVoiceFormFiller = true
+                            },
+                            testTag = "plus_menu_voice_form"
+                        )
+                        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(SwissInk))
+                        StudioToolRow(
+                            index = "20",
+                            title = "Interactive CLI Command Builder (/cmd)",
+                            subtitle = "FFmpeg, ADB, Git, Bash & PowerShell cards with flag tooltips & editable inputs",
+                            icon = Icons.Outlined.Terminal,
+                            onClick = {
+                                showPlusMenu = false
+                                cliBuilderQuery = ""
+                            },
+                            testTag = "plus_menu_cli_builder"
+                        )
+                        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(SwissInk))
+                        StudioToolRow(
+                            index = "21",
                             title = "Slash Commands Reference (/help)",
-                            subtitle = "All built-in commands: /remember, /mcp, /init, /compact, /undo, /export",
+                            subtitle = "All built-in commands: /cmd, /form, /ghost, /remember, /mcp, /compact, /export",
                             icon = Icons.Outlined.Terminal,
                             onClick = {
                                 showPlusMenu = false
@@ -2451,7 +3264,11 @@ fun ChatScreen(
             onDismiss = { editingForkMessage = null },
             onConfirmFork = { newText ->
                 editingForkMessage = null
-                viewModel.editMessageAndFork(targetMsg, newText)
+                if (targetMsg.role == "ASSISTANT") {
+                    viewModel.editAndForkAssistantMessage(targetMsg, newText)
+                } else {
+                    viewModel.editMessageAndFork(targetMsg, newText)
+                }
             }
         )
     }
@@ -2563,6 +3380,17 @@ fun ChatScreen(
         )
     }
 
+    if (showVoiceNotesSheet) {
+        VoiceNotesInboxSheet(
+            notes = state.voiceNotes,
+            isSavingNote = state.isSavingNote,
+            onSaveNewMemo = viewModel::saveVoiceQuickNote,
+            onUpdateNote = viewModel::updateVoiceNote,
+            onDeleteNote = viewModel::deleteVoiceNote,
+            onDismiss = { showVoiceNotesSheet = false }
+        )
+    }
+
     state.activeStudyPack?.let { pack ->
         StudyQuizDialog(
             studyPack = pack,
@@ -2573,6 +3401,8 @@ fun ChatScreen(
     state.activeMindMap?.let { rootNode ->
         MindMapDialog(
             rootNode = rootNode,
+            isExpandingNode = state.isExpandingMindMapNode,
+            onExpandSubTopic = viewModel::expandMindMapNode,
             onDismiss = viewModel::dismissMindMap
         )
     }
@@ -2603,6 +3433,284 @@ fun ChatScreen(
             title = title,
             markdownContent = markdown,
             onDismiss = { exportStudioPayload = null }
+        )
+    }
+
+    // Power Toolkit 16-Tool Launcher Hub
+    if (showToolkitHub) {
+        PowerToolkitHubDialog(
+            onDismiss = { showToolkitHub = false },
+            onSelectTool = { action ->
+                showToolkitHub = false
+                when (action) {
+                    PowerToolAction.INTERACTIVE_CANVAS -> canvasInitialContent = state.branchNodes.lastOrNull { it.message.role == "ASSISTANT" }?.message?.content.orEmpty()
+                    PowerToolAction.SPOTLIGHT_SEARCH -> showSpotlightDialog = true
+                    PowerToolAction.EXPENSE_TRACKER -> showExpensesDialog = true
+                    PowerToolAction.WATCHLIST -> showWatchlistDialog = true
+                    PowerToolAction.GRAPH_PLOTTER -> plotterInitialExpr = "a * sin(b * x) + c"
+                    PowerToolAction.DECISION_MATRIX -> decisionInitialPrompt = ""
+                    PowerToolAction.CSV_EXPLORER -> showCsvExplorer = true
+                    PowerToolAction.LOCAL_WORKSPACE -> showLocalWorkspace = true
+                    PowerToolAction.FACE_INTERPRETER -> showInterpreter = true
+                    PowerToolAction.COMMUTE_HUD -> showCommuteHud = true
+                    PowerToolAction.BLE_INSPECTOR -> showBleInspector = true
+                    PowerToolAction.QR_GENERATOR -> qrDialogPayload = ""
+                    PowerToolAction.VIDEO_FRAME -> showVideoExtractor = true
+                    PowerToolAction.COLOR_PALETTE -> {
+                        paletteInitialBitmap = null
+                        showColorPalette = true
+                    }
+                    PowerToolAction.PRIVACY_REDACTOR -> redactorInitialText = inputText
+                    PowerToolAction.CLIPBOARD_VAULT -> showClipboardVault = true
+                    PowerToolAction.VOICE_FORM_FILLER -> showVoiceFormFiller = true
+                    PowerToolAction.CLI_COMMAND_BUILDER -> cliBuilderQuery = ""
+                }
+            }
+        )
+    }
+
+    annotatingBitmap?.let { bmp ->
+        ImageAnnotatorDialog(
+            sourceBitmap = bmp,
+            onDismiss = { annotatingBitmap = null },
+            onApplyAnnotatedBitmap = { annotated ->
+                annotatingBitmap = null
+                viewModel.attachBitmapAndSelectVision(annotated, label = "Marked-Up Image")
+            },
+            onExtractPalette = { extracted ->
+                annotatingBitmap = null
+                paletteInitialBitmap = extracted
+                showColorPalette = true
+            }
+        )
+    }
+
+    qrDialogPayload?.let { payload ->
+        QrStudioDialog(
+            initialPayload = payload,
+            onDismiss = { qrDialogPayload = null },
+            onNotify = { viewModel.showNotice(it) }
+        )
+    }
+
+    if (showVideoExtractor) {
+        VideoFrameExtractorDialog(
+            onDismiss = { showVideoExtractor = false },
+            onSendFrameToAi = { frameBmp, label ->
+                showVideoExtractor = false
+                viewModel.attachBitmapAndSelectVision(frameBmp, label = label)
+            }
+        )
+    }
+
+    if (showColorPalette) {
+        ColorPaletteDialog(
+            initialBitmap = paletteInitialBitmap,
+            onDismiss = {
+                showColorPalette = false
+                paletteInitialBitmap = null
+            },
+            onNotify = { viewModel.showNotice(it) }
+        )
+    }
+
+    redactorInitialText?.let { initial ->
+        PrivacyRedactorDialog(
+            initialText = initial,
+            onDismiss = { redactorInitialText = null },
+            onAskAiWithRedacted = { sanitized ->
+                redactorInitialText = null
+                inputText = sanitized
+            },
+            onNotify = { viewModel.showNotice(it) }
+        )
+    }
+
+    plotterInitialExpr?.let { expr ->
+        InteractiveGraphPlotterDialog(
+            initialExpression = expr,
+            onDismiss = { plotterInitialExpr = null },
+            onAskAiExplain = { prompt ->
+                plotterInitialExpr = null
+                viewModel.sendMessage(prompt)
+            }
+        )
+    }
+
+    if (showCsvExplorer) {
+        CsvChartExplorerDialog(
+            onDismiss = { showCsvExplorer = false },
+            onAskAiInsights = { prompt ->
+                showCsvExplorer = false
+                viewModel.sendMessage(prompt)
+            }
+        )
+    }
+
+    if (decisionInitialPrompt != null || state.activeDecisionMatrix != null) {
+        DecisionMatrixDialog(
+            initialPrompt = decisionInitialPrompt.orEmpty(),
+            matrix = state.activeDecisionMatrix,
+            isBuilding = state.isBuildingMatrix,
+            onBuildMatrix = viewModel::buildDecisionMatrix,
+            onDismiss = {
+                decisionInitialPrompt = null
+                viewModel.dismissDecisionMatrix()
+            }
+        )
+    }
+
+    readingRoomPayload?.let { (title, content) ->
+        ReadingRoomDialog(
+            title = title,
+            markdownContent = content,
+            onDismiss = { readingRoomPayload = null },
+            onAskAboutPassage = { passage ->
+                readingRoomPayload = null
+                inputText = "Explain this passage in more detail:\n\n> $passage\n\n"
+            }
+        )
+    }
+
+    canvasInitialContent?.let { content ->
+        InteractiveCanvasDialog(
+            initialContent = content,
+            versions = state.canvasVersions,
+            workspaceFiles = state.workspaceFiles,
+            onSaveVersion = viewModel::saveCanvasVersion,
+            onAiEditBlock = { fullDoc, selected, instr ->
+                viewModel.editCanvasSelection(fullDoc, selected, instr)
+            },
+            onNotify = { viewModel.showNotice(it) },
+            onDismiss = { canvasInitialContent = null }
+        )
+    }
+
+    if (showExpensesDialog) {
+        ExpenseTrackerDialog(
+            expenses = state.expenses,
+            onSaveExpense = viewModel::saveExpense,
+            onDeleteExpense = viewModel::deleteExpense,
+            onScanReceiptBitmap = { bmp -> viewModel.scanReceiptBitmap(bmp) },
+            onNotify = { viewModel.showNotice(it) },
+            onDismiss = { showExpensesDialog = false }
+        )
+    }
+
+    if (showWatchlistDialog) {
+        WatchlistDialog(
+            items = state.watchlist,
+            onAddItem = viewModel::saveWatchlistItem,
+            onDeleteItem = viewModel::deleteWatchlistItem,
+            onCheckItem = { item -> viewModel.checkWatchlistItem(item) },
+            onNotify = { viewModel.showNotice(it) },
+            onDismiss = { showWatchlistDialog = false }
+        )
+    }
+
+    if (showSpotlightDialog) {
+        SpotlightSearchDialog(
+            onSearch = { q, f -> viewModel.spotlightSearch(q, f) },
+            onLoadTopicClusters = { viewModel.loadTopicClusters() },
+            onOpenConversation = { cid ->
+                showSpotlightDialog = false
+                viewModel.selectConversation(cid)
+            },
+            onDismiss = { showSpotlightDialog = false }
+        )
+    }
+
+    if (showClipboardVault) {
+        ClipboardVaultDialog(
+            snippets = state.clipboardHistory,
+            onMergeAndSend = { merged ->
+                showClipboardVault = false
+                viewModel.sendMessage(merged)
+            },
+            onDeleteSnippet = viewModel::deleteClipboardSnippet,
+            onClearAll = viewModel::clearClipboardVault,
+            onDismiss = { showClipboardVault = false }
+        )
+    }
+
+    if (showBleInspector) {
+        BleInspectorDialog(
+            onSendTelemetryToAi = { log ->
+                showBleInspector = false
+                viewModel.sendMessage(log)
+            },
+            onDismiss = { showBleInspector = false }
+        )
+    }
+
+    if (showLocalWorkspace) {
+        LocalWorkspaceDialog(
+            workspaceUri = state.localWorkspaceUri,
+            files = state.workspaceFiles,
+            onMountFolder = { treeUri -> viewModel.setLocalWorkspaceTree(context, treeUri) },
+            onRefreshFiles = { viewModel.refreshWorkspaceFiles(context) },
+            onInjectFileIntoPrompt = { fileName, fileContent ->
+                showLocalWorkspace = false
+                inputText = buildString {
+                    if (inputText.isNotBlank()) appendLine(inputText)
+                    appendLine("File: @$fileName")
+                    appendLine("```")
+                    appendLine(fileContent.take(6000))
+                    appendLine("```")
+                }
+                viewModel.showNotice("WORKSPACE // Loaded @$fileName into prompt.")
+            },
+            onDismiss = { showLocalWorkspace = false }
+        )
+    }
+
+    if (showCommuteHud) {
+        CommuteHudDialog(
+            wakePhraseEnabled = state.wakePhraseEnabled,
+            lastAssistantReply = state.branchNodes.lastOrNull { it.message.role == "ASSISTANT" }?.message?.content.orEmpty(),
+            onSubmitVoicePrompt = { spoken -> viewModel.sendMessage(spoken) },
+            onReadLastReply = {
+                val last = state.branchNodes.lastOrNull { it.message.role == "ASSISTANT" }?.message
+                if (last != null) ttsController.speak(last.id, last.content)
+            },
+            onQuickNavigateHome = {
+                viewModel.sendMessage("Navigate home on Google Maps")
+            },
+            onDismiss = { showCommuteHud = false }
+        )
+    }
+
+    if (showInterpreter) {
+        FaceToFaceInterpreterDialog(
+            onTranslate = { text, fromLang, toLang ->
+                viewModel.translateInterpreterUtterance(text, fromLang, toLang)
+            },
+            onDismiss = { showInterpreter = false }
+        )
+    }
+
+    if (showVoiceFormFiller) {
+        VoiceFormFillerDialog(
+            templates = state.voiceFormTemplates,
+            onSaveTemplates = viewModel::saveVoiceFormTemplates,
+            onFillWithAi = { tpl, transcript -> viewModel.fillVoiceForm(tpl, transcript) },
+            onSendToChat = { markdownTable ->
+                viewModel.sendMessage(markdownTable)
+            },
+            onDismiss = { showVoiceFormFiller = false },
+            onNotify = { viewModel.showNotice(it) }
+        )
+    }
+
+    cliBuilderQuery?.let { initialQ ->
+        CliCommandBuilderDialog(
+            initialQuery = initialQ,
+            onBuildCommand = { q -> viewModel.buildCliCommand(q) },
+            onSendToChat = { cmdText ->
+                viewModel.sendMessage("Explain and verify this command:\n```bash\n$cmdText\n```")
+            },
+            onDismiss = { cliBuilderQuery = null },
+            onNotify = { viewModel.showNotice(it) }
         )
     }
 }
@@ -2714,13 +3822,23 @@ private fun ChatMessageCell(
     canModify: Boolean,
     isGeneratingStudy: Boolean,
     isGeneratingMindMap: Boolean,
+    canCheckpoint: Boolean = false,
+    isSummarizingCheckpoint: Boolean = false,
+    factClaims: List<FactCheckClaim> = emptyList(),
+    isFactChecking: Boolean = false,
     onCopy: () -> Unit,
+    onBeamQr: () -> Unit = {},
     onQuoteSwipe: () -> Unit,
     onToggleSpeak: () -> Unit,
     onEditUserMessage: () -> Unit,
+    onEditAssistantMessage: () -> Unit = {},
+    onSummarizeCheckpoint: () -> Unit = {},
     onRegenerateBranch: () -> Unit,
     onGenerateStudyPack: () -> Unit,
     onGenerateMindMap: () -> Unit,
+    onOpenReadingRoom: () -> Unit = {},
+    onOpenCanvas: () -> Unit = {},
+    onVerifyClaims: () -> Unit = {},
     onExportMessage: () -> Unit,
     onSwitchBranch: (Long) -> Unit,
     onInspectJson: () -> Unit,
@@ -2815,6 +3933,21 @@ private fun ChatMessageCell(
                                 onSwitchBranch = onSwitchBranch,
                                 inverted = true
                             )
+                            if (message.content.isNotBlank()) {
+                                Box(
+                                    modifier = Modifier
+                                        .clickable(onClick = onBeamQr)
+                                        .padding(2.dp)
+                                        .testTag("beam_qr_user_${message.id}")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Outlined.QrCode2,
+                                        contentDescription = "Beam via QR",
+                                        tint = SwissConcrete,
+                                        modifier = Modifier.size(15.dp)
+                                    )
+                                }
+                            }
                             if (canModify) {
                                 Box(
                                     modifier = Modifier
@@ -2950,8 +4083,34 @@ private fun ChatMessageCell(
                                     BranchSwitcherBar(node = node, onSwitchBranch = onSwitchBranch)
                                 }
 
-                                Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                                Row(
+                                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                ) {
                                     if (canModify) {
+                                        SwissIconCell(
+                                            icon = Icons.Outlined.FactCheck,
+                                            contentDescription = "Fact-check claims",
+                                            onClick = onVerifyClaims,
+                                            enabled = !isFactChecking,
+                                            accent = factClaims.isNotEmpty(),
+                                            cellSize = 36.dp,
+                                            modifier = Modifier.testTag("fact_check_${message.id}")
+                                        )
+                                        SwissIconCell(
+                                            icon = Icons.Outlined.Book,
+                                            contentDescription = "Open in Reading Room",
+                                            onClick = onOpenReadingRoom,
+                                            cellSize = 36.dp,
+                                            modifier = Modifier.testTag("reading_room_${message.id}")
+                                        )
+                                        SwissIconCell(
+                                            icon = Icons.Outlined.EditNote,
+                                            contentDescription = "Open in Interactive Canvas",
+                                            onClick = onOpenCanvas,
+                                            cellSize = 36.dp,
+                                            modifier = Modifier.testTag("open_canvas_${message.id}")
+                                        )
                                         SwissIconCell(
                                             icon = Icons.Outlined.School,
                                             contentDescription = "Generate Study Flashcards & Quiz",
@@ -2987,6 +4146,24 @@ private fun ChatMessageCell(
                                         modifier = Modifier.testTag("tts_speak_${message.id}")
                                     )
                                     SwissIconCell(
+                                        icon = Icons.Outlined.QrCode2,
+                                        contentDescription = "Beam via QR (Single or Animated Multi-QR)",
+                                        onClick = onBeamQr,
+                                        cellSize = 36.dp,
+                                        modifier = Modifier.testTag("beam_qr_${message.id}")
+                                    )
+                                    if (canCheckpoint) {
+                                        SwissIconCell(
+                                            icon = Icons.Outlined.BookmarkAdd,
+                                            contentDescription = "Summarize up to here (TL;DR Checkpoint)",
+                                            onClick = onSummarizeCheckpoint,
+                                            enabled = !isSummarizingCheckpoint,
+                                            accent = isSummarizingCheckpoint,
+                                            cellSize = 36.dp,
+                                            modifier = Modifier.testTag("checkpoint_summarize_${message.id}")
+                                        )
+                                    }
+                                    SwissIconCell(
                                         icon = Icons.Outlined.IosShare,
                                         contentDescription = "Export Studio (PDF, DOCX, Notion MD, Share)",
                                         onClick = onExportMessage,
@@ -3001,12 +4178,70 @@ private fun ChatMessageCell(
                                     )
                                     if (canModify) {
                                         SwissIconCell(
+                                            icon = Icons.Outlined.Edit,
+                                            contentDescription = "Edit and branch AI response",
+                                            onClick = onEditAssistantMessage,
+                                            cellSize = 36.dp,
+                                            modifier = Modifier.testTag("edit_fork_ai_${message.id}")
+                                        )
+                                        SwissIconCell(
                                             icon = Icons.Outlined.Refresh,
                                             contentDescription = "Regenerate as new branch",
                                             onClick = onRegenerateBranch,
                                             cellSize = 36.dp,
                                             modifier = Modifier.testTag("regenerate_button")
                                         )
+                                    }
+                                }
+                            }
+
+                            // Inline Fact-Check Verification Results
+                            if (factClaims.isNotEmpty()) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .background(SwissCanvas, RectangleShape)
+                                        .border(1.dp, SwissInk, RectangleShape)
+                                        .padding(8.dp),
+                                    verticalArrangement = Arrangement.spacedBy(5.dp)
+                                ) {
+                                    Text(
+                                        text = "FACT-CHECK // ${factClaims.size} VERIFIED CLAIMS",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = SwissInk
+                                    )
+                                    factClaims.forEach { claim ->
+                                        val isOk = claim.status.equals("VERIFIED", ignoreCase = true)
+                                        val isConflict = claim.status.equals("CONFLICT", ignoreCase = true)
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                            verticalAlignment = Alignment.Top
+                                        ) {
+                                            Text(
+                                                text = "[${claim.status.uppercase()}]",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = when {
+                                                    isOk -> SwissVerifiedInk
+                                                    isConflict -> SwissSignalRed
+                                                    else -> SwissMuted
+                                                }
+                                            )
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = claim.statement,
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = SwissInk
+                                                )
+                                                if (claim.note.isNotBlank()) {
+                                                    Text(
+                                                        text = claim.note,
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        color = SwissMuted
+                                                    )
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }

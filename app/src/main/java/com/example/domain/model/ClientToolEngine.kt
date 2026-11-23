@@ -191,7 +191,7 @@ object ClientToolEngine {
         ),
         ToolSchema(
             name = "execute_device_action",
-            description = "Triggers a native Android device action confirmation card to make a phone call (make_call), play/search a YouTube video (open_youtube), send a WhatsApp message to a contact or number (send_whatsapp), launch any installed Android app (open_app), set an alarm (set_alarm), or start a countdown timer (set_timer).",
+            description = "Triggers a native Android device action confirmation card for phone calls (make_call), YouTube (open_youtube), WhatsApp (send_whatsapp), Maps directions/search (open_maps), Calendar event insert (create_calendar_event), SMS (send_sms), Email (send_email), UPI payment confirmation (upi_pay), launching apps (open_app), alarms (set_alarm), or countdown timers (set_timer).",
             parameters = JSONObject()
                 .put("type", "object")
                 .put(
@@ -201,19 +201,63 @@ object ClientToolEngine {
                             "action_type",
                             JSONObject()
                                 .put("type", "string")
-                                .put("description", "One of: 'make_call', 'open_youtube', 'send_whatsapp', 'open_app', 'set_alarm', 'set_timer'.")
+                                .put("description", "One of: 'make_call', 'open_youtube', 'send_whatsapp', 'open_maps', 'create_calendar_event', 'send_sms', 'send_email', 'upi_pay', 'open_app', 'set_alarm', 'set_timer'.")
                         )
                         .put(
                             "phone_number",
-                            JSONObject().put("type", "string").put("description", "Phone number for make_call or send_whatsapp.")
+                            JSONObject().put("type", "string").put("description", "Phone number for make_call, send_whatsapp, or send_sms.")
                         )
                         .put(
                             "contact_name",
-                            JSONObject().put("type", "string").put("description", "Contact name (e.g. 'Mom', 'Rahul') to resolve from saved Quick Contacts for make_call or send_whatsapp.")
+                            JSONObject().put("type", "string").put("description", "Contact name (e.g. 'Mom', 'Rahul') to resolve from saved Quick Contacts for call, WhatsApp, SMS, Email, or UPI.")
                         )
                         .put(
                             "message",
-                            JSONObject().put("type", "string").put("description", "Pre-filled message text for send_whatsapp.")
+                            JSONObject().put("type", "string").put("description", "Message or body text for send_whatsapp, send_sms, or send_email.")
+                        )
+                        .put(
+                            "email_address",
+                            JSONObject().put("type", "string").put("description", "Recipient email address for send_email.")
+                        )
+                        .put(
+                            "subject",
+                            JSONObject().put("type", "string").put("description", "Email subject line for send_email.")
+                        )
+                        .put(
+                            "maps_query",
+                            JSONObject().put("type", "string").put("description", "Destination address or nearby search query for open_maps.")
+                        )
+                        .put(
+                            "is_navigation",
+                            JSONObject().put("type", "boolean").put("description", "True for turn-by-turn navigation (google.navigation), false for Maps search (geo).")
+                        )
+                        .put(
+                            "event_title",
+                            JSONObject().put("type", "string").put("description", "Title of calendar event for create_calendar_event.")
+                        )
+                        .put(
+                            "start_datetime",
+                            JSONObject().put("type", "string").put("description", "ISO date/time string like '2026-11-22 15:00' for create_calendar_event.")
+                        )
+                        .put(
+                            "duration_minutes",
+                            JSONObject().put("type", "integer").put("description", "Duration in minutes for create_calendar_event (default 60).")
+                        )
+                        .put(
+                            "location",
+                            JSONObject().put("type", "string").put("description", "Optional location for create_calendar_event.")
+                        )
+                        .put(
+                            "upi_id",
+                            JSONObject().put("type", "string").put("description", "UPI VPA ID like 'rahul@okaxis' for upi_pay.")
+                        )
+                        .put(
+                            "amount",
+                            JSONObject().put("type", "string").put("description", "Amount in INR (e.g. '500') for upi_pay.")
+                        )
+                        .put(
+                            "note",
+                            JSONObject().put("type", "string").put("description", "Optional payment note for upi_pay.")
                         )
                         .put(
                             "youtube_query",
@@ -372,6 +416,71 @@ object ClientToolEngine {
                 seconds = args.optInt("duration_seconds", 60).coerceAtLeast(1),
                 label = label.takeIf { it.isNotBlank() }
             )
+            "open_maps", "maps", "navigate" -> {
+                val q = args.optString("maps_query").trim()
+                    .ifBlank { args.optString("query").trim() }
+                    .ifBlank { label }
+                if (q.isNotBlank()) {
+                    DeviceAction.OpenMaps(
+                        query = q,
+                        isNavigation = args.optBoolean("is_navigation", type == "navigate")
+                    )
+                } else {
+                    DeviceActionEngine.resolveAppEntry("Google Maps", customApps)
+                }
+            }
+            "create_calendar_event", "calendar_event", "schedule_event" -> {
+                val title = args.optString("event_title").trim().ifBlank { label.ifBlank { "New Event" } }
+                val dtRaw = args.optString("start_datetime").trim()
+                val durationMin = args.optInt("duration_minutes", 60).coerceIn(5, 1440)
+                val startMs = if (dtRaw.isNotBlank()) {
+                    runCatching {
+                        parseFlexibleDateTime(dtRaw, ZoneId.systemDefault()).toInstant().toEpochMilli()
+                    }.getOrElse { System.currentTimeMillis() + 3600_000L }
+                } else {
+                    System.currentTimeMillis() + 3600_000L
+                }
+                DeviceAction.CreateCalendarEvent(
+                    eventTitle = title,
+                    startTimeMillis = startMs,
+                    endTimeMillis = startMs + durationMin * 60_000L,
+                    location = args.optString("location").trim().takeIf { it.isNotBlank() },
+                    description = args.optString("message").trim().takeIf { it.isNotBlank() }
+                )
+            }
+            "send_sms", "sms" -> {
+                val number = when {
+                    rawPhone.isNotBlank() -> DeviceActionEngine.normalizePhoneNumber(rawPhone)
+                    resolvedContact != null -> DeviceActionEngine.normalizePhoneNumber(resolvedContact.phoneNumber)
+                    else -> ""
+                }
+                DeviceAction.SendSms(
+                    phoneNumber = number,
+                    message = args.optString("message").trim(),
+                    contactLabel = resolvedContact?.name ?: contactName.takeIf { it.isNotBlank() }
+                )
+            }
+            "send_email", "email" -> {
+                val rawEmail = args.optString("email_address").trim()
+                    .ifBlank { args.optString("email").trim() }
+                    .ifBlank { resolvedContact?.email.orEmpty() }
+                DeviceAction.SendEmail(
+                    emailAddress = rawEmail,
+                    subject = args.optString("subject").trim().ifBlank { label },
+                    body = args.optString("message").trim().ifBlank { args.optString("body").trim() },
+                    contactLabel = resolvedContact?.name ?: contactName.takeIf { it.isNotBlank() }
+                )
+            }
+            "upi_pay", "pay_upi", "upi" -> {
+                val upi = args.optString("upi_id").trim().ifBlank { resolvedContact?.upiId.orEmpty() }
+                val payee = resolvedContact?.name ?: contactName.ifBlank { upi.substringBefore("@").ifBlank { "UPI Payee" } }
+                DeviceAction.UpiPay(
+                    upiId = upi,
+                    payeeName = payee,
+                    amount = args.optString("amount").trim(),
+                    note = args.optString("note").trim().ifBlank { args.optString("message").trim() }
+                )
+            }
             "open_app" -> {
                 val appQuery = args.optString("app_name").trim().ifBlank { label }
                 DeviceActionEngine.resolveAppEntry(appQuery, customApps)

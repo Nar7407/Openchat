@@ -26,11 +26,15 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.outlined.Alarm
 import androidx.compose.material.icons.outlined.Apps
+import androidx.compose.material.icons.outlined.Build
 import androidx.compose.material.icons.outlined.Call
 import androidx.compose.material.icons.outlined.ChatBubbleOutline
+import androidx.compose.material.icons.outlined.DirectionsCar
 import androidx.compose.material.icons.outlined.GraphicEq
 import androidx.compose.material.icons.outlined.Launch
+import androidx.compose.material.icons.outlined.NoteAdd
 import androidx.compose.material.icons.outlined.PlayCircleOutline
+import androidx.compose.material.icons.outlined.ScreenshotMonitor
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Timer
 import androidx.compose.material.icons.outlined.Translate
@@ -72,9 +76,14 @@ fun FloatingSidebarDock(
     isMiniWindowMode: Boolean,
     onToggleMiniWindowMode: () -> Unit,
     onOpenLiveTranslator: () -> Unit,
+    onOpenScanScreen: () -> Unit,
+    onOpenVoiceNotes: () -> Unit,
     onOpenAssistantOverlay: () -> Unit,
     onOpenMiniChat: () -> Unit,
     onTriggerDeviceAction: (DeviceAction) -> Unit,
+    onOpenToolkitHub: () -> Unit = {},
+    onOpenCommuteHud: () -> Unit = {},
+    onOpenInterpreter: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -114,9 +123,18 @@ fun FloatingSidebarDock(
                 )
 
                 SidebarDockItem(
+                    icon = Icons.Outlined.ScreenshotMonitor,
+                    label = "SCAN",
+                    accent = true,
+                    onClick = {
+                        expanded = false
+                        onOpenScanScreen()
+                    },
+                    testTag = "sidebar_scan_screen"
+                )
+                SidebarDockItem(
                     icon = Icons.Outlined.Translate,
                     label = "LENS",
-                    accent = true,
                     onClick = {
                         expanded = false
                         onOpenLiveTranslator()
@@ -131,6 +149,34 @@ fun FloatingSidebarDock(
                         onOpenAssistantOverlay()
                     },
                     testTag = "sidebar_assistant"
+                )
+                SidebarDockItem(
+                    icon = Icons.Outlined.NoteAdd,
+                    label = "NOTES",
+                    onClick = {
+                        expanded = false
+                        onOpenVoiceNotes()
+                    },
+                    testTag = "sidebar_voice_notes"
+                )
+                SidebarDockItem(
+                    icon = Icons.Outlined.Build,
+                    label = "TOOLS",
+                    accent = true,
+                    onClick = {
+                        expanded = false
+                        onOpenToolkitHub()
+                    },
+                    testTag = "sidebar_power_toolkit"
+                )
+                SidebarDockItem(
+                    icon = Icons.Outlined.DirectionsCar,
+                    label = "HUD",
+                    onClick = {
+                        expanded = false
+                        onOpenCommuteHud()
+                    },
+                    testTag = "sidebar_commute_hud"
                 )
                 SidebarDockItem(
                     icon = Icons.Outlined.ChatBubbleOutline,
@@ -213,6 +259,14 @@ fun FloatingSidebarDock(
 
     if (showAllToolsDrawer) {
         QuickToolsAndAppLauncherDialog(
+            onOpenScanScreen = {
+                showAllToolsDrawer = false
+                onOpenScanScreen()
+            },
+            onOpenVoiceNotes = {
+                showAllToolsDrawer = false
+                onOpenVoiceNotes()
+            },
             onOpenLiveTranslator = {
                 showAllToolsDrawer = false
                 onOpenLiveTranslator()
@@ -220,6 +274,18 @@ fun FloatingSidebarDock(
             onOpenAssistantOverlay = {
                 showAllToolsDrawer = false
                 onOpenAssistantOverlay()
+            },
+            onOpenToolkitHub = {
+                showAllToolsDrawer = false
+                onOpenToolkitHub()
+            },
+            onOpenCommuteHud = {
+                showAllToolsDrawer = false
+                onOpenCommuteHud()
+            },
+            onOpenInterpreter = {
+                showAllToolsDrawer = false
+                onOpenInterpreter()
             },
             onToggleMiniWindowMode = {
                 showAllToolsDrawer = false
@@ -273,8 +339,13 @@ private fun SidebarDockItem(
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun QuickToolsAndAppLauncherDialog(
+    onOpenScanScreen: () -> Unit,
+    onOpenVoiceNotes: () -> Unit,
     onOpenLiveTranslator: () -> Unit,
     onOpenAssistantOverlay: () -> Unit,
+    onOpenToolkitHub: () -> Unit = {},
+    onOpenCommuteHud: () -> Unit = {},
+    onOpenInterpreter: () -> Unit = {},
     onToggleMiniWindowMode: () -> Unit,
     onExecuteAction: (DeviceAction) -> Unit,
     onDismiss: () -> Unit
@@ -371,8 +442,18 @@ fun QuickToolsAndAppLauncherDialog(
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         SwissToggleCell(
-                            label = "LIVE LENS TRANSLATOR",
+                            label = "SCAN SCREEN",
                             selected = true,
+                            onClick = onOpenScanScreen
+                        )
+                        SwissToggleCell(
+                            label = "VOICE NOTES INBOX",
+                            selected = false,
+                            onClick = onOpenVoiceNotes
+                        )
+                        SwissToggleCell(
+                            label = "LIVE LENS / SOLVE",
+                            selected = false,
                             onClick = onOpenLiveTranslator
                         )
                         SwissToggleCell(
@@ -389,6 +470,21 @@ fun QuickToolsAndAppLauncherDialog(
                             label = "TIMER 5 MIN",
                             selected = false,
                             onClick = { onExecuteAction(DeviceAction.SetTimer(300, "5 Min Timer")) }
+                        )
+                        SwissToggleCell(
+                            label = "POWER TOOLKIT (16)",
+                            selected = true,
+                            onClick = onOpenToolkitHub
+                        )
+                        SwissToggleCell(
+                            label = "COMMUTE HUD",
+                            selected = false,
+                            onClick = onOpenCommuteHud
+                        )
+                        SwissToggleCell(
+                            label = "FACE INTERPRETER",
+                            selected = false,
+                            onClick = onOpenInterpreter
                         )
                         SwissToggleCell(
                             label = "ALARM 07:00",

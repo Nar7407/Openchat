@@ -1,5 +1,6 @@
 package com.example.ui.viewmodel
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
 import androidx.lifecycle.ViewModel
@@ -7,14 +8,20 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.local.ConversationEntity
 import com.example.data.local.MessageEntity
 import com.example.data.repository.AllChatRepository
+import com.example.domain.model.AssistantRoutine
 import com.example.domain.model.AutoRouterConfig
 import com.example.domain.model.BranchMessageNode
+import com.example.domain.model.CanvasVersionInfo
 import com.example.domain.model.ChatOptions
 import com.example.domain.model.ClipboardPromptHint
+import com.example.domain.model.ClipboardSnippetInfo
 import com.example.domain.model.ConversationTree
 import com.example.domain.model.CustomAppEntry
 import com.example.domain.model.CustomSlashCommand
+import com.example.domain.model.DecisionMatrixData
 import com.example.domain.model.DisplayCurrency
+import com.example.domain.model.ExpenseRecord
+import com.example.domain.model.FactCheckClaim
 import com.example.domain.model.KnowledgeDocInfo
 import com.example.domain.model.McpCheckResult
 import com.example.domain.model.McpServerConfig
@@ -27,12 +34,30 @@ import com.example.domain.model.SelectableModel
 import com.example.domain.model.SlashCommandDef
 import com.example.domain.model.SlashCommandId
 import com.example.domain.model.SlashCommandRegistry
+import com.example.domain.model.CliCommandSpec
+import com.example.domain.model.CliFlagToken
+import com.example.domain.model.DailyBudgetConfig
+import com.example.domain.model.FilledFormResult
+import com.example.domain.model.NegativeConstraint
+import com.example.domain.model.SmartContextSnapshot
+import com.example.domain.model.SmartZone
+import com.example.domain.model.SpotlightResult
 import com.example.domain.model.StudyPack
+import com.example.domain.model.ThreadCheckpoint
+import com.example.domain.model.TopicCluster
 import com.example.domain.model.UserMemoryInfo
+import com.example.domain.model.VoiceFormTemplate
+import com.example.domain.model.VoiceNoteInfo
+import com.example.domain.model.WatchlistItemInfo
 import com.example.domain.model.WebSearchProvider
+import com.example.domain.model.WorkspaceFileEntry
+import com.example.ui.components.PowerToolAction
 import com.example.ui.theme.SwissThemePreset
 import com.example.util.DeviceAction
 import com.example.util.DeviceActionEngine
+import com.example.util.LocalWorkspaceManager
+import com.example.util.PromptCompressor
+import com.example.util.SmartContextEngine
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -58,12 +83,33 @@ sealed interface ChatUiEvent {
     data object OpenInitAgentsDialog : ChatUiEvent
     data object OpenCustomCommandsSheet : ChatUiEvent
     data object OpenMemoryBank : ChatUiEvent
+    data object OpenVoiceNotes : ChatUiEvent
+    data class SpeakRoutineText(val text: String) : ChatUiEvent
     data object StartVoiceDictation : ChatUiEvent
     data object LaunchCameraVision : ChatUiEvent
     data class OpenPromptEditor(val initialText: String) : ChatUiEvent
     data class OpenShareDialog(val shareUrl: String, val markdown: String) : ChatUiEvent
     data class OpenExportStudio(val title: String, val markdown: String) : ChatUiEvent
     data class TriggerExportMarkdown(val suggestedFileName: String, val markdown: String) : ChatUiEvent
+    data class OpenQrDialog(val initialPayload: String) : ChatUiEvent
+    data class OpenPlotter(val initialExpression: String) : ChatUiEvent
+    data class OpenDecisionMatrix(val initialPrompt: String) : ChatUiEvent
+    data class OpenCanvas(val initialContent: String = "") : ChatUiEvent
+    data object OpenExpenses : ChatUiEvent
+    data object OpenWatchlist : ChatUiEvent
+    data object OpenBleInspector : ChatUiEvent
+    data object OpenCommuteHud : ChatUiEvent
+    data object OpenInterpreter : ChatUiEvent
+    data object OpenSpotlight : ChatUiEvent
+    data class OpenRedactor(val initialText: String = "") : ChatUiEvent
+    data object OpenCsvExplorer : ChatUiEvent
+    data object OpenLocalWorkspace : ChatUiEvent
+    data object OpenVideoFrameExtractor : ChatUiEvent
+    data object OpenColorPalette : ChatUiEvent
+    data object OpenClipboardVault : ChatUiEvent
+    data object OpenVoiceFormFiller : ChatUiEvent
+    data class OpenCliBuilder(val initialQuery: String = "") : ChatUiEvent
+    data object OpenToolkitHub : ChatUiEvent
     data object ExitApp : ChatUiEvent
 }
 
@@ -114,13 +160,52 @@ data class ChatUiState(
     val pendingDeviceAction: DeviceAction? = null,
     val quickContacts: List<QuickContact> = emptyList(),
     val customApps: List<CustomAppEntry> = emptyList(),
+    val routines: List<AssistantRoutine> = emptyList(),
+    val voiceNotes: List<VoiceNoteInfo> = emptyList(),
+    val isSavingNote: Boolean = false,
     val pendingAttachmentUri: String? = null,
     val isStreaming: Boolean = false,
     val statusNotice: String? = null,
     val errorToast: String? = null,
-    val lastFailedPrompt: String? = null
+    val lastFailedPrompt: String? = null,
+    val tokenDietEnabled: Boolean = false,
+    val guidedModeEnabled: Boolean = false,
+    val verifyFixEnabled: Boolean = false,
+    val smartContext: SmartContextSnapshot = SmartContextSnapshot(),
+    val smartZones: List<SmartZone> = emptyList(),
+    val timeProfilesEnabled: Boolean = true,
+    val autoEcoMode: Boolean = true,
+    val wakePhraseEnabled: Boolean = false,
+    val ambientWhisperEnabled: Boolean = false,
+    val cooldownMap: Map<Long, Long> = emptyMap(),
+    val clipboardHistory: List<ClipboardSnippetInfo> = emptyList(),
+    val localWorkspaceUri: String? = null,
+    val workspaceFiles: List<WorkspaceFileEntry> = emptyList(),
+    val factCheckByMessageId: Map<Long, List<FactCheckClaim>> = emptyMap(),
+    val checkingFactMessageIds: Set<Long> = emptySet(),
+    val activeDecisionMatrix: DecisionMatrixData? = null,
+    val isBuildingMatrix: Boolean = false,
+    val expenses: List<ExpenseRecord> = emptyList(),
+    val watchlist: List<WatchlistItemInfo> = emptyList(),
+    val canvasVersions: List<CanvasVersionInfo> = emptyList(),
+    val activeConstraints: Set<NegativeConstraint> = emptySet(),
+    val isEnhancingPrompt: Boolean = false,
+    val isExpandingMindMapNode: Boolean = false,
+    val ghostModeEnabled: Boolean = false,
+    val ghostMessages: List<MessageEntity> = emptyList(),
+    val dailyBudgetConfig: DailyBudgetConfig = DailyBudgetConfig(),
+    val todaySpendUsd: Double = 0.0,
+    val forceFlagshipOverride: Boolean = false,
+    val voiceFormTemplates: List<VoiceFormTemplate> = emptyList(),
+    val threadCheckpoints: List<ThreadCheckpoint> = emptyList(),
+    val summarizingCheckpointMsgId: Long? = null
 ) {
-    val messages: List<MessageEntity> get() = branchNodes.map { it.message }
+    val messages: List<MessageEntity>
+        get() = if (ghostModeEnabled) ghostMessages else branchNodes.map { it.message }
+    val budgetUsageRatio: Double
+        get() = if (dailyBudgetConfig.dailyCapUsd > 0.0) todaySpendUsd / dailyBudgetConfig.dailyCapUsd else 0.0
+    val isBudgetWarningActive: Boolean
+        get() = dailyBudgetConfig.dailyCapUsd > 0.0 && budgetUsageRatio >= 0.80
 }
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -158,6 +243,82 @@ class ChatViewModel(
     private val liveVoiceActive = MutableStateFlow(false)
     private val pendingDeviceAction = MutableStateFlow<DeviceAction?>(null)
     private val lastFailedPrompt = MutableStateFlow<String?>(null)
+    private val isSavingNote = MutableStateFlow(false)
+    private val tokenDietEnabled = MutableStateFlow(false)
+    private val guidedModeEnabled = MutableStateFlow(false)
+    private val verifyFixEnabled = MutableStateFlow(false)
+    private val smartContext = MutableStateFlow(SmartContextSnapshot())
+    private val workspaceFiles = MutableStateFlow<List<WorkspaceFileEntry>>(emptyList())
+    private val factCheckByMessageId = MutableStateFlow<Map<Long, List<FactCheckClaim>>>(emptyMap())
+    private val checkingFactMessageIds = MutableStateFlow<Set<Long>>(emptySet())
+    private val activeDecisionMatrix = MutableStateFlow<DecisionMatrixData?>(null)
+    private val isBuildingMatrix = MutableStateFlow(false)
+    private val activeConstraints = MutableStateFlow<Set<NegativeConstraint>>(emptySet())
+    private val isEnhancingPrompt = MutableStateFlow(false)
+    private val isExpandingMindMapNode = MutableStateFlow(false)
+    private val ghostModeEnabled = MutableStateFlow(false)
+    private val ghostMessages = MutableStateFlow<List<MessageEntity>>(emptyList())
+    private val forceFlagshipOverride = MutableStateFlow(false)
+    private val summarizingCheckpointMsgId = MutableStateFlow<Long?>(null)
+
+    private val wave4UxBundleFlow = combine(
+        activeConstraints,
+        isEnhancingPrompt,
+        isExpandingMindMapNode,
+        ghostModeEnabled,
+        ghostMessages
+    ) { constraints, enhancing, expandingMap, ghostOn, ghostList ->
+        Wave4UxBundle(constraints, enhancing, expandingMap, ghostOn, ghostList)
+    }
+
+    private val wave4BudgetAndMetaFlow = combine(
+        repository.dailyBudgetConfigFlow,
+        repository.observeTodaySpendUsd(),
+        forceFlagshipOverride,
+        repository.voiceFormTemplatesFlow,
+        combine(repository.threadCheckpointsFlow, summarizingCheckpointMsgId) { map, busyId -> map to busyId }
+    ) { budgetCfg, todaySpend, flagshipOverride, formTemplates, (cpMap, cpBusyId) ->
+        Wave4BudgetMetaBundle(budgetCfg, todaySpend, flagshipOverride, formTemplates, cpMap, cpBusyId)
+    }
+
+    private val conversationModesBundleFlow = combine(
+        tokenDietEnabled,
+        guidedModeEnabled,
+        verifyFixEnabled,
+        smartContext,
+        repository.cooldownSnapshotFlow
+    ) { diet, guided, verify, ctx, cooldowns ->
+        ConversationModesBundle(diet, guided, verify, ctx, cooldowns)
+    }
+
+    private val smartPrefsBundleFlow = combine(
+        repository.smartZonesFlow,
+        repository.timeProfilesEnabledFlow,
+        repository.autoEcoModeFlow,
+        repository.wakePhraseEnabledFlow,
+        repository.ambientWhisperEnabledFlow
+    ) { zones, timeProf, eco, wake, whisper ->
+        SmartPrefsBundle(zones, timeProf, eco, wake, whisper)
+    }
+
+    private val hubsBundleFlow = combine(
+        repository.clipboardFlow,
+        repository.localWorkspaceUriFlow,
+        workspaceFiles,
+        repository.expensesFlow,
+        combine(repository.watchlistFlow, repository.canvasVersionsFlow) { w, c -> w to c }
+    ) { clips, wsUri, wsFiles, exps, (watch, canvas) ->
+        HubsBundle(clips, wsUri, wsFiles, exps, watch, canvas)
+    }
+
+    private val verificationBundleFlow = combine(
+        factCheckByMessageId,
+        checkingFactMessageIds,
+        activeDecisionMatrix,
+        isBuildingMatrix
+    ) { facts, checking, matrix, building ->
+        VerificationBundle(facts, checking, matrix, building)
+    }
 
     // Per-conversation redo stack storing popped message turns from /undo
     private val redoStackByConv = MutableStateFlow<Map<Long, List<List<MessageEntity>>>>(emptyMap())
@@ -376,12 +537,75 @@ class ChatViewModel(
             quickContacts = contacts,
             customApps = apps
         )
+    }.combine(
+        combine(
+            repository.routinesFlow,
+            repository.voiceNotesFlow,
+            isSavingNote
+        ) { routines, notes, savingNote -> Triple(routines, notes, savingNote) }
+    ) { state, (routines, notes, savingNote) ->
+        state.copy(
+            routines = routines,
+            voiceNotes = notes,
+            isSavingNote = savingNote
+        )
     }.combine(isStreaming) { state, streaming ->
         state.copy(isStreaming = streaming)
     }.combine(
         combine(statusNotice, errorToast, lastFailedPrompt) { notice, err, failed -> Triple(notice, err, failed) }
     ) { state, (notice, err, failed) ->
         state.copy(statusNotice = notice, errorToast = err, lastFailedPrompt = failed)
+    }.combine(conversationModesBundleFlow) { state, cm ->
+        state.copy(
+            tokenDietEnabled = cm.tokenDietEnabled,
+            guidedModeEnabled = cm.guidedModeEnabled,
+            verifyFixEnabled = cm.verifyFixEnabled,
+            smartContext = cm.smartContext,
+            cooldownMap = cm.cooldownMap
+        )
+    }.combine(smartPrefsBundleFlow) { state, sp ->
+        state.copy(
+            smartZones = sp.smartZones,
+            timeProfilesEnabled = sp.timeProfilesEnabled,
+            autoEcoMode = sp.autoEcoMode,
+            wakePhraseEnabled = sp.wakePhraseEnabled,
+            ambientWhisperEnabled = sp.ambientWhisperEnabled
+        )
+    }.combine(hubsBundleFlow) { state, hb ->
+        state.copy(
+            clipboardHistory = hb.clipboardHistory,
+            localWorkspaceUri = hb.localWorkspaceUri,
+            workspaceFiles = hb.workspaceFiles,
+            expenses = hb.expenses,
+            watchlist = hb.watchlist,
+            canvasVersions = hb.canvasVersions
+        )
+    }.combine(verificationBundleFlow) { state, vb ->
+        state.copy(
+            factCheckByMessageId = vb.factCheckByMessageId,
+            checkingFactMessageIds = vb.checkingFactMessageIds,
+            activeDecisionMatrix = vb.activeDecisionMatrix,
+            isBuildingMatrix = vb.isBuildingMatrix
+        )
+    }.combine(wave4UxBundleFlow) { state, w4 ->
+        state.copy(
+            activeConstraints = w4.activeConstraints,
+            isEnhancingPrompt = w4.isEnhancingPrompt,
+            isExpandingMindMapNode = w4.isExpandingMindMapNode,
+            ghostModeEnabled = w4.ghostModeEnabled,
+            ghostMessages = w4.ghostMessages
+        )
+    }.combine(wave4BudgetAndMetaFlow) { state, bm ->
+        val convId = state.activeConversation?.id
+        val convCheckpoints = if (convId != null) bm.checkpointsByConv[convId].orEmpty() else emptyList()
+        state.copy(
+            dailyBudgetConfig = bm.budgetConfig,
+            todaySpendUsd = bm.todaySpendUsd,
+            forceFlagshipOverride = bm.forceFlagshipOverride,
+            voiceFormTemplates = bm.voiceFormTemplates,
+            threadCheckpoints = convCheckpoints,
+            summarizingCheckpointMsgId = bm.summarizingCheckpointMsgId
+        )
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5000),
@@ -696,11 +920,414 @@ class ChatViewModel(
             preview = preview,
             kindLabel = kindLabel
         )
+        viewModelScope.launch {
+            repository.recordClipboardSnippet(trimmed)
+        }
     }
 
     fun dismissClipboardHint() {
         clipboardHint.value?.let { dismissedClipboardHash = it.hash }
         clipboardHint.value = null
+    }
+
+    // --- Wave 3B: Smart Triggers, Token Diet, Guided Mode, Verify & Fix, Productivity Hubs ---
+
+    fun toggleTokenDiet() {
+        val next = !tokenDietEnabled.value
+        tokenDietEnabled.value = next
+        statusNotice.value = if (next) {
+            "TOKEN DIET // Prompt compression ON (strips filler words & collapses code whitespace)."
+        } else {
+            "TOKEN DIET // Prompt compression OFF."
+        }
+    }
+
+    fun toggleGuidedMode() {
+        val next = !guidedModeEnabled.value
+        guidedModeEnabled.value = next
+        statusNotice.value = if (next) {
+            "GUIDED MODE // AI will ask 2-3 quick clarifying questions before big plans."
+        } else {
+            "GUIDED MODE // Direct answer mode restored."
+        }
+    }
+
+    fun toggleVerifyFix() {
+        val next = !verifyFixEnabled.value
+        verifyFixEnabled.value = next
+        statusNotice.value = if (next) {
+            "VERIFY & FIX // Automatic coding/math self-correction pass armed."
+        } else {
+            "VERIFY & FIX // Self-correction pass OFF."
+        }
+    }
+
+    fun refreshSmartContext(context: Context, ambientDb: Int? = null) {
+        val state = uiState.value
+        val snapshot = SmartContextEngine.captureSnapshot(
+            context = context,
+            savedZones = state.smartZones,
+            timeProfilesEnabled = state.timeProfilesEnabled,
+            autoEcoEnabled = state.autoEcoMode,
+            ambientDb = ambientDb
+        )
+        smartContext.value = snapshot
+    }
+
+    fun verifyMessageClaims(message: MessageEntity) {
+        if (checkingFactMessageIds.value.contains(message.id)) return
+        viewModelScope.launch {
+            checkingFactMessageIds.update { it + message.id }
+            statusNotice.value = "FACT-CHECK // Verifying dates, numbers & claims…"
+            runCatching {
+                repository.verifyAnswerClaims(message.content, uiState.value.selectedModel)
+            }.onSuccess { claims ->
+                factCheckByMessageId.update { it + (message.id to claims) }
+                statusNotice.value = "FACT-CHECK // Checked ${claims.size} claim${if (claims.size == 1) "" else "s"}."
+            }.onFailure { err ->
+                errorToast.value = err.message ?: "Fact-check verification failed."
+            }
+            checkingFactMessageIds.update { it - message.id }
+        }
+    }
+
+    fun buildDecisionMatrix(prompt: String) {
+        val clean = prompt.trim()
+        if (clean.isEmpty() || isBuildingMatrix.value) return
+        viewModelScope.launch {
+            isBuildingMatrix.value = true
+            statusNotice.value = "COMPARE // Building weighted Decision Matrix…"
+            runCatching {
+                repository.generateDecisionMatrix(clean, uiState.value.selectedModel)
+            }.onSuccess { data ->
+                activeDecisionMatrix.value = data
+                statusNotice.value = null
+            }.onFailure { err ->
+                errorToast.value = err.message ?: "Could not build comparison matrix."
+            }
+            isBuildingMatrix.value = false
+        }
+    }
+
+    fun dismissDecisionMatrix() {
+        activeDecisionMatrix.value = null
+    }
+
+    fun setLocalWorkspaceTree(context: Context, treeUri: Uri) {
+        viewModelScope.launch {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    treeUri,
+                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                        android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            }
+            val uriStr = treeUri.toString()
+            repository.setLocalWorkspaceUri(uriStr)
+            refreshWorkspaceFiles(context, uriStr)
+            statusNotice.value = "WORKSPACE // Mounted local folder for @file context & write-back."
+        }
+    }
+
+    fun refreshWorkspaceFiles(context: Context, overrideUri: String? = null) {
+        val uriStr = overrideUri ?: uiState.value.localWorkspaceUri ?: return
+        viewModelScope.launch {
+            val files = LocalWorkspaceManager.scanWorkspaceFiles(context, uriStr)
+            workspaceFiles.value = files
+        }
+    }
+
+    fun recordClipboard(rawText: String) {
+        viewModelScope.launch {
+            repository.recordClipboardSnippet(rawText)
+        }
+    }
+
+    fun deleteClipboardSnippet(id: Long) {
+        viewModelScope.launch {
+            repository.deleteClipboardSnippet(id)
+        }
+    }
+
+    fun clearClipboardVault() {
+        viewModelScope.launch {
+            repository.clearClipboardVault()
+            statusNotice.value = "CLIPBOARD // Cleared local snippet vault."
+        }
+    }
+
+    fun saveExpense(record: ExpenseRecord) {
+        viewModelScope.launch {
+            repository.saveExpense(record)
+            statusNotice.value = "EXPENSES // Saved ${record.merchant} (${record.currency} ${record.amount})."
+        }
+    }
+
+    fun deleteExpense(id: Long) {
+        viewModelScope.launch {
+            repository.deleteExpense(id)
+        }
+    }
+
+    suspend fun scanReceiptBitmap(bitmap: Bitmap): Result<ExpenseRecord> = runCatching {
+        repository.extractExpenseFromImage(bitmap, uiState.value.selectedModel)
+    }
+
+    fun saveWatchlistItem(title: String, queryOrUrl: String) {
+        if (queryOrUrl.isBlank()) return
+        viewModelScope.launch {
+            repository.saveWatchlistItem(title, queryOrUrl)
+            statusNotice.value = "WATCHLIST // Added \"${title.ifBlank { queryOrUrl.take(30) }}\"."
+        }
+    }
+
+    fun deleteWatchlistItem(id: Long) {
+        viewModelScope.launch {
+            repository.deleteWatchlistItem(id)
+        }
+    }
+
+    suspend fun checkWatchlistItem(item: WatchlistItemInfo): Result<WatchlistItemInfo> = runCatching {
+        repository.checkWatchlistUpdate(item, uiState.value.selectedModel)
+    }
+
+    fun saveCanvasVersion(docTitle: String, content: String) {
+        viewModelScope.launch {
+            val ver = repository.saveCanvasVersion(docTitle, content)
+            statusNotice.value = "CANVAS // Saved v${ver.versionNumber} (${ver.docTitle})."
+        }
+    }
+
+    suspend fun editCanvasSelection(
+        fullDoc: String,
+        selectedBlock: String,
+        instruction: String
+    ): Result<String> = runCatching {
+        repository.aiEditCanvasSelection(fullDoc, selectedBlock, instruction, uiState.value.selectedModel)
+    }
+
+    suspend fun spotlightSearch(query: String, filter: String): List<SpotlightResult> =
+        repository.spotlightSearch(query, filter)
+
+    suspend fun loadTopicClusters(): List<TopicCluster> =
+        repository.clusterConversationsByTopic()
+
+    suspend fun generateCleanSvg(description: String): Result<String> = runCatching {
+        repository.generateCleanSvg(description, uiState.value.selectedModel)
+    }
+
+    suspend fun translateInterpreterUtterance(
+        text: String,
+        sourceLang: String,
+        targetLang: String
+    ): Result<String> = runCatching {
+        repository.translateLiveUtterance(text, sourceLang, targetLang, uiState.value.selectedModel)
+    }
+
+    fun openToolkitHub() {
+        _events.tryEmit(ChatUiEvent.OpenToolkitHub)
+    }
+
+    fun launchPowerTool(tool: PowerToolAction) {
+        val lastAssistant = uiState.value.messages.lastOrNull { it.role == "ASSISTANT" }?.content.orEmpty()
+        when (tool) {
+            PowerToolAction.QR_GENERATOR -> _events.tryEmit(ChatUiEvent.OpenQrDialog(lastAssistant.take(300)))
+            PowerToolAction.VIDEO_FRAME -> _events.tryEmit(ChatUiEvent.OpenVideoFrameExtractor)
+            PowerToolAction.COLOR_PALETTE -> _events.tryEmit(ChatUiEvent.OpenColorPalette)
+            PowerToolAction.PRIVACY_REDACTOR -> _events.tryEmit(ChatUiEvent.OpenRedactor(lastAssistant))
+            PowerToolAction.CSV_EXPLORER -> _events.tryEmit(ChatUiEvent.OpenCsvExplorer)
+            PowerToolAction.GRAPH_PLOTTER -> _events.tryEmit(ChatUiEvent.OpenPlotter("a*sin(b*x)+c"))
+            PowerToolAction.DECISION_MATRIX -> _events.tryEmit(ChatUiEvent.OpenDecisionMatrix(""))
+            PowerToolAction.INTERACTIVE_CANVAS -> _events.tryEmit(ChatUiEvent.OpenCanvas(lastAssistant))
+            PowerToolAction.EXPENSE_TRACKER -> _events.tryEmit(ChatUiEvent.OpenExpenses)
+            PowerToolAction.WATCHLIST -> _events.tryEmit(ChatUiEvent.OpenWatchlist)
+            PowerToolAction.BLE_INSPECTOR -> _events.tryEmit(ChatUiEvent.OpenBleInspector)
+            PowerToolAction.FACE_INTERPRETER -> _events.tryEmit(ChatUiEvent.OpenInterpreter)
+            PowerToolAction.COMMUTE_HUD -> _events.tryEmit(ChatUiEvent.OpenCommuteHud)
+            PowerToolAction.SPOTLIGHT_SEARCH -> _events.tryEmit(ChatUiEvent.OpenSpotlight)
+            PowerToolAction.CLIPBOARD_VAULT -> _events.tryEmit(ChatUiEvent.OpenClipboardVault)
+            PowerToolAction.LOCAL_WORKSPACE -> _events.tryEmit(ChatUiEvent.OpenLocalWorkspace)
+            PowerToolAction.VOICE_FORM_FILLER -> _events.tryEmit(ChatUiEvent.OpenVoiceFormFiller)
+            PowerToolAction.CLI_COMMAND_BUILDER -> _events.tryEmit(ChatUiEvent.OpenCliBuilder(""))
+        }
+    }
+
+    fun toggleConstraint(rule: NegativeConstraint) {
+        activeConstraints.update { cur -> if (rule in cur) cur - rule else cur + rule }
+    }
+
+    fun toggleGhostMode() {
+        val next = !ghostModeEnabled.value
+        if (isStreaming.value) stopGeneration()
+        ghostMessages.value = emptyList()
+        ghostModeEnabled.value = next
+        statusNotice.value = if (next) {
+            "GHOST MODE // Incognito active — zero messages written to local history or search."
+        } else {
+            "GHOST MODE // Exited incognito & wiped volatile memory."
+        }
+    }
+
+    fun toggleForceFlagshipOverride() {
+        val next = !forceFlagshipOverride.value
+        forceFlagshipOverride.value = next
+        statusNotice.value = if (next) {
+            "BUDGET // Flagship manual override ON for upcoming prompts."
+        } else {
+            "BUDGET // Auto-downgrade guard active."
+        }
+    }
+
+    fun enhancePrompt(roughPrompt: String, onEnhanced: (String) -> Unit) {
+        val clean = roughPrompt.trim()
+        if (clean.isEmpty() || isEnhancingPrompt.value) return
+        viewModelScope.launch {
+            isEnhancingPrompt.value = true
+            statusNotice.value = "PROMPT DOCTOR // Optimizing your prompt…"
+            runCatching {
+                repository.enhanceUserPrompt(clean, uiState.value.selectedModel)
+            }.onSuccess { polished ->
+                onEnhanced(polished)
+                statusNotice.value = "PROMPT DOCTOR // Prompt upgraded — review or tap Send."
+            }.onFailure { err ->
+                errorToast.value = err.message ?: "Prompt Doctor failed."
+            }
+            isEnhancingPrompt.value = false
+        }
+    }
+
+    fun expandMindMapNode(targetNode: MindMapNode) {
+        val currentRoot = activeMindMap.value ?: return
+        if (isExpandingMindMapNode.value) return
+        viewModelScope.launch {
+            isExpandingMindMapNode.value = true
+            statusNotice.value = "MIND MAP // Expanding \"${targetNode.label}\"…"
+            runCatching {
+                repository.expandMindMapSubTopic(currentRoot, targetNode, uiState.value.selectedModel)
+            }.onSuccess { updatedRoot ->
+                activeMindMap.value = updatedRoot
+                statusNotice.value = "MIND MAP // Grew new child branches under \"${targetNode.label}\"."
+            }.onFailure { err ->
+                errorToast.value = err.message ?: "Could not expand Mind Map branch."
+            }
+            isExpandingMindMapNode.value = false
+        }
+    }
+
+    fun saveVoiceFormTemplates(templates: List<VoiceFormTemplate>) {
+        viewModelScope.launch {
+            repository.saveVoiceFormTemplates(templates)
+            statusNotice.value = "FORM // Saved ${templates.size} voice form template(s)."
+        }
+    }
+
+    suspend fun fillVoiceForm(template: VoiceFormTemplate, transcript: String): Result<FilledFormResult> = runCatching {
+        repository.fillStructuredFormFromVoice(template, transcript, uiState.value.selectedModel)
+    }
+
+    suspend fun buildCliCommand(query: String): CliCommandSpec =
+        repository.buildModularCliCommand(query, uiState.value.selectedModel)
+
+    fun createCheckpointAt(targetMessage: MessageEntity) {
+        val convId = uiState.value.activeConversation?.id ?: return
+        if (summarizingCheckpointMsgId.value != null) return
+        val branchMsgs = uiState.value.branchNodes.map { it.message }
+        val idx = branchMsgs.indexOfFirst { it.id == targetMessage.id }
+        if (idx < 0) return
+        val upToHere = branchMsgs.subList(0, idx + 1)
+        viewModelScope.launch {
+            summarizingCheckpointMsgId.value = targetMessage.id
+            statusNotice.value = "CHECKPOINT // Summarizing ${upToHere.size} messages into TL;DR divider…"
+            runCatching {
+                repository.createThreadCheckpoint(convId, targetMessage, upToHere, uiState.value.selectedModel)
+            }.onSuccess { cp ->
+                statusNotice.value = "CHECKPOINT // Inserted TL;DR divider covering ${cp.messageCountCovered} messages."
+            }.onFailure { err ->
+                errorToast.value = err.message ?: "Failed to create checkpoint."
+            }
+            summarizingCheckpointMsgId.value = null
+        }
+    }
+
+    fun deleteCheckpoint(checkpointId: String) {
+        val convId = uiState.value.activeConversation?.id ?: return
+        viewModelScope.launch {
+            repository.deleteThreadCheckpoint(convId, checkpointId)
+        }
+    }
+
+    fun editAndForkAssistantMessage(targetMessage: MessageEntity, newContent: String) {
+        val convId = uiState.value.activeConversation?.id ?: return
+        val clean = newContent.trim()
+        if (clean.isEmpty() || isStreaming.value) return
+        viewModelScope.launch {
+            val forkedId = repository.editAndForkAssistantMessage(convId, targetMessage, clean)
+            val parentKey = targetMessage.parentMessageId ?: -1L
+            selectedBranchByParent.update { it + (parentKey to forkedId) }
+            statusNotice.value = "BRANCH // Created parallel AI response branch (use < 1 / N > to switch)."
+        }
+    }
+
+    /**
+     * Resolves inline `@filename` or `@relative/path` references against mounted SAF
+     * local workspace files before dispatching the prompt to the LLM.
+     */
+    fun sendMessageWithWorkspaceContext(
+        context: Context,
+        rawPromptText: String,
+        optionalLiveFrame: Bitmap? = null
+    ) {
+        val files = uiState.value.workspaceFiles
+        if (files.isEmpty() || !rawPromptText.contains("@")) {
+            if (optionalLiveFrame != null) {
+                sendMessageWithOptionalLiveFrame(rawPromptText, optionalLiveFrame)
+            } else {
+                sendMessage(rawPromptText)
+            }
+            return
+        }
+        val mentionedTokens = Regex("""@([A-Za-z0-9_.\-/]+)""")
+            .findAll(rawPromptText)
+            .map { it.groupValues[1] }
+            .distinct()
+            .toList()
+        val matchedFiles = mentionedTokens.mapNotNull { token ->
+            files.firstOrNull {
+                it.name.equals(token, ignoreCase = true) ||
+                    it.relativePath.equals(token, ignoreCase = true)
+            }
+        }.distinctBy { it.uriString }.take(3)
+
+        if (matchedFiles.isEmpty()) {
+            if (optionalLiveFrame != null) {
+                sendMessageWithOptionalLiveFrame(rawPromptText, optionalLiveFrame)
+            } else {
+                sendMessage(rawPromptText)
+            }
+            return
+        }
+
+        viewModelScope.launch {
+            statusNotice.value = "WORKSPACE // Reading ${matchedFiles.size} @file(s)…"
+            val injectedBlocks = matchedFiles.mapNotNull { entry ->
+                runCatching {
+                    val content = LocalWorkspaceManager.readFileContent(context, entry.uriString, maxChars = 14_000)
+                    if (content.isNotBlank()) {
+                        "### WORKSPACE FILE: `${entry.relativePath}`\n```\n$content\n```"
+                    } else null
+                }.getOrNull()
+            }
+            val finalPrompt = if (injectedBlocks.isNotEmpty()) {
+                injectedBlocks.joinToString("\n\n") + "\n\n" + rawPromptText
+            } else {
+                rawPromptText
+            }
+            if (optionalLiveFrame != null) {
+                sendMessageWithOptionalLiveFrame(finalPrompt, optionalLiveFrame)
+            } else {
+                sendMessage(finalPrompt)
+            }
+        }
     }
 
     fun setPendingDeviceAction(action: DeviceAction?) {
@@ -711,11 +1338,100 @@ class ChatViewModel(
         pendingDeviceAction.value = null
     }
 
-    fun saveQuickContact(name: String, phoneNumber: String) {
-        if (name.isBlank() || phoneNumber.isBlank()) return
+    fun saveQuickContact(
+        name: String,
+        phoneNumber: String,
+        email: String = "",
+        upiId: String = ""
+    ) {
+        val cleanName = name.trim()
+        val cleanPhone = phoneNumber.trim()
+        val cleanEmail = email.trim()
+        val cleanUpi = upiId.trim()
+        if (cleanName.isBlank() || (cleanPhone.isBlank() && cleanEmail.isBlank() && cleanUpi.isBlank())) return
         viewModelScope.launch {
-            repository.saveQuickContact(QuickContact(name = name.trim(), phoneNumber = phoneNumber.trim()))
-            statusNotice.value = "CONTACTS // Saved $name ($phoneNumber) to Quick Contacts."
+            repository.saveQuickContact(
+                QuickContact(
+                    name = cleanName,
+                    phoneNumber = cleanPhone,
+                    email = cleanEmail,
+                    upiId = cleanUpi
+                )
+            )
+            statusNotice.value = "CONTACTS // Saved $cleanName to Quick Contacts."
+        }
+    }
+
+    fun saveVoiceQuickNote(rawText: String) {
+        val clean = rawText.trim()
+        if (clean.isEmpty()) {
+            _events.tryEmit(ChatUiEvent.OpenVoiceNotes)
+            return
+        }
+        viewModelScope.launch {
+            isSavingNote.value = true
+            statusNotice.value = "NOTE // Cleaning up voice memo into structured Markdown…"
+            runCatching {
+                repository.saveVoiceQuickNote(clean, uiState.value.selectedModel)
+            }.onSuccess { saved ->
+                statusNotice.value = "NOTE // Saved \"${saved.title}\" to Voice Quick-Notes Inbox."
+            }.onFailure { err ->
+                errorToast.value = err.message ?: "Could not save voice note."
+            }
+            isSavingNote.value = false
+        }
+    }
+
+    fun updateVoiceNote(note: VoiceNoteInfo) {
+        viewModelScope.launch {
+            repository.updateVoiceNote(note)
+            statusNotice.value = "NOTE // Updated \"${note.title}\"."
+        }
+    }
+
+    fun deleteVoiceNote(id: Long) {
+        viewModelScope.launch {
+            repository.deleteVoiceNote(id)
+        }
+    }
+
+    fun runRoutine(routine: AssistantRoutine) {
+        if (isStreaming.value) return
+        activeStreamJob = viewModelScope.launch {
+            isStreaming.value = true
+            statusNotice.value = "ROUTINE // Running \"${routine.name}\"…"
+            try {
+                val result = repository.executeRoutine(
+                    routine = routine,
+                    preferredModel = uiState.value.selectedModel,
+                    onProgress = { msg -> statusNotice.value = "ROUTINE // $msg" }
+                )
+                val convId = activeConversationId.value
+                    ?: repository.getOrCreateActiveConversationId(
+                        defaultTitle = "Routine: ${routine.name}",
+                        modelDbId = uiState.value.selectedModel?.model?.id,
+                        personaId = uiState.value.activePersona?.id
+                    ).also { activeConversationId.value = it }
+                repository.appendInstantExchange(
+                    conversationId = convId,
+                    userText = "Run routine: ${routine.name}",
+                    assistantText = result.summaryText,
+                    modelLabel = result.modelLabel
+                )
+                if (result.pendingDeviceAction != null) {
+                    pendingDeviceAction.value = result.pendingDeviceAction
+                }
+                if (!result.spokenText.isNullOrBlank()) {
+                    _events.tryEmit(ChatUiEvent.SpeakRoutineText(result.spokenText))
+                }
+                statusNotice.value = "ROUTINE // \"${routine.name}\" finished."
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                errorToast.value = t.message ?: "Routine failed."
+            } finally {
+                isStreaming.value = false
+            }
         }
     }
 
@@ -1127,6 +1843,91 @@ class ChatViewModel(
             SlashCommandId.MEMORY -> {
                 _events.tryEmit(ChatUiEvent.OpenMemoryBank)
             }
+            SlashCommandId.NOTE -> {
+                val memo = argument.trim()
+                if (memo.isNotBlank()) {
+                    saveVoiceQuickNote(memo)
+                } else {
+                    val lastAssistant = uiState.value.messages.lastOrNull { !it.isError && it.content.isNotBlank() }?.content
+                    if (!lastAssistant.isNullOrBlank()) {
+                        saveVoiceQuickNote(lastAssistant)
+                    } else {
+                        _events.tryEmit(ChatUiEvent.OpenVoiceNotes)
+                    }
+                }
+            }
+            SlashCommandId.NOTES -> {
+                _events.tryEmit(ChatUiEvent.OpenVoiceNotes)
+            }
+            SlashCommandId.ROUTINES -> {
+                val query = argument.trim()
+                val matched = if (query.isNotBlank()) {
+                    uiState.value.routines.firstOrNull {
+                        it.name.equals(query, ignoreCase = true) ||
+                            it.triggerPhrase.equals(query, ignoreCase = true) ||
+                            it.name.contains(query, ignoreCase = true)
+                    }
+                } else null
+                if (matched != null) {
+                    runRoutine(matched)
+                } else if (uiState.value.routines.isEmpty()) {
+                    statusNotice.value = "ROUTINES // No routines yet. Open Settings → Routines Builder to create 1-tap macros."
+                } else {
+                    val names = uiState.value.routines.joinToString(", ") { "\"${it.name}\"" }
+                    statusNotice.value = "ROUTINES // Available: $names. Type /routine <name> or say its trigger phrase."
+                }
+            }
+            SlashCommandId.QR -> {
+                _events.tryEmit(ChatUiEvent.OpenQrDialog(argument))
+            }
+            SlashCommandId.PLOT -> {
+                _events.tryEmit(ChatUiEvent.OpenPlotter(argument.ifBlank { "sin(a * x) + b * x" }))
+            }
+            SlashCommandId.COMPARE -> {
+                if (argument.isNotBlank()) {
+                    buildDecisionMatrix(argument)
+                }
+                _events.tryEmit(ChatUiEvent.OpenDecisionMatrix(argument))
+            }
+            SlashCommandId.CANVAS -> {
+                val seed = argument.ifBlank {
+                    uiState.value.messages.lastOrNull { it.role == "ASSISTANT" && !it.isError }?.content.orEmpty()
+                }
+                _events.tryEmit(ChatUiEvent.OpenCanvas(seed))
+            }
+            SlashCommandId.EXPENSES -> {
+                _events.tryEmit(ChatUiEvent.OpenExpenses)
+            }
+            SlashCommandId.WATCH -> {
+                if (argument.isNotBlank()) {
+                    saveWatchlistItem(argument.take(40), argument)
+                }
+                _events.tryEmit(ChatUiEvent.OpenWatchlist)
+            }
+            SlashCommandId.BLE -> {
+                _events.tryEmit(ChatUiEvent.OpenBleInspector)
+            }
+            SlashCommandId.COMMUTE -> {
+                _events.tryEmit(ChatUiEvent.OpenCommuteHud)
+            }
+            SlashCommandId.INTERPRET -> {
+                _events.tryEmit(ChatUiEvent.OpenInterpreter)
+            }
+            SlashCommandId.SPOTLIGHT -> {
+                _events.tryEmit(ChatUiEvent.OpenSpotlight)
+            }
+            SlashCommandId.REDACT -> {
+                _events.tryEmit(ChatUiEvent.OpenRedactor(argument))
+            }
+            SlashCommandId.CMD -> {
+                _events.tryEmit(ChatUiEvent.OpenCliBuilder(argument))
+            }
+            SlashCommandId.FORM -> {
+                _events.tryEmit(ChatUiEvent.OpenVoiceFormFiller)
+            }
+            SlashCommandId.GHOST -> {
+                toggleGhostMode()
+            }
             SlashCommandId.EXIT -> {
                 stopGeneration()
                 _events.tryEmit(ChatUiEvent.ExitApp)
@@ -1261,7 +2062,24 @@ class ChatViewModel(
             return
         }
 
-        // 1b. Intercept Device Action commands (Call, WhatsApp, YouTube, Alarm, Timer, Open App) with 1-tap confirmation card
+        // 1a. Intercept saved 1-tap Assistant Routine trigger phrases
+        if (attachment == null && batchDocs.isEmpty() && state.routines.isNotEmpty()) {
+            val normalizedTrigger = trimmed.lowercase()
+                .removePrefix("run ")
+                .removePrefix("start ")
+                .trim()
+            val matchedRoutine = state.routines.firstOrNull { r ->
+                val phrase = r.triggerPhrase.trim().lowercase()
+                (phrase.isNotEmpty() && (trimmed.equals(phrase, ignoreCase = true) || normalizedTrigger == phrase)) ||
+                    trimmed.equals("run ${r.name}", ignoreCase = true)
+            }
+            if (matchedRoutine != null) {
+                runRoutine(matchedRoutine)
+                return
+            }
+        }
+
+        // 1b. Intercept Device Action commands (Call, WhatsApp, SMS, Email, Maps, Calendar, UPI, YouTube, Alarm, Timer, Open App)
         if (attachment == null && batchDocs.isEmpty()) {
             val parsedDeviceAction = DeviceActionEngine.parseFromPrompt(
                 rawInput = trimmed,
@@ -1276,6 +2094,51 @@ class ChatViewModel(
         }
 
         if (isStreaming.value) return
+
+        // 1c. Intercept saved Smart Home / Webhook / Tasker trigger phrases
+        if (attachment == null && batchDocs.isEmpty() && !trimmed.startsWith("/")) {
+            viewModelScope.launch {
+                val matchedHook = repository.matchWebhookByPhrase(trimmed)
+                if (matchedHook != null) {
+                    statusNotice.value = "WEBHOOK // Firing \"${matchedHook.name}\"…"
+                    val res = repository.executeWebhook(matchedHook)
+                    val summary = res.fold(
+                        onSuccess = { "**Webhook Executed:** `${matchedHook.name}`\n\n- **Endpoint:** `${matchedHook.method} ${matchedHook.url}`\n- **Response:** `$it`" },
+                        onFailure = { "**Webhook Failed:** `${matchedHook.name}` — ${it.message ?: "Network error"}" }
+                    )
+                    val convId = activeConversationId.value
+                        ?: repository.getOrCreateActiveConversationId(
+                            defaultTitle = "Webhook: ${matchedHook.name}",
+                            modelDbId = uiState.value.selectedModel?.model?.id,
+                            personaId = uiState.value.activePersona?.id
+                        ).also { activeConversationId.value = it }
+                    repository.appendInstantExchange(
+                        conversationId = convId,
+                        userText = trimmed,
+                        assistantText = summary,
+                        modelLabel = "WEBHOOK"
+                    )
+                    statusNotice.value = res.fold(
+                        onSuccess = { "WEBHOOK // ${matchedHook.name} → $it" },
+                        onFailure = { "WEBHOOK // Failed: ${it.message}" }
+                    )
+                    return@launch
+                }
+                continueSendMessage(trimmed, attachment, batchDocs, rawPromptText)
+            }
+            return
+        }
+
+        continueSendMessage(trimmed, attachment, batchDocs, rawPromptText)
+    }
+
+    private fun continueSendMessage(
+        trimmed: String,
+        attachment: String?,
+        batchDocs: List<Pair<String, String>>,
+        rawPromptText: String
+    ) {
+        val state = uiState.value
 
         // 2. Intercept Custom Slash Commands (e.g. /fix, /explain, /json)
         var effectivePrompt = trimmed
@@ -1352,7 +2215,16 @@ class ChatViewModel(
                 appendLine()
             }
             if (effectivePrompt.isNotBlank()) {
-                append(effectivePrompt)
+                val processed = if (state.tokenDietEnabled) {
+                    val comp = PromptCompressor.compress(effectivePrompt)
+                    if (comp.savedPercent >= 5) {
+                        statusNotice.value = "TOKEN DIET // Saved ~${comp.savedPercent}% tokens before sending."
+                    }
+                    comp.compressedText
+                } else {
+                    effectivePrompt
+                }
+                append(processed)
             } else if (batchDocs.isNotEmpty()) {
                 append("Analyze, compare, and synthesize the ${batchDocs.size} attached documents below.")
             }
@@ -1374,9 +2246,20 @@ class ChatViewModel(
             }
         }.trim()
 
-        val options = buildChatOptions(effectivePersona, state.agentsMd, state.requestParams, state.toolsEnabled)
+        val latestCheckpoint = state.threadCheckpoints.maxByOrNull { it.createdAt }
+        val options = buildChatOptions(
+            persona = effectivePersona,
+            agentsMd = state.agentsMd,
+            params = state.requestParams,
+            enableTools = state.toolsEnabled,
+            guidedMode = state.guidedModeEnabled,
+            smartContext = state.smartContext,
+            activeConstraints = state.activeConstraints,
+            checkpointSummary = latestCheckpoint?.summaryMarkdown
+        )
         val searchOn = state.webSearchEnabled
         val shouldAutoExtractMemory = state.autoExtractMemories
+        val shouldVerifyFix = state.verifyFixEnabled
         pendingAttachmentUri.value = null
         quotedMessage.value = null
         pendingDocumentContext.value = null
@@ -1387,10 +2270,84 @@ class ChatViewModel(
             statusNotice.value = "AUTO-ROUTER // Selected ${model.model.displayName} ($autoRouteLabel)."
         }
 
+        // Incognito Ghost Chat Mode: pure volatile RAM, zero Room DB / search / memory writes
+        if (state.ghostModeEnabled) {
+            activeStreamJob = viewModelScope.launch {
+                isStreaming.value = true
+                lastFailedPrompt.value = null
+                val (resolvedModel, budgetNotice) = repository.resolveBudgetDowngradeModel(
+                    requestedModel = model,
+                    availableModels = state.availableModels,
+                    forceFlagshipOverride = state.forceFlagshipOverride
+                )
+                if (budgetNotice != null) statusNotice.value = budgetNotice
+                val priorHistory = ghostMessages.value.map {
+                    (if (it.role == "USER") "user" else "assistant") to it.content
+                }
+                val userMsgId = -(System.currentTimeMillis())
+                val aiMsgId = userMsgId - 1L
+                val userGhost = MessageEntity(
+                    id = userMsgId,
+                    conversationId = -1L,
+                    role = "USER",
+                    content = finalPrompt
+                )
+                val aiGhost = MessageEntity(
+                    id = aiMsgId,
+                    conversationId = -1L,
+                    role = "ASSISTANT",
+                    content = "",
+                    modelLabel = "GHOST // ${resolvedModel.model.displayName}"
+                )
+                ghostMessages.update { it + userGhost + aiGhost }
+                try {
+                    val finalReply = repository.streamGhostChatTurn(
+                        history = priorHistory,
+                        userText = finalPrompt,
+                        model = resolvedModel,
+                        options = options,
+                        onDelta = { partial ->
+                            ghostMessages.update { list ->
+                                list.map { if (it.id == aiMsgId) it.copy(content = partial) else it }
+                            }
+                        }
+                    )
+                    if (finalReply.isNotBlank()) {
+                        ghostMessages.update { list ->
+                            list.map { if (it.id == aiMsgId) it.copy(content = finalReply) else it }
+                        }
+                        viewModelScope.launch {
+                            val chips = repository.generateFollowUpChips(finalPrompt, finalReply, resolvedModel)
+                            if (chips.isNotEmpty()) followUpSuggestions.value = chips
+                        }
+                    }
+                } catch (ce: kotlinx.coroutines.CancellationException) {
+                    throw ce
+                } catch (err: Throwable) {
+                    val errText = err.message ?: "Ghost request failed."
+                    ghostMessages.update { list ->
+                        list.map { if (it.id == aiMsgId) it.copy(content = errText, isError = true) else it }
+                    }
+                    errorToast.value = errText
+                    lastFailedPrompt.value = rawPromptText
+                } finally {
+                    isStreaming.value = false
+                }
+            }
+            return
+        }
+
         activeStreamJob = viewModelScope.launch {
             isStreaming.value = true
             lastFailedPrompt.value = null
             try {
+                val (resolvedModel, budgetNotice) = repository.resolveBudgetDowngradeModel(
+                    requestedModel = model,
+                    availableModels = state.availableModels,
+                    forceFlagshipOverride = state.forceFlagshipOverride
+                )
+                if (budgetNotice != null) statusNotice.value = budgetNotice
+                val model = resolvedModel
                 val convId = activeConversationId.value
                     ?: repository.createConversation(
                         title = effectivePrompt.take(40).ifBlank { "Image Chat" },
@@ -1428,8 +2385,23 @@ class ChatViewModel(
                     }
                 )
 
-                val lastReply = uiState.value.messages.lastOrNull { it.role == "ASSISTANT" && !it.isError }?.content.orEmpty()
-                if (lastReply.isNotBlank()) {
+                val lastMsg = uiState.value.messages.lastOrNull { it.role == "ASSISTANT" && !it.isError }
+                var lastReply = lastMsg?.content.orEmpty()
+                if (lastMsg != null && lastReply.isNotBlank()) {
+                    if (shouldVerifyFix && lastReply.length >= 60) {
+                        statusNotice.value = "VERIFY & FIX // Running automated edge-case self-check…"
+                        val verified = repository.verifyAndFixResponse(
+                            originalPrompt = effectivePrompt.ifBlank { finalPrompt.take(800) },
+                            draftAnswer = lastReply,
+                            preferredModel = model
+                        )
+                        if (verified.isNotBlank() && verified != lastReply) {
+                            repository.updateMessageContent(lastMsg.id, verified)
+                            lastReply = verified
+                            statusNotice.value = "VERIFY & FIX // Self-check complete."
+                        }
+                    }
+
                     // Generate 3 clickable 1-tap Smart Follow-Up Chips silently in background
                     viewModelScope.launch {
                         val chips = repository.generateFollowUpChips(
@@ -1529,11 +2501,36 @@ class ChatViewModel(
         persona: PersonaInfo?,
         agentsMd: String,
         params: RequestParamsOverride,
-        enableTools: Boolean
+        enableTools: Boolean,
+        guidedMode: Boolean = false,
+        smartContext: SmartContextSnapshot = SmartContextSnapshot(),
+        activeConstraints: Set<NegativeConstraint> = emptySet(),
+        checkpointSummary: String? = null
     ): ChatOptions {
         val combinedSystem = buildList {
             if (agentsMd.isNotBlank()) add("# Project Instructions (AGENTS.md)\n$agentsMd")
             if (!persona?.systemPrompt.isNullOrBlank()) add(persona!!.systemPrompt)
+            if (smartContext.timeProfile.systemInstruction.isNotBlank()) {
+                add("# Smart Time Profile (${smartContext.timeProfile.label})\n${smartContext.timeProfile.systemInstruction}")
+            }
+            if (smartContext.isEcoModeActive) {
+                val ecoDetail = if (smartContext.isSlowNetwork) "Slow/Metered Network" else "Battery ${smartContext.batteryPercent}%"
+                add("# Eco Mode Active\nKeep responses crisp and token-efficient ($ecoDetail).")
+            }
+            if (guidedMode) {
+                add(
+                    "# Guided Wizard Mode\nIf the user's request is broad, ambiguous, or a multi-step planning/architecture task, ask 2-3 brief, high-impact clarifying questions numbered 1..3 BEFORE producing a long final answer. If the user is answering your clarifying questions, deliver the complete tailored solution."
+                )
+            }
+            if (activeConstraints.isNotEmpty()) {
+                add(
+                    "# Strict Output Constraints\n" +
+                        activeConstraints.joinToString("\n") { "- ${it.chipLabel}: ${it.instruction}" }
+                )
+            }
+            if (!checkpointSummary.isNullOrBlank()) {
+                add("# Earlier Thread TL;DR Checkpoint Anchor\n$checkpointSummary")
+            }
         }.joinToString("\n\n").takeIf { it.isNotBlank() }
 
         return ChatOptions(
@@ -1600,5 +2597,54 @@ class ChatViewModel(
         val batchDocumentTitles: List<String>,
         val liveCamEnabled: Boolean,
         val liveVoiceActive: Boolean
+    )
+
+    private data class ConversationModesBundle(
+        val tokenDietEnabled: Boolean,
+        val guidedModeEnabled: Boolean,
+        val verifyFixEnabled: Boolean,
+        val smartContext: SmartContextSnapshot,
+        val cooldownMap: Map<Long, Long>
+    )
+
+    private data class SmartPrefsBundle(
+        val smartZones: List<SmartZone>,
+        val timeProfilesEnabled: Boolean,
+        val autoEcoMode: Boolean,
+        val wakePhraseEnabled: Boolean,
+        val ambientWhisperEnabled: Boolean
+    )
+
+    private data class HubsBundle(
+        val clipboardHistory: List<ClipboardSnippetInfo>,
+        val localWorkspaceUri: String?,
+        val workspaceFiles: List<WorkspaceFileEntry>,
+        val expenses: List<ExpenseRecord>,
+        val watchlist: List<WatchlistItemInfo>,
+        val canvasVersions: List<CanvasVersionInfo>
+    )
+
+    private data class VerificationBundle(
+        val factCheckByMessageId: Map<Long, List<FactCheckClaim>>,
+        val checkingFactMessageIds: Set<Long>,
+        val activeDecisionMatrix: DecisionMatrixData?,
+        val isBuildingMatrix: Boolean
+    )
+
+    private data class Wave4UxBundle(
+        val activeConstraints: Set<NegativeConstraint>,
+        val isEnhancingPrompt: Boolean,
+        val isExpandingMindMapNode: Boolean,
+        val ghostModeEnabled: Boolean,
+        val ghostMessages: List<MessageEntity>
+    )
+
+    private data class Wave4BudgetMetaBundle(
+        val budgetConfig: DailyBudgetConfig,
+        val todaySpendUsd: Double,
+        val forceFlagshipOverride: Boolean,
+        val voiceFormTemplates: List<VoiceFormTemplate>,
+        val checkpointsByConv: Map<Long, List<ThreadCheckpoint>>,
+        val summarizingCheckpointMsgId: Long?
     )
 }

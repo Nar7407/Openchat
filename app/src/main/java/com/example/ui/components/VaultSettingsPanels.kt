@@ -3,12 +3,15 @@ package com.example.ui.components
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Lock
@@ -16,6 +19,7 @@ import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.Key
 import androidx.compose.material.icons.outlined.Upload
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -26,14 +30,18 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import com.example.domain.model.DailyBudgetConfig
 import com.example.domain.model.DisplayCurrency
 import com.example.domain.model.ModelInfo
+import com.example.domain.model.SelectableModel
 import com.example.ui.theme.SwissCanvas
+import com.example.ui.theme.SwissConcrete
 import com.example.ui.theme.SwissInk
 import com.example.ui.theme.SwissMuted
 import com.example.ui.theme.SwissPaper
@@ -41,17 +49,22 @@ import com.example.ui.theme.SwissSignalRed
 import com.example.ui.theme.SwissSignalRedTint
 import com.example.ui.theme.SwissVerifiedInk
 import com.example.ui.theme.SwissVerifiedTint
+import java.util.Locale
 
 @Composable
 fun VaultSecurityAndBackupPanel(
     displayCurrency: DisplayCurrency,
     isPinEnabled: Boolean,
+    autoLockMinutes: Int = 5,
+    lockOnAppSwitch: Boolean = false,
     statusMessage: String?,
     errorMessage: String?,
     onSelectCurrency: (DisplayCurrency) -> Unit,
     onRequestSetPin: () -> Unit,
     onDisablePin: () -> Unit,
     onLockNow: () -> Unit,
+    onSetAutoLockMinutes: (Int) -> Unit = {},
+    onSetLockOnAppSwitch: (Boolean) -> Unit = {},
     onRequestExportBackup: () -> Unit,
     onRequestImportBackup: () -> Unit,
     onDismissNotices: () -> Unit,
@@ -149,6 +162,43 @@ fun VaultSecurityAndBackupPanel(
                             )
                         }
                     }
+
+                    // Auto-Lock on Idle or App Switch
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 6.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            text = "AUTO-LOCK ON IDLE OR APP SWITCH",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (isPinEnabled) SwissInk else SwissMuted
+                        )
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            listOf(0 to "OFF", 1 to "1 MIN", 5 to "5 MIN", 15 to "15 MIN").forEach { (mins, label) ->
+                                SwissToggleCell(
+                                    label = label,
+                                    selected = autoLockMinutes == mins,
+                                    useSignalRedWhenSelected = true,
+                                    onClick = { onSetAutoLockMinutes(mins) },
+                                    modifier = Modifier.testTag("autolock_mins_$mins")
+                                )
+                            }
+                            SwissToggleCell(
+                                label = if (lockOnAppSwitch) "ON APP SWITCH: ON" else "ON APP SWITCH: OFF",
+                                selected = lockOnAppSwitch,
+                                useSignalRedWhenSelected = true,
+                                onClick = { onSetLockOnAppSwitch(!lockOnAppSwitch) },
+                                modifier = Modifier.testTag("autolock_app_switch_toggle")
+                            )
+                        }
+                    }
                 }
 
                 SwissRuleDivider(symbol = "/")
@@ -224,6 +274,171 @@ fun VaultSecurityAndBackupPanel(
                                 style = MaterialTheme.typography.bodySmall,
                                 color = SwissInk
                             )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun DailyBudgetGuardPanel(
+    config: DailyBudgetConfig,
+    todaySpendUsd: Double,
+    availableModels: List<SelectableModel>,
+    onSaveConfig: (DailyBudgetConfig) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var capDraft by remember(config.dailyCapUsd) {
+        mutableStateOf(
+            if (config.dailyCapUsd > 0.0) String.format(Locale.US, "%.2f", config.dailyCapUsd) else ""
+        )
+    }
+    val ratio = if (config.dailyCapUsd > 0.0) {
+        (todaySpendUsd / config.dailyCapUsd).toFloat().coerceIn(0f, 1f)
+    } else 0f
+    val pct = if (config.dailyCapUsd > 0.0) ((todaySpendUsd / config.dailyCapUsd) * 100.0).toInt() else 0
+    val isWarning = config.dailyCapUsd > 0.0 && ratio >= 0.80f
+    val amberInk = Color(0xFFB45309)
+    val amberTint = Color(0xFFFEF3C7)
+
+    SwissPanel(modifier = modifier.fillMaxWidth().testTag("daily_budget_guard_panel")) {
+        Column {
+            SwissPanelHeader(
+                leftLabel = "BUDGET // DAILY CAP & 80% AUTO-DOWNGRADE",
+                rightLabel = if (config.dailyCapUsd > 0.0) {
+                    String.format(Locale.US, "$%.3f / $%.2f (%d%%)", todaySpendUsd, config.dailyCapUsd, pct)
+                } else {
+                    String.format(Locale.US, "TODAY $%.3f · UNLIMITED", todaySpendUsd)
+                },
+                rightAccent = isWarning,
+                backgroundColor = if (isWarning) amberTint else SwissPaper
+            )
+
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "At 80% of your daily cap, AllChat displays an amber warning badge and automatically routes routine queries to your flash/free tier model unless you manually override to flagship.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = SwissMuted
+                )
+
+                if (config.dailyCapUsd > 0.0) {
+                    LinearProgressIndicator(
+                        progress = { ratio.coerceAtLeast(0.02f) },
+                        color = when {
+                            ratio >= 1f -> SwissSignalRed
+                            isWarning -> amberInk
+                            else -> SwissInk
+                        },
+                        trackColor = SwissConcrete,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(6.dp)
+                    )
+                }
+
+                // Quick Cap Presets
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    listOf(0.0 to "UNLIMITED", 0.50 to "$0.50", 2.00 to "$2.00", 5.00 to "$5.00", 10.00 to "$10.00").forEach { (usd, label) ->
+                        SwissToggleCell(
+                            label = label,
+                            selected = kotlin.math.abs(config.dailyCapUsd - usd) < 0.001,
+                            useSignalRedWhenSelected = true,
+                            onClick = {
+                                capDraft = if (usd > 0.0) String.format(Locale.US, "%.2f", usd) else ""
+                                onSaveConfig(config.copy(dailyCapUsd = usd))
+                            },
+                            modifier = Modifier.testTag("budget_preset_${label.replace("$", "")}")
+                        )
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedTextField(
+                        value = capDraft,
+                        onValueChange = { capDraft = it.filter { ch -> ch.isDigit() || ch == '.' } },
+                        label = { Text("Custom Daily Cap (USD)") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        shape = RectangleShape,
+                        colors = swissTextFieldColors(),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("budget_cap_input")
+                    )
+                    SwissButton(
+                        text = "Apply",
+                        variant = SwissButtonVariant.INK,
+                        minHeight = 46.dp,
+                        onClick = {
+                            val parsed = capDraft.toDoubleOrNull()?.coerceAtLeast(0.0) ?: 0.0
+                            onSaveConfig(config.copy(dailyCapUsd = parsed))
+                        },
+                        modifier = Modifier.testTag("budget_cap_apply_button")
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "AUTO-DOWNGRADE AT 80% CAP",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = SwissInk
+                    )
+                    SwissToggleCell(
+                        label = if (config.autoDowngradeEnabled) "ENABLED" else "OFF",
+                        selected = config.autoDowngradeEnabled,
+                        useSignalRedWhenSelected = true,
+                        onClick = {
+                            onSaveConfig(config.copy(autoDowngradeEnabled = !config.autoDowngradeEnabled))
+                        },
+                        modifier = Modifier.testTag("budget_autodowngrade_toggle")
+                    )
+                }
+
+                if (config.autoDowngradeEnabled && availableModels.isNotEmpty()) {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            text = "DOWNGRADE FLASH / FREE MODEL (AUTO-PICKS FLASH/MINI IF UNSET)",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SwissMuted
+                        )
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            SwissToggleCell(
+                                label = "AUTO-DETECT FLASH",
+                                selected = config.downgradeModelDbId == null,
+                                useSignalRedWhenSelected = true,
+                                onClick = { onSaveConfig(config.copy(downgradeModelDbId = null)) }
+                            )
+                            availableModels.take(12).forEach { cand ->
+                                SwissToggleCell(
+                                    label = cand.model.displayName.take(22),
+                                    selected = config.downgradeModelDbId == cand.model.id,
+                                    useSignalRedWhenSelected = true,
+                                    onClick = { onSaveConfig(config.copy(downgradeModelDbId = cand.model.id)) }
+                                )
+                            }
                         }
                     }
                 }

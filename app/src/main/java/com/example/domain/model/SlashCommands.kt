@@ -27,6 +27,23 @@ enum class SlashCommandId {
     COMMANDS,
     REMEMBER,
     MEMORY,
+    NOTE,
+    NOTES,
+    ROUTINES,
+    QR,
+    PLOT,
+    COMPARE,
+    CANVAS,
+    EXPENSES,
+    WATCH,
+    BLE,
+    COMMUTE,
+    INTERPRET,
+    SPOTLIGHT,
+    REDACT,
+    CMD,
+    FORM,
+    GHOST,
     EXIT
 }
 
@@ -166,6 +183,119 @@ object SlashCommandRegistry {
             aliases = listOf("/memories"),
             category = SlashCommandCategory.PROVIDERS,
             summary = "Opens the Memory Bank manager to view, edit, toggle, or delete saved facts."
+        ),
+        SlashCommandDef(
+            id = SlashCommandId.NOTE,
+            primary = "/note",
+            category = SlashCommandCategory.PROVIDERS,
+            summary = "Cleans up dictated text or a memo into a structured Markdown note in your Voice Notes Inbox."
+        ),
+        SlashCommandDef(
+            id = SlashCommandId.NOTES,
+            primary = "/notes",
+            aliases = listOf("/inbox"),
+            category = SlashCommandCategory.PROVIDERS,
+            summary = "Opens your Voice Quick-Notes Inbox to search, copy, edit, or delete saved notes."
+        ),
+        SlashCommandDef(
+            id = SlashCommandId.ROUTINES,
+            primary = "/routine",
+            aliases = listOf("/routines"),
+            category = SlashCommandCategory.PROVIDERS,
+            summary = "Runs a saved 1-tap Assistant Routine by name/phrase or opens Routines in Settings."
+        ),
+        SlashCommandDef(
+            id = SlashCommandId.QR,
+            primary = "/qr",
+            category = SlashCommandCategory.PROVIDERS,
+            summary = "Generates an instant scannable QR code locally (e.g. /qr https://example.com)."
+        ),
+        SlashCommandDef(
+            id = SlashCommandId.PLOT,
+            primary = "/plot",
+            category = SlashCommandCategory.PROVIDERS,
+            summary = "Opens the Interactive Desmos-Style Function Plotter (e.g. /plot a*exp(-b*x)*sin(c*x))."
+        ),
+        SlashCommandDef(
+            id = SlashCommandId.COMPARE,
+            primary = "/compare",
+            category = SlashCommandCategory.PROVIDERS,
+            summary = "Builds a Weighted Decision Matrix Card with live sliders (e.g. /compare MacBook vs ThinkPad)."
+        ),
+        SlashCommandDef(
+            id = SlashCommandId.CANVAS,
+            primary = "/canvas",
+            aliases = listOf("/scratchpad"),
+            category = SlashCommandCategory.INTERFACE,
+            summary = "Opens the Interactive Split-Editor Canvas with Highlight-to-Edit & Version History."
+        ),
+        SlashCommandDef(
+            id = SlashCommandId.EXPENSES,
+            primary = "/expenses",
+            aliases = listOf("/receipt"),
+            category = SlashCommandCategory.PROVIDERS,
+            summary = "Opens your private Receipt & Monthly Expense Tracker with 1-tap .xlsx export."
+        ),
+        SlashCommandDef(
+            id = SlashCommandId.WATCH,
+            primary = "/watch",
+            aliases = listOf("/watchlist"),
+            category = SlashCommandCategory.PROVIDERS,
+            summary = "Opens the Web Page & Topic Change Watcher to track what's new."
+        ),
+        SlashCommandDef(
+            id = SlashCommandId.BLE,
+            primary = "/ble",
+            category = SlashCommandCategory.PROVIDERS,
+            summary = "Opens the Bluetooth LE Smart-Device & ESP32/Arduino Sensor Inspector."
+        ),
+        SlashCommandDef(
+            id = SlashCommandId.COMMUTE,
+            primary = "/commute",
+            aliases = listOf("/hud"),
+            category = SlashCommandCategory.INTERFACE,
+            summary = "Launches the high-contrast Hands-Free Commute / Driving HUD with Earbud Tap-to-Talk."
+        ),
+        SlashCommandDef(
+            id = SlashCommandId.INTERPRET,
+            primary = "/interpret",
+            aliases = listOf("/interpreter"),
+            category = SlashCommandCategory.INTERFACE,
+            summary = "Launches Two-Person Face-to-Face Split-Screen Live Voice Interpreter."
+        ),
+        SlashCommandDef(
+            id = SlashCommandId.SPOTLIGHT,
+            primary = "/spotlight",
+            aliases = listOf("/find"),
+            category = SlashCommandCategory.SESSION,
+            summary = "Global Spotlight Search across all chats, code, notes, docs, expenses + Visual Topic Map."
+        ),
+        SlashCommandDef(
+            id = SlashCommandId.REDACT,
+            primary = "/redact",
+            category = SlashCommandCategory.PROVIDERS,
+            summary = "Opens the local Privacy-First PII Redactor (masks phones, Aadhaar, PAN, emails, UPI)."
+        ),
+        SlashCommandDef(
+            id = SlashCommandId.CMD,
+            primary = "/cmd",
+            aliases = listOf("/cli", "/shell"),
+            category = SlashCommandCategory.PROVIDERS,
+            summary = "Interactive CLI Command Builder for FFmpeg, ADB, Git, Bash & PowerShell with tappable flag tooltips."
+        ),
+        SlashCommandDef(
+            id = SlashCommandId.FORM,
+            primary = "/form",
+            aliases = listOf("/log", "/table"),
+            category = SlashCommandCategory.PROVIDERS,
+            summary = "Voice-to-Structured-Form & Instant Table Filler (Standup, Bug Report, Workout, Lab Log)."
+        ),
+        SlashCommandDef(
+            id = SlashCommandId.GHOST,
+            primary = "/ghost",
+            aliases = listOf("/incognito"),
+            category = SlashCommandCategory.SESSION,
+            summary = "Toggles Incognito Ghost Chat mode (nothing written to local history or search index)."
         ),
         SlashCommandDef(
             id = SlashCommandId.EXIT,
