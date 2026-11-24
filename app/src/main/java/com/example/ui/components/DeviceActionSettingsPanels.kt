@@ -21,7 +21,10 @@ import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.outlined.Contacts
+import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.DeleteOutline
+import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material.icons.outlined.Headphones
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -34,8 +37,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -54,7 +59,8 @@ import com.example.util.DeviceActionEngine
 @Composable
 fun QuickContactsSettingsPanel(
     contacts: List<QuickContact>,
-    onSaveContact: (name: String, phone: String, email: String, upiId: String) -> Unit,
+    onSaveContact: (name: String, phone: String, email: String, upiId: String, nicknames: String) -> Unit,
+    onImportContactsBulk: (List<QuickContact>) -> Unit,
     onDeleteContact: (id: String) -> Unit,
     onReportError: (String) -> Unit,
     modifier: Modifier = Modifier
@@ -62,6 +68,7 @@ fun QuickContactsSettingsPanel(
     val context = LocalContext.current
     var nameDraft by remember { mutableStateOf("") }
     var phoneDraft by remember { mutableStateOf("") }
+    var nicknamesDraft by remember { mutableStateOf("") }
     var emailDraft by remember { mutableStateOf("") }
     var upiDraft by remember { mutableStateOf("") }
 
@@ -83,7 +90,7 @@ fun QuickContactsSettingsPanel(
                         val pickedName = if (nameIdx >= 0) cursor.getString(nameIdx).orEmpty().trim() else ""
                         val pickedNum = if (numIdx >= 0) cursor.getString(numIdx).orEmpty().trim() else ""
                         if (pickedName.isNotBlank() && pickedNum.isNotBlank()) {
-                            onSaveContact(pickedName, DeviceActionEngine.normalizePhoneNumber(pickedNum), "", "")
+                            onSaveContact(pickedName, DeviceActionEngine.normalizePhoneNumber(pickedNum), "", "", "")
                         } else {
                             onReportError("Selected contact did not contain a valid phone number.")
                         }
@@ -95,10 +102,28 @@ fun QuickContactsSettingsPanel(
         }
     }
 
+    // Zero-permission Bulk vCard (.vcf) File Importer via Android Storage Access Framework
+    val vcfImportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        runCatching {
+            val rawVcf = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }.orEmpty()
+            val parsed = DeviceActionEngine.parseVcfContacts(rawVcf)
+            if (parsed.isEmpty()) {
+                onReportError("No valid contacts found inside the selected .vcf file.")
+            } else {
+                onImportContactsBulk(parsed)
+            }
+        }.onFailure { err ->
+            onReportError(err.message ?: "Could not read the selected .vcf file.")
+        }
+    }
+
     SwissPanel(modifier = modifier.fillMaxWidth()) {
         Column {
             SwissPanelHeader(
-                leftLabel = "ACTIONS // QUICK CONTACTS (CALL, SMS, EMAIL & UPI)",
+                leftLabel = "ACTIONS // QUICK CONTACTS (CALL, WHATSAPP, SMS, EMAIL & UPI)",
                 rightLabel = "${contacts.size} SAVED"
             )
             Column(
@@ -106,31 +131,52 @@ fun QuickContactsSettingsPanel(
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Text(
-                    text = "Save phone numbers, emails, and UPI IDs locally so commands like \"Call Mom\", \"SMS Rahul\", \"Email Priya\", or \"Pay 250 to Amit via UPI\" resolve automatically without broad permissions.",
+                    text = "Import contacts from your phone or bulk .vcf export, or add manually with nicknames (e.g. \"Mom, Mummy\", \"Bhai\"). Saved contacts are resolved automatically across Chat, Live Assistant & Widget.",
                     style = MaterialTheme.typography.bodySmall,
                     color = SwissMuted
                 )
 
-                SwissButton(
-                    text = "Import from Phone Contacts",
-                    leadingIcon = Icons.Outlined.Contacts,
-                    variant = SwissButtonVariant.PRIMARY,
-                    minHeight = 40.dp,
-                    onClick = {
-                        runCatching {
-                            val pickIntent = Intent(
-                                Intent.ACTION_PICK,
-                                ContactsContract.CommonDataKinds.Phone.CONTENT_URI
-                            )
-                            contactPickerLauncher.launch(pickIntent)
-                        }.onFailure {
-                            onReportError("No Contacts app available on this device. Add manually below.")
-                        }
-                    },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("settings_import_phone_contact")
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    SwissButton(
+                        text = "Pick Phone Contact",
+                        leadingIcon = Icons.Outlined.Contacts,
+                        variant = SwissButtonVariant.PRIMARY,
+                        minHeight = 40.dp,
+                        onClick = {
+                            runCatching {
+                                val pickIntent = Intent(
+                                    Intent.ACTION_PICK,
+                                    ContactsContract.CommonDataKinds.Phone.CONTENT_URI
+                                )
+                                contactPickerLauncher.launch(pickIntent)
+                            }.onFailure {
+                                onReportError("No Contacts app available on this device. Add manually or import .vcf below.")
+                            }
+                        },
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("settings_import_phone_contact")
+                    )
+
+                    SwissButton(
+                        text = "Import .VCF (Bulk)",
+                        variant = SwissButtonVariant.OUTLINE,
+                        minHeight = 40.dp,
+                        onClick = {
+                            runCatching {
+                                vcfImportLauncher.launch(arrayOf("text/x-vcard", "text/vcard", "text/directory", "*/*"))
+                            }.onFailure {
+                                onReportError("Unable to open file picker for .vcf import.")
+                            }
+                        },
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("settings_import_vcf_contacts")
+                    )
+                }
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -139,7 +185,7 @@ fun QuickContactsSettingsPanel(
                     OutlinedTextField(
                         value = nameDraft,
                         onValueChange = { nameDraft = it },
-                        placeholder = { Text("Name (e.g. Mom)", style = MaterialTheme.typography.bodySmall) },
+                        placeholder = { Text("Name (e.g. Sunita)", style = MaterialTheme.typography.bodySmall) },
                         singleLine = true,
                         shape = RectangleShape,
                         colors = swissTextFieldColors(containerColor = SwissCanvas),
@@ -160,6 +206,18 @@ fun QuickContactsSettingsPanel(
                             .testTag("settings_contact_phone_input")
                     )
                 }
+
+                OutlinedTextField(
+                    value = nicknamesDraft,
+                    onValueChange = { nicknamesDraft = it },
+                    placeholder = { Text("Voice Aliases / Nicknames (e.g. Mom, Mummy, Bhai, Vimla)", style = MaterialTheme.typography.bodySmall) },
+                    singleLine = true,
+                    shape = RectangleShape,
+                    colors = swissTextFieldColors(containerColor = SwissCanvas),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("settings_contact_nicknames_input")
+                )
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -201,10 +259,12 @@ fun QuickContactsSettingsPanel(
                             nameDraft.trim(),
                             if (phoneDraft.isNotBlank()) DeviceActionEngine.normalizePhoneNumber(phoneDraft) else "",
                             emailDraft.trim(),
-                            upiDraft.trim()
+                            upiDraft.trim(),
+                            nicknamesDraft.trim()
                         )
                         nameDraft = ""
                         phoneDraft = ""
+                        nicknamesDraft = ""
                         emailDraft = ""
                         upiDraft = ""
                     },
@@ -226,13 +286,27 @@ fun QuickContactsSettingsPanel(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = contact.name,
-                                        style = MaterialTheme.typography.titleSmall,
-                                        color = SwissInk,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
+                                    Row(
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = contact.name,
+                                            style = MaterialTheme.typography.titleSmall,
+                                            color = SwissInk,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        if (contact.nicknames.isNotBlank()) {
+                                            Text(
+                                                text = "AKA ${contact.nicknames.uppercase()}",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = SwissSignalRed,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                    }
                                     val detailLine = listOfNotNull(
                                         contact.phoneNumber.takeIf { it.isNotBlank() },
                                         contact.email.takeIf { it.isNotBlank() },
@@ -246,14 +320,34 @@ fun QuickContactsSettingsPanel(
                                         overflow = TextOverflow.Ellipsis
                                     )
                                 }
-                                Icon(
-                                    imageVector = Icons.Outlined.DeleteOutline,
-                                    contentDescription = "Delete contact",
+                                Row(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Outlined.Edit,
+                                        contentDescription = "Edit contact & voice aliases",
+                                        tint = SwissInk,
+                                        modifier = Modifier
+                                            .size(18.dp)
+                                            .clickable {
+                                                nameDraft = contact.name
+                                                phoneDraft = contact.phoneNumber
+                                                nicknamesDraft = contact.nicknames
+                                                emailDraft = contact.email
+                                                upiDraft = contact.upiId
+                                            }
+                                            .testTag("settings_edit_contact_${contact.id}")
+                                    )
+                                    Icon(
+                                        imageVector = Icons.Outlined.DeleteOutline,
+                                        contentDescription = "Delete contact",
                                     tint = SwissSignalRed,
                                     modifier = Modifier
                                         .size(20.dp)
                                         .clickable { onDeleteContact(contact.id) }
                                 )
+                                }
                             }
                         }
                     }
@@ -531,3 +625,124 @@ fun VisionFallbackSettingsPanel(
         }
     }
 }
+
+@Composable
+fun EarbudLaunchSetupPanel(
+    onTestLiveMic: () -> Unit,
+    onCopiedNotice: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val clipboard = LocalClipboardManager.current
+    val deepLinks = remember {
+        listOf(
+            "ANDROID DEEP LINK" to "allchat://live",
+            "PROTOCOL LINK" to "web+allchat://live",
+            "WEB / PWA ROUTE" to "https://allchat.app/?mode=live"
+        )
+    }
+
+    SwissPanel(modifier = modifier.fillMaxWidth().testTag("earbud_launch_setup_panel")) {
+        Column {
+            SwissPanelHeader(
+                leftLabel = "HANDS-FREE // EARBUD LAUNCH SETUP",
+                rightLabel = "BLUETOOTH"
+            )
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = "Control Live Assistant & Call/WhatsApp confirmations directly from your Bluetooth earbuds: 1x Tap = Confirm / Interrupt / Talk, 2x Tap or Next Track = Cancel.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = SwissMuted
+                )
+
+                deepLinks.forEachIndexed { idx, (label, uri) ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(SwissCanvas, RectangleShape)
+                            .border(1.dp, SwissInk, RectangleShape)
+                            .clickable {
+                                clipboard.setText(AnnotatedString(uri))
+                                onCopiedNotice("Copied $uri")
+                            }
+                            .padding(horizontal = 10.dp, vertical = 8.dp)
+                            .testTag("earbud_deeplink_copy_$idx"),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = label,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissMuted
+                            )
+                            Text(
+                                text = uri,
+                                style = MaterialTheme.typography.titleSmall,
+                                color = SwissInk,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .background(SwissInk, RectangleShape)
+                                .padding(horizontal = 8.dp, vertical = 5.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.ContentCopy,
+                                contentDescription = "Copy $uri",
+                                tint = SwissWhite,
+                                modifier = Modifier.size(13.dp)
+                            )
+                            Text(
+                                text = "COPY",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissWhite
+                            )
+                        }
+                    }
+                }
+
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(SwissPaper, RectangleShape)
+                        .border(1.dp, SwissConcrete, RectangleShape)
+                        .padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        text = "BACKGROUND EARBUD LAUNCH (KEY MAPPER / MACRODROID)",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = SwissSignalRed
+                    )
+                    Text(
+                        text = "1. Install Key Mapper or MacroDroid from Google Play.\n" +
+                            "2. Set Trigger → Bluetooth Headset Button (Long Press / Double Press).\n" +
+                            "3. Set Action → Open URL / Deep Link → paste allchat://live (or web+allchat://live).\n" +
+                            "4. Pressing your earbud even when AllChat is closed will jump straight into Live Mic listening with an audio chime.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = SwissInk
+                    )
+                }
+
+                SwissButton(
+                    text = "Test Live Mic & Earbud Mode",
+                    leadingIcon = Icons.Outlined.Headphones,
+                    variant = SwissButtonVariant.PRIMARY,
+                    minHeight = 42.dp,
+                    onClick = onTestLiveMic,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("settings_test_earbud_live_mic")
+                )
+            }
+        }
+    }
+}
+

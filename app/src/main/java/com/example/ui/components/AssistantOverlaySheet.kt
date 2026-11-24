@@ -112,6 +112,7 @@ import com.example.domain.model.DailyBudgetConfig
 import com.example.domain.model.ModelCapability
 import com.example.domain.model.NegativeConstraint
 import com.example.domain.model.QuickContact
+import com.example.domain.model.ReasoningEffort
 import com.example.domain.model.SelectableModel
 import com.example.ui.theme.SwissCanvas
 import com.example.ui.theme.SwissConcrete
@@ -126,7 +127,12 @@ import com.example.domain.model.AmbientNoiseLevel
 import com.example.domain.model.SmartContextSnapshot
 import com.example.util.DeviceAction
 import com.example.util.DeviceActionEngine
+import com.example.util.EarbudChimePlayer
+import com.example.util.EarbudCommand
+import com.example.util.EarbudKeyBus
+import com.example.util.MediaButtonBridge
 import com.example.util.ReadAloudController
+import kotlinx.coroutines.delay
 import com.example.util.SmartContextEngine
 import com.example.util.VoiceInputController
 import com.example.util.WakePhraseListener
@@ -207,6 +213,7 @@ fun AssistantOverlaySheet(
     var ghostMode by remember { mutableStateOf(false) }
     var ghostMessages by remember { mutableStateOf<List<MessageEntity>>(emptyList()) }
     var activeConstraints by remember { mutableStateOf<Set<NegativeConstraint>>(emptySet()) }
+    var reasoningEffort by remember { mutableStateOf(ReasoningEffort.BALANCED) }
     var isEnhancingPrompt by remember { mutableStateOf(false) }
     var followUpChips by remember { mutableStateOf<List<String>>(emptyList()) }
     var qrBeamPayload by remember { mutableStateOf<String?>(null) }
@@ -292,10 +299,28 @@ fun AssistantOverlaySheet(
         }
     }
 
+    var isTtsSpeaking by remember { mutableStateOf(false) }
+    val cooldownMap by repository.cooldownSnapshotFlow.collectAsStateWithLifecycle()
+    var cooldownNowMs by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(cooldownMap) {
+        val maxUntil = cooldownMap.values.maxOrNull() ?: 0L
+        while (maxUntil > System.currentTimeMillis()) {
+            cooldownNowMs = System.currentTimeMillis()
+            delay(1000L)
+        }
+        cooldownNowMs = System.currentTimeMillis()
+    }
+    val activeCooldownSec = remember(cooldownMap, cooldownNowMs) {
+        cooldownMap.values
+            .map { ((it - cooldownNowMs) / 1000L).toInt() }
+            .filter { it > 0 }
+            .maxOrNull() ?: 0
+    }
+
     val ttsController = remember(context) {
         ReadAloudController(
             context = context,
-            onSpeakingIdChanged = {}
+            onSpeakingIdChanged = { id -> isTtsSpeaking = (id != null) }
         )
     }
 
@@ -458,7 +483,28 @@ fun AssistantOverlaySheet(
         val parsedAction = DeviceActionEngine.parseFromPrompt(clean, quickContacts, customApps)
         if (parsedAction != null) {
             pendingAction = parsedAction
-            val spoken = "Ready to ${parsedAction.title}. Tap the confirmation button to execute."
+            if (parsedAction is DeviceAction.DialPhone && parsedAction.phoneNumber.isNotBlank()) {
+                statusBanner = parsedAction.displayBanner
+            }
+            val spoken = when (parsedAction) {
+                is DeviceAction.DialPhone -> when {
+                    parsedAction.ambiguousMatches.size >= 2 ->
+                        "Multiple contacts match ${parsedAction.contactLabel}. Tap one of the chips below to call."
+                    parsedAction.phoneNumber.isNotBlank() ->
+                        "Ready to call ${parsedAction.contactLabel ?: parsedAction.phoneNumber}. Press earbud once to confirm, or double-press to cancel."
+                    else ->
+                        "Pick a saved contact or enter a number below to call ${parsedAction.contactLabel ?: ""}."
+                }
+                is DeviceAction.SendWhatsApp -> when {
+                    parsedAction.ambiguousMatches.size >= 2 ->
+                        "Multiple contacts match ${parsedAction.contactLabel}. Tap a chip below to open WhatsApp."
+                    parsedAction.phoneNumber.isNotBlank() ->
+                        "Ready to send WhatsApp to ${parsedAction.contactLabel ?: parsedAction.phoneNumber}. Press earbud once to confirm, or double-press to cancel."
+                    else ->
+                        "Select a contact or enter a phone number below to send on WhatsApp."
+                }
+                else -> "Ready to ${parsedAction.title}. Tap the confirmation button below."
+            }
             if (!muteTts) ttsController.speak(System.currentTimeMillis(), spoken)
             if (ghostMode) {
                 val now = System.currentTimeMillis()
@@ -530,11 +576,22 @@ fun AssistantOverlaySheet(
                 if (budgetNotice != null) statusBanner = budgetNotice
 
                 val constraintBlock = activeConstraints.joinToString("\n") { "- ${it.instruction}" }
+                val contactsDirectory = if (ghostMode) {
+                    DeviceActionEngine.formatContactsForSystemPrompt(quickContacts)
+                } else ""
                 val effectiveSystemPrompt = buildString {
                     append("You are AllChat Assistant in Quick Overlay mode. Answer clearly, concisely, and naturally while remembering all prior turns in this conversation. When the user asks to call someone, send a WhatsApp message, send an SMS or email, pay via UPI, navigate or search Maps, create a calendar event, play/open YouTube, set an alarm/timer, or open an app, call the execute_device_action tool.")
+                    if (reasoningEffort.systemHint.isNotBlank()) {
+                        append("\n\nReasoning Effort (${reasoningEffort.displayLabel}): ")
+                        append(reasoningEffort.systemHint)
+                    }
                     if (constraintBlock.isNotBlank()) {
                         append("\n\nStrict User Output Rules:\n")
                         append(constraintBlock)
+                    }
+                    if (contactsDirectory.isNotBlank()) {
+                        append("\n\n")
+                        append(contactsDirectory)
                     }
                 }
 
@@ -551,14 +608,40 @@ fun AssistantOverlaySheet(
                         history = priorHistory,
                         userText = clean,
                         model = effectiveModel,
-                        options = ChatOptions(systemPrompt = effectiveSystemPrompt, enableTools = false),
+                        options = ChatOptions(
+                            systemPrompt = effectiveSystemPrompt,
+                            temperature = reasoningEffort.temperatureOverride,
+                            enableTools = false,
+                            reasoningEffort = reasoningEffort,
+                            supportsVisionInput = effectiveModel.model.supportsImageInput
+                        ),
                         onDelta = { partial ->
                             ghostMessages = ghostMessages.map { if (it.id == aiId) it.copy(content = partial) else it }
                         }
                     )
                     if (finalReply.isNotBlank()) {
                         ghostMessages = ghostMessages.map { if (it.id == aiId) it.copy(content = finalReply) else it }
-                        if (!muteTts) ttsController.speak(aiId, finalReply)
+                        val interceptedGhost = DeviceActionEngine.parseFromAssistantReply(
+                            userPrompt = clean,
+                            assistantReply = finalReply,
+                            contacts = quickContacts,
+                            customApps = customApps
+                        )
+                        if (interceptedGhost != null) {
+                            pendingAction = interceptedGhost
+                            val promptMsg = when (interceptedGhost) {
+                                is DeviceAction.DialPhone -> {
+                                    if (interceptedGhost.phoneNumber.isNotBlank()) statusBanner = interceptedGhost.displayBanner
+                                    "Ready to call ${interceptedGhost.contactLabel ?: interceptedGhost.phoneNumber}. Press earbud once to confirm, or double-press to cancel."
+                                }
+                                is DeviceAction.SendWhatsApp ->
+                                    "Ready to send WhatsApp to ${interceptedGhost.contactLabel ?: interceptedGhost.phoneNumber}. Press earbud once to confirm, or double-press to cancel."
+                                else -> finalReply
+                            }
+                            if (!muteTts) ttsController.speak(aiId, promptMsg)
+                        } else if (!muteTts) {
+                            ttsController.speak(aiId, finalReply)
+                        }
                         scope.launch {
                             val chips = repository.generateFollowUpChips(clean, finalReply, effectiveModel)
                             if (chips.isNotEmpty()) followUpChips = chips
@@ -582,7 +665,10 @@ fun AssistantOverlaySheet(
                         parentMessageId = leafId,
                         options = ChatOptions(
                             systemPrompt = effectiveSystemPrompt,
-                            enableTools = toolsEnabled
+                            temperature = reasoningEffort.temperatureOverride,
+                            enableTools = toolsEnabled,
+                            reasoningEffort = reasoningEffort,
+                            supportsVisionInput = effectiveModel.model.supportsImageInput
                         ),
                         enableWebSearch = webSearchEnabled,
                         onGroundingStatus = { status -> statusBanner = status },
@@ -591,7 +677,35 @@ fun AssistantOverlaySheet(
                             if (!muteTts) ttsController.enqueueSentence(sentence)
                         },
                         onDeviceActionTriggered = { triggered ->
-                            pendingAction = triggered
+                            val enriched = if (triggered is DeviceAction.DialPhone && triggered.contactLabel.isNullOrBlank() && triggered.phoneNumber.isNotBlank()) {
+                                val matched = DeviceActionEngine.resolveContactByPhone(triggered.phoneNumber, quickContacts)
+                                if (matched != null) triggered.copy(contactLabel = matched.name) else triggered
+                            } else {
+                                triggered
+                            }
+                            pendingAction = enriched
+                            when (enriched) {
+                                is DeviceAction.DialPhone -> {
+                                    if (enriched.phoneNumber.isNotBlank()) {
+                                        statusBanner = enriched.displayBanner
+                                        if (!muteTts) {
+                                            ttsController.speak(
+                                                System.currentTimeMillis(),
+                                                "Ready to call ${enriched.contactLabel ?: enriched.phoneNumber}. Press earbud once to confirm, or double-press to cancel."
+                                            )
+                                        }
+                                    }
+                                }
+                                is DeviceAction.SendWhatsApp -> {
+                                    if (enriched.phoneNumber.isNotBlank() && !muteTts) {
+                                        ttsController.speak(
+                                            System.currentTimeMillis(),
+                                            "Ready to send WhatsApp to ${enriched.contactLabel ?: enriched.phoneNumber}. Press earbud once to confirm, or double-press to cancel."
+                                        )
+                                    }
+                                }
+                                else -> Unit
+                            }
                         },
                         onRequestError = { msg ->
                             hadRequestError = true
@@ -659,22 +773,103 @@ fun AssistantOverlaySheet(
         }
     )
 
-    fun startMic() {
+    fun startMic(playChime: Boolean = true) {
         ttsController.stop()
         val granted = ContextCompat.checkSelfPermission(
             context,
             Manifest.permission.RECORD_AUDIO
         ) == PackageManager.PERMISSION_GRANTED
         if (granted) {
+            if (playChime) EarbudChimePlayer.playMicActivationChime()
             voiceController.start()
         } else {
             micPermLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
     }
 
+    fun handleEarbudSingleTap() {
+        val currentAction = pendingAction
+        val isReadyCallOrWa = when (currentAction) {
+            is DeviceAction.DialPhone -> currentAction.phoneNumber.isNotBlank() && currentAction.ambiguousMatches.isEmpty()
+            is DeviceAction.SendWhatsApp -> currentAction.phoneNumber.isNotBlank() && currentAction.ambiguousMatches.isEmpty()
+            else -> false
+        }
+        when {
+            // 1. Pending Call / WhatsApp card -> Immediately CONFIRM & EXECUTE
+            currentAction != null && isReadyCallOrWa -> {
+                EarbudChimePlayer.playConfirmChime()
+                ttsController.stop()
+                if (!muteTts) ttsController.speak(System.currentTimeMillis(), "Executing now")
+                DeviceActionEngine.execute(context, currentAction)
+                    .onSuccess { msg ->
+                        statusBanner = if (currentAction is DeviceAction.DialPhone) "ACTION // $msg" else "OK // $msg"
+                        if (currentAction !is DeviceAction.DialPhone) {
+                            pendingAction = null
+                        }
+                    }
+                    .onFailure { err ->
+                        errorBanner = err.message ?: "Action execution failed"
+                    }
+            }
+            // 2. Active TTS playback -> Voice Barge-In (stop speaking & immediately open mic)
+            isTtsSpeaking -> {
+                ttsController.stop()
+                statusBanner = "BARGE-IN // Interrupted reply — listening…"
+                startMic(playChime = true)
+            }
+            // 3. Already listening -> stop listening
+            isListening -> {
+                voiceController.stop()
+            }
+            // 4. Mic idle -> toggle microphone listening ON with activation chime
+            else -> {
+                startMic(playChime = true)
+            }
+        }
+    }
+
+    fun handleEarbudCancelTap() {
+        if (pendingAction != null) {
+            EarbudChimePlayer.playCancelChime()
+            pendingAction = null
+            ttsController.stop()
+            statusBanner = "EARBUD // Cancelled — returning to listening…"
+            if (!muteTts) ttsController.speak(System.currentTimeMillis(), "Cancelled")
+            scope.launch {
+                delay(850L)
+                startMic(playChime = true)
+            }
+        } else if (isTtsSpeaking) {
+            ttsController.stop()
+            statusBanner = "BARGE-IN // Speech stopped — listening…"
+            startMic(playChime = true)
+        }
+    }
+
+    // Active Bluetooth Earbud MediaSession + Silent AudioTrack Keep-Alive while Live Assistant is open
+    DisposableEffect(context) {
+        val bridge = MediaButtonBridge(
+            context = context,
+            onEarbudTriggerAsk = { handleEarbudSingleTap() },
+            onEarbudNextAction = { handleEarbudCancelTap() },
+            enableSilentKeepAlive = true
+        ).also { it.start(context) }
+        onDispose { bridge.stop() }
+    }
+
+    // Also consume hardware media keys forwarded via Activity.dispatchKeyEvent
+    LaunchedEffect(Unit) {
+        EarbudKeyBus.events.collect { cmd ->
+            when (cmd) {
+                EarbudCommand.SINGLE_TAP -> handleEarbudSingleTap()
+                EarbudCommand.DOUBLE_TAP_OR_NEXT -> handleEarbudCancelTap()
+            }
+        }
+    }
+
     LaunchedEffect(autoStartMic) {
         if (autoStartMic) {
-            startMic()
+            startMic(playChime = true)
         }
     }
 
@@ -791,6 +986,18 @@ fun AssistantOverlaySheet(
                             horizontalArrangement = Arrangement.spacedBy(7.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
+                            // Compact 429/503 Cooldown Timer Badge in Live Assistant Header
+                            if (activeCooldownSec > 0) {
+                                Text(
+                                    text = "429:${activeCooldownSec}s",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SwissWhite,
+                                    modifier = Modifier
+                                        .background(SwissSignalRed, RectangleShape)
+                                        .padding(horizontal = 5.dp, vertical = 3.dp)
+                                        .testTag("assistant_cooldown_badge")
+                                )
+                            }
                             // Incognito Ghost Mode Toggle in Assistant Header
                             Box(
                                 modifier = Modifier
@@ -990,35 +1197,68 @@ fun AssistantOverlaySheet(
                         }
                     }
 
-                    // Compact Live Audio Waveform Visualizer Strip (Pinned under header)
-                    Canvas(
+                    // Interactive Voice Barge-In Audio Waveform Strip (Single tap cancels TTS & starts listening)
+                    Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(28.dp)
+                            .height(34.dp)
                             .background(SwissInk)
-                            .padding(horizontal = 16.dp)
-                    ) {
-                        val barCount = 28
-                        val spacing = size.width / barCount
-                        val midY = size.height / 2f
-                        for (i in 0 until barCount) {
-                            val norm = i / barCount.toFloat()
-                            val envelope = sin(norm * Math.PI).toFloat()
-                            val amplitude = when {
-                                isListening -> (0.25f + liveRms * 0.75f) * envelope * (0.65f + 0.35f * sin(wavePhase + i * 0.5f))
-                                isStreaming -> 0.55f * envelope * (0.5f + 0.5f * sin(wavePhase * 1.4f + i * 0.6f))
-                                else -> 0.08f * envelope
+                            .clickable {
+                                if (isTtsSpeaking) {
+                                    ttsController.stop()
+                                    statusBanner = "BARGE-IN // Interrupted speech — listening…"
+                                    startMic(playChime = true)
+                                } else if (isListening) {
+                                    voiceController.stop()
+                                } else {
+                                    startMic(playChime = true)
+                                }
                             }
-                            val barHalfH = (size.height * 0.40f * amplitude).coerceAtLeast(2f)
-                            val x = spacing * i + spacing / 2f
-                            drawLine(
-                                color = if (isListening || isStreaming) SwissSignalRed else SwissConcrete,
-                                start = Offset(x, midY - barHalfH),
-                                end = Offset(x, midY + barHalfH),
-                                strokeWidth = (spacing * 0.45f).coerceIn(3f, 8f),
-                                cap = StrokeCap.Butt
-                            )
+                            .testTag("assistant_waveform_barge_in"),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Canvas(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(horizontal = 16.dp)
+                        ) {
+                            val barCount = 28
+                            val spacing = size.width / barCount
+                            val midY = size.height / 2f
+                            for (i in 0 until barCount) {
+                                val norm = i / barCount.toFloat()
+                                val envelope = sin(norm * Math.PI).toFloat()
+                                val amplitude = when {
+                                    isListening -> (0.25f + liveRms * 0.75f) * envelope * (0.65f + 0.35f * sin(wavePhase + i * 0.5f))
+                                    isTtsSpeaking || isStreaming -> 0.55f * envelope * (0.5f + 0.5f * sin(wavePhase * 1.4f + i * 0.6f))
+                                    else -> 0.08f * envelope
+                                }
+                                val barHalfH = (size.height * 0.40f * amplitude).coerceAtLeast(2f)
+                                val x = spacing * i + spacing / 2f
+                                drawLine(
+                                    color = if (isListening || isTtsSpeaking || isStreaming) SwissSignalRed else SwissConcrete,
+                                    start = Offset(x, midY - barHalfH),
+                                    end = Offset(x, midY + barHalfH),
+                                    strokeWidth = (spacing * 0.45f).coerceIn(3f, 8f),
+                                    cap = StrokeCap.Butt
+                                )
+                            }
                         }
+                        val waveHint = when {
+                            isTtsSpeaking -> "SPEAKING // TAP WAVEFORM OR EARBUD TO INTERRUPT"
+                            isListening -> "LISTENING // TAP WAVEFORM TO STOP"
+                            else -> "🎧 EARBUD READY // TAP WAVEFORM TO TALK"
+                        }
+                        Text(
+                            text = waveHint,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SwissWhite.copy(alpha = 0.85f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier
+                                .background(SwissInk.copy(alpha = 0.65f))
+                                .padding(horizontal = 8.dp, vertical = 2.dp)
+                        )
                     }
 
                     // Quick-Action & Parity Controls Strip (Pinned under waveform)
@@ -1447,7 +1687,14 @@ fun AssistantOverlaySheet(
                                     DeviceActionConfirmCard(
                                         action = action,
                                         quickContacts = quickContacts,
-                                        onUpdateAction = { updated -> pendingAction = updated },
+                                        autoLaunchDialer = false,
+                                        showEarbudHints = true,
+                                        onUpdateAction = { updated ->
+                                            pendingAction = updated
+                                            if (updated is DeviceAction.DialPhone && updated.phoneNumber.isNotBlank()) {
+                                                statusBanner = updated.displayBanner
+                                            }
+                                        },
                                         onSaveQuickContact = { name, phone ->
                                             scope.launch {
                                                 repository.saveQuickContact(
@@ -1459,8 +1706,10 @@ fun AssistantOverlaySheet(
                                         onExecute = {
                                             DeviceActionEngine.execute(context, action)
                                                 .onSuccess { msg ->
-                                                    statusBanner = "OK // $msg"
-                                                    pendingAction = null
+                                                    statusBanner = if (action is DeviceAction.DialPhone) "ACTION // $msg" else "OK // $msg"
+                                                    if (action !is DeviceAction.DialPhone) {
+                                                        pendingAction = null
+                                                    }
                                                 }
                                                 .onFailure { err ->
                                                     errorBanner = err.message ?: "Action failed"
@@ -1626,6 +1875,38 @@ fun AssistantOverlaySheet(
                                     cellSize = 48.dp,
                                     modifier = Modifier.testTag("assistant_enhance_wand_button")
                                 )
+
+                                // Per-Message Thinking / Creativity Effort Dial (LOW / BAL / DEEP)
+                                Box(
+                                    modifier = Modifier
+                                        .height(48.dp)
+                                        .background(
+                                            when (reasoningEffort) {
+                                                ReasoningEffort.DEEP -> SwissInk
+                                                ReasoningEffort.LOW -> SwissSubtleFill
+                                                ReasoningEffort.BALANCED -> SwissPaper
+                                            },
+                                            RectangleShape
+                                        )
+                                        .border(
+                                            1.dp,
+                                            if (reasoningEffort == ReasoningEffort.DEEP) SwissSignalRed else SwissInk,
+                                            RectangleShape
+                                        )
+                                        .clickable {
+                                            reasoningEffort = reasoningEffort.next()
+                                            statusBanner = "THINKING DIAL // ${reasoningEffort.displayLabel}"
+                                        }
+                                        .padding(horizontal = 7.dp)
+                                        .testTag("assistant_reasoning_dial"),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = reasoningEffort.shortLabel,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (reasoningEffort == ReasoningEffort.DEEP) SwissWhite else SwissInk
+                                    )
+                                }
 
                                 if (isStreaming) {
                                     SwissIconCell(

@@ -2,6 +2,7 @@ package com.example.ui.assistant
 
 import android.content.Intent
 import android.os.Bundle
+import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -9,16 +10,24 @@ import com.example.AllChatApplication
 import com.example.MainActivity
 import com.example.ui.components.AssistantOverlaySheet
 import com.example.ui.theme.AllChatTheme
+import com.example.util.EarbudKeyBus
 import com.example.widget.AllChatWidgetProvider
 
 /**
  * Standalone translucent Google-Assistant-style overlay Activity launched via:
  * - Android Default Assistant / ASSIST intent
- * - Deep link: allchat://assistant
+ * - Deep link: allchat://assistant, allchat://live, web+allchat://live
  * - App Shortcut ("Assistant")
- * - Key Mapper / Android Accessibility Volume Up + Down shortcut
+ * - Key Mapper / MacroDroid / Bluetooth Earbud shortcut
  */
 class AssistantOverlayActivity : ComponentActivity() {
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (EarbudKeyBus.handleHardwareKeyEvent(event)) {
+            return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)

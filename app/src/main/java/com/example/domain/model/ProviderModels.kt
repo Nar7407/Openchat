@@ -74,6 +74,68 @@ object CostEstimator {
     }
 }
 
+enum class ReasoningEffort(
+    val shortLabel: String,
+    val displayLabel: String,
+    val temperatureOverride: Float?,
+    val thinkingBudgetTokens: Int?,
+    val systemHint: String
+) {
+    LOW(
+        shortLabel = "LOW",
+        displayLabel = "INSTANT",
+        temperatureOverride = 0.2f,
+        thinkingBudgetTokens = 0,
+        systemHint = "Fast instant mode: answer immediately, concisely, and directly with zero preamble or lengthy step-by-step thinking."
+    ),
+    BALANCED(
+        shortLabel = "BAL",
+        displayLabel = "BALANCED",
+        temperatureOverride = null,
+        thinkingBudgetTokens = null,
+        systemHint = ""
+    ),
+    DEEP(
+        shortLabel = "DEEP",
+        displayLabel = "DEEP THINK",
+        temperatureOverride = 0.75f,
+        thinkingBudgetTokens = 4096,
+        systemHint = "Deep reasoning mode: carefully analyze edge cases and think step-by-step inside <think>...</think> before presenting a thorough, verified final answer."
+    );
+
+    fun next(): ReasoningEffort = when (this) {
+        LOW -> BALANCED
+        BALANCED -> DEEP
+        DEEP -> LOW
+    }
+}
+
+enum class ReplyMorphStyle(
+    val chipLabel: String,
+    val instruction: String
+) {
+    SHORTER_50(
+        "-50% SHORTER",
+        "Rewrite this response to be roughly 50% shorter while preserving every critical fact, code block, or actionable takeaway. Remove all filler."
+    ),
+    MORE_DETAIL(
+        "+MORE DETAIL",
+        "Expand this response with deeper explanation, concrete examples, edge cases, and practical implementation nuances."
+    ),
+    ELI5(
+        "ELI5",
+        "Rewrite this response so a beginner or 10-year-old can understand it immediately, using plain everyday language and a clear analogy."
+    ),
+    EXPERT_TECH(
+        "EXPERT / TECH",
+        "Rewrite this response at a principal-engineer / expert technical depth with precise terminology, architecture trade-offs, and zero hand-holding."
+    ),
+    BULLET_POINTS(
+        "BULLET POINTS",
+        "Restructure this response into crisp, high-signal bullet points with bold lead-ins so it can be scanned in seconds."
+    )
+}
+
 data class ChatOptions(
     val systemPrompt: String? = null,
     val temperature: Float? = null,
@@ -81,7 +143,9 @@ data class ChatOptions(
     val maxTokens: Int? = null,
     val jsonMode: Boolean = false,
     val enableGeminiGoogleSearch: Boolean = false,
-    val enableTools: Boolean = false
+    val enableTools: Boolean = false,
+    val reasoningEffort: ReasoningEffort = ReasoningEffort.BALANCED,
+    val supportsVisionInput: Boolean = true
 )
 
 enum class WebSearchProvider(val label: String, val websiteUrl: String) {
@@ -360,8 +424,14 @@ data class QuickContact(
     val name: String,
     val phoneNumber: String,
     val email: String = "",
-    val upiId: String = ""
-)
+    val upiId: String = "",
+    val nicknames: String = ""
+) {
+    val aliasList: List<String>
+        get() = nicknames.split(',', ';', '/')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+}
 
 data class CustomAppEntry(
     val id: String = "",

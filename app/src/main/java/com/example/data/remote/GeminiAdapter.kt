@@ -185,13 +185,19 @@ class GeminiAdapter(private val client: OkHttpClient) {
                 JSONObject().put("parts", JSONArray().put(JSONObject().put("text", sysPrompt)))
             )
         }
-        if (options.temperature != null || options.topP != null || options.maxTokens != null || options.jsonMode) {
+        val thinkingBudget = if (modelId.contains("2.5", ignoreCase = true)) {
+            options.reasoningEffort.thinkingBudgetTokens
+        } else null
+        if (options.temperature != null || options.topP != null || options.maxTokens != null || options.jsonMode || thinkingBudget != null) {
             val genConfig = JSONObject()
             options.temperature?.let { genConfig.put("temperature", it.toDouble()) }
             options.topP?.let { genConfig.put("topP", it.coerceIn(0.01f, 1f).toDouble()) }
             options.maxTokens?.takeIf { it > 0 }?.let { genConfig.put("maxOutputTokens", it) }
             if (options.jsonMode) {
                 genConfig.put("responseMimeType", "application/json")
+            }
+            if (thinkingBudget != null) {
+                genConfig.put("thinkingConfig", JSONObject().put("thinkingBudget", thinkingBudget))
             }
             payloadObj.put("generationConfig", genConfig)
         }

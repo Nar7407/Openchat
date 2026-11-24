@@ -15,6 +15,7 @@ import com.example.domain.model.IncomingAppAction
 import com.example.domain.model.IncomingSharePayload
 import com.example.ui.AllChatApp
 import com.example.ui.theme.AllChatTheme
+import com.example.util.EarbudKeyBus
 import com.example.widget.AllChatWidgetProvider
 
 class MainActivity : ComponentActivity() {
@@ -59,6 +60,9 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (EarbudKeyBus.handleHardwareKeyEvent(event)) {
+            return true
+        }
         if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             val now = SystemClock.uptimeMillis()
             when (event.keyCode) {
@@ -88,19 +92,25 @@ class MainActivity : ComponentActivity() {
     private fun handleIncomingIntent(intent: Intent?) {
         if (intent == null) return
 
-        // 0. Check custom protocol deep links (allchat:// and web+allchat://)
+        // 0. Check custom protocol deep links (allchat://, web+allchat://, or ?mode=live)
         val dataUri = intent.data
         val scheme = dataUri?.scheme?.lowercase()
+        val queryMode = dataUri?.getQueryParameter("mode")?.lowercase().orEmpty()
+        if (queryMode == "live") {
+            pendingAppAction.value = IncomingAppAction.ASSISTANT_OVERLAY
+            return
+        }
         if (dataUri != null && (scheme == "allchat" || scheme == "web+allchat")) {
             val host = dataUri.host?.lowercase().orEmpty()
-            val modeParam = dataUri.getQueryParameter("mode")?.lowercase().orEmpty()
+            val path = dataUri.path?.lowercase().orEmpty()
+            val modeParam = queryMode
             val queryParam = dataUri.getQueryParameter("q")?.trim().orEmpty()
             when {
                 host == "ask" && queryParam.isNotBlank() -> {
                     pendingSharePayload.value = IncomingSharePayload.DeepLinkAsk(queryParam)
                     return
                 }
-                modeParam == "assistant" || host == "assistant" -> {
+                host == "live" || path == "/live" || modeParam == "live" || modeParam == "assistant" || host == "assistant" -> {
                     pendingAppAction.value = IncomingAppAction.ASSISTANT_OVERLAY
                     return
                 }
@@ -151,7 +161,7 @@ class MainActivity : ComponentActivity() {
                 "clipboard" -> IncomingAppAction.SUMMARIZE_CLIPBOARD
                 "image" -> IncomingAppAction.GENERATE_IMAGE
                 "camera" -> IncomingAppAction.CAMERA_VISION
-                "assistant" -> IncomingAppAction.ASSISTANT_OVERLAY
+                "assistant", "live" -> IncomingAppAction.ASSISTANT_OVERLAY
                 "lens" -> IncomingAppAction.LIVE_LENS_EXPLAIN
                 "lens_translate" -> IncomingAppAction.LIVE_LENS_TRANSLATE
                 "commute" -> IncomingAppAction.COMMUTE_HUD

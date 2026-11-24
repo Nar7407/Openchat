@@ -205,6 +205,15 @@ class OpenAiCompatibleAdapter(private val client: OkHttpClient) {
         options.temperature?.let { bodyObj.put("temperature", it.toDouble()) }
         options.topP?.let { bodyObj.put("top_p", it.coerceIn(0.01f, 1f).toDouble()) }
         options.maxTokens?.takeIf { it > 0 }?.let { bodyObj.put("max_tokens", it) }
+        val lowerModelId = modelId.lowercase()
+        val isOpenAiReasoning = lowerModelId.startsWith("o1") || lowerModelId.startsWith("o3") || lowerModelId.startsWith("o4") ||
+            lowerModelId.contains("/o1") || lowerModelId.contains("/o3") || lowerModelId.contains("/o4")
+        if (isOpenAiReasoning && options.reasoningEffort != com.example.domain.model.ReasoningEffort.BALANCED) {
+            bodyObj.put(
+                "reasoning_effort",
+                if (options.reasoningEffort == com.example.domain.model.ReasoningEffort.DEEP) "high" else "low"
+            )
+        }
         if (options.jsonMode) {
             bodyObj.put("response_format", JSONObject().put("type", "json_object"))
         }

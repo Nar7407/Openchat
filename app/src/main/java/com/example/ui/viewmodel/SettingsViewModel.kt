@@ -298,6 +298,10 @@ class SettingsViewModel(
         vaultErrorMessage.value = message
     }
 
+    fun showStatusMessage(message: String) {
+        vaultStatusMessage.value = message
+    }
+
     fun clearVaultNotices() {
         vaultStatusMessage.value = null
         vaultErrorMessage.value = null
@@ -348,12 +352,14 @@ class SettingsViewModel(
         name: String,
         phoneNumber: String,
         email: String = "",
-        upiId: String = ""
+        upiId: String = "",
+        nicknames: String = ""
     ) {
         val cleanName = name.trim()
         val cleanPhone = phoneNumber.trim()
         val cleanEmail = email.trim()
         val cleanUpi = upiId.trim()
+        val cleanNicks = nicknames.trim()
         if (cleanName.isBlank() || (cleanPhone.isBlank() && cleanEmail.isBlank() && cleanUpi.isBlank())) return
         viewModelScope.launch {
             repository.saveQuickContact(
@@ -361,15 +367,25 @@ class SettingsViewModel(
                     name = cleanName,
                     phoneNumber = cleanPhone,
                     email = cleanEmail,
-                    upiId = cleanUpi
+                    upiId = cleanUpi,
+                    nicknames = cleanNicks
                 )
             )
             val details = listOfNotNull(
                 cleanPhone.takeIf { it.isNotBlank() },
                 cleanEmail.takeIf { it.isNotBlank() },
-                cleanUpi.takeIf { it.isNotBlank() }
+                cleanUpi.takeIf { it.isNotBlank() },
+                cleanNicks.takeIf { it.isNotBlank() }?.let { "AKA $it" }
             ).joinToString(" · ")
             vaultStatusMessage.value = "CONTACTS // Saved $cleanName ($details)."
+        }
+    }
+
+    fun importQuickContactsBulk(contacts: List<QuickContact>) {
+        if (contacts.isEmpty()) return
+        viewModelScope.launch {
+            val count = repository.saveQuickContactsBulk(contacts)
+            vaultStatusMessage.value = "CONTACTS // Imported $count contact${if (count == 1) "" else "s"} from .vcf."
         }
     }
 

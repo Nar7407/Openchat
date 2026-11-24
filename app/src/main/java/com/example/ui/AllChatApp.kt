@@ -55,6 +55,9 @@ import com.example.ui.components.SwissButtonVariant
 import com.example.ui.components.VoiceNotesInboxSheet
 import com.example.util.DeviceAction
 import com.example.util.DeviceActionEngine
+import com.example.util.EarbudCommand
+import com.example.util.EarbudKeyBus
+import com.example.util.MediaButtonBridge
 import com.example.util.ReadAloudController
 import com.example.ui.screens.ArenaScreen
 import com.example.ui.screens.ChatScreen
@@ -131,6 +134,30 @@ fun AllChatApp(
     LaunchedEffect(Unit) {
         repository.initializeLockState()
         runCatching { repository.pruneOldJunkChatsIfEnabled() }
+    }
+
+    // Foreground Earbud Tap Listener when Live Assistant is closed:
+    // Single-tap Bluetooth earbud opens Live Assistant straight into active Mic mode.
+    DisposableEffect(showAssistantOverlay, showCommuteHud) {
+        val bridge = if (!showAssistantOverlay && !showCommuteHud) {
+            MediaButtonBridge(
+                context = context,
+                onEarbudTriggerAsk = { showAssistantOverlay = true },
+                onEarbudNextAction = {},
+                enableSilentKeepAlive = false
+            ).also { it.start(context) }
+        } else null
+        onDispose { bridge?.stop() }
+    }
+
+    LaunchedEffect(showAssistantOverlay, showCommuteHud) {
+        if (!showAssistantOverlay && !showCommuteHud) {
+            EarbudKeyBus.events.collect { cmd ->
+                if (cmd == EarbudCommand.SINGLE_TAP) {
+                    showAssistantOverlay = true
+                }
+            }
+        }
     }
 
     // Automatic Vault Lock after N minutes of idle/background or immediately on app switch

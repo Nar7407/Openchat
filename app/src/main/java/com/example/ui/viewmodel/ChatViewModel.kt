@@ -39,6 +39,8 @@ import com.example.domain.model.CliFlagToken
 import com.example.domain.model.DailyBudgetConfig
 import com.example.domain.model.FilledFormResult
 import com.example.domain.model.NegativeConstraint
+import com.example.domain.model.ReasoningEffort
+import com.example.domain.model.ReplyMorphStyle
 import com.example.domain.model.SmartContextSnapshot
 import com.example.domain.model.SmartZone
 import com.example.domain.model.SpotlightResult
@@ -198,7 +200,9 @@ data class ChatUiState(
     val forceFlagshipOverride: Boolean = false,
     val voiceFormTemplates: List<VoiceFormTemplate> = emptyList(),
     val threadCheckpoints: List<ThreadCheckpoint> = emptyList(),
-    val summarizingCheckpointMsgId: Long? = null
+    val summarizingCheckpointMsgId: Long? = null,
+    val reasoningEffort: ReasoningEffort = ReasoningEffort.BALANCED,
+    val morphingMessageId: Long? = null
 ) {
     val messages: List<MessageEntity>
         get() = if (ghostModeEnabled) ghostMessages else branchNodes.map { it.message }
@@ -226,7 +230,7 @@ class ChatViewModel(
     private val mcpCheckResults = MutableStateFlow<Map<String, McpCheckResult>>(emptyMap())
     private val checkingMcpIds = MutableStateFlow<Set<String>>(emptySet())
     private val webSearchEnabled = MutableStateFlow(false)
-    private val toolsEnabled = MutableStateFlow(false)
+    private val toolsEnabled = MutableStateFlow(true)
     private val requestParams = MutableStateFlow(RequestParamsOverride())
     private val quotedMessage = MutableStateFlow<MessageEntity?>(null)
     private val miniModeEnabled = MutableStateFlow(false)
@@ -260,6 +264,8 @@ class ChatViewModel(
     private val ghostMessages = MutableStateFlow<List<MessageEntity>>(emptyList())
     private val forceFlagshipOverride = MutableStateFlow(false)
     private val summarizingCheckpointMsgId = MutableStateFlow<Long?>(null)
+    private val reasoningEffort = MutableStateFlow(ReasoningEffort.BALANCED)
+    private val morphingMessageId = MutableStateFlow<Long?>(null)
 
     private val wave4UxBundleFlow = combine(
         activeConstraints,
@@ -605,6 +611,13 @@ class ChatViewModel(
             voiceFormTemplates = bm.voiceFormTemplates,
             threadCheckpoints = convCheckpoints,
             summarizingCheckpointMsgId = bm.summarizingCheckpointMsgId
+        )
+    }.combine(
+        combine(reasoningEffort, morphingMessageId) { effort, morphId -> effort to morphId }
+    ) { state, (effort, morphId) ->
+        state.copy(
+            reasoningEffort = effort,
+            morphingMessageId = morphId
         )
     }.stateIn(
         scope = viewModelScope,
@@ -1331,7 +1344,16 @@ class ChatViewModel(
     }
 
     fun setPendingDeviceAction(action: DeviceAction?) {
-        pendingDeviceAction.value = action
+        val enriched = if (action is DeviceAction.DialPhone && action.contactLabel.isNullOrBlank() && action.phoneNumber.isNotBlank()) {
+            val matched = DeviceActionEngine.resolveContactByPhone(action.phoneNumber, uiState.value.quickContacts)
+            if (matched != null) action.copy(contactLabel = matched.name) else action
+        } else {
+            action
+        }
+        pendingDeviceAction.value = enriched
+        if (enriched is DeviceAction.DialPhone && enriched.phoneNumber.isNotBlank()) {
+            statusNotice.value = enriched.displayBanner
+        }
     }
 
     fun dismissDeviceAction() {
@@ -2088,7 +2110,19 @@ class ChatViewModel(
             )
             if (parsedDeviceAction != null) {
                 pendingDeviceAction.value = parsedDeviceAction
-                statusNotice.value = "${parsedDeviceAction.badge} // Ready — tap confirmation button below."
+                statusNotice.value = when (parsedDeviceAction) {
+                    is DeviceAction.DialPhone -> if (parsedDeviceAction.phoneNumber.isNotBlank()) {
+                        parsedDeviceAction.displayBanner
+                    } else {
+                        "PHONE // Select a matching contact or enter number below."
+                    }
+                    is DeviceAction.SendWhatsApp -> if (parsedDeviceAction.phoneNumber.isNotBlank()) {
+                        "WHATSAPP // Ready for ${parsedDeviceAction.contactLabel ?: parsedDeviceAction.phoneNumber} — auto-opening in 3s."
+                    } else {
+                        "WHATSAPP // Select a matching contact or enter number below."
+                    }
+                    else -> "${parsedDeviceAction.badge} // Ready — tap confirmation button below."
+                }
                 return
             }
         }
@@ -2255,7 +2289,8 @@ class ChatViewModel(
             guidedMode = state.guidedModeEnabled,
             smartContext = state.smartContext,
             activeConstraints = state.activeConstraints,
-            checkpointSummary = latestCheckpoint?.summaryMarkdown
+            checkpointSummary = latestCheckpoint?.summaryMarkdown,
+            reasoningEffort = state.reasoningEffort
         )
         val searchOn = state.webSearchEnabled
         val shouldAutoExtractMemory = state.autoExtractMemories
@@ -2376,8 +2411,21 @@ class ChatViewModel(
                         selectedBranchByParent.update { it + (parentKey to childId) }
                     },
                     onDeviceActionTriggered = { triggered ->
-                        pendingDeviceAction.value = triggered
-                        statusNotice.value = "${triggered.badge} // Ready — tap confirmation button below."
+                        val enriched = if (triggered is DeviceAction.DialPhone && triggered.contactLabel.isNullOrBlank() && triggered.phoneNumber.isNotBlank()) {
+                            val matched = DeviceActionEngine.resolveContactByPhone(triggered.phoneNumber, uiState.value.quickContacts)
+                            if (matched != null) triggered.copy(contactLabel = matched.name) else triggered
+                        } else {
+                            triggered
+                        }
+                        pendingDeviceAction.value = enriched
+                        statusNotice.value = when (enriched) {
+                            is DeviceAction.DialPhone -> if (enriched.phoneNumber.isNotBlank()) {
+                                enriched.displayBanner
+                            } else {
+                                "PHONE // Select a matching contact or enter number below."
+                            }
+                            else -> "${enriched.badge} // Ready — tap confirmation button below."
+                        }
                     },
                     onRequestError = { errMsg ->
                         errorToast.value = errMsg
@@ -2465,12 +2513,107 @@ class ChatViewModel(
         }
     }
 
+    fun cycleReasoningEffort() {
+        val next = reasoningEffort.value.next()
+        reasoningEffort.value = next
+        statusNotice.value = "THINKING DIAL // ${next.displayLabel} mode active."
+    }
+
+    fun setReasoningEffort(effort: ReasoningEffort) {
+        reasoningEffort.value = effort
+        statusNotice.value = "THINKING DIAL // ${effort.displayLabel} mode active."
+    }
+
+    fun morphAssistantMessage(targetMessage: MessageEntity, style: ReplyMorphStyle) {
+        val state = uiState.value
+        val model = state.selectedModel ?: run {
+            errorToast.value = "Configure a Text Chat model in Settings first."
+            return
+        }
+        if (isStreaming.value || morphingMessageId.value != null) return
+        val baseOptions = buildChatOptions(
+            persona = state.activePersona,
+            agentsMd = state.agentsMd,
+            params = state.requestParams,
+            enableTools = false,
+            reasoningEffort = state.reasoningEffort
+        )
+
+        if (state.ghostModeEnabled) {
+            activeStreamJob = viewModelScope.launch {
+                isStreaming.value = true
+                morphingMessageId.value = targetMessage.id
+                statusNotice.value = "MORPH // Rewriting (${style.chipLabel})…"
+                val original = targetMessage.content
+                try {
+                    val rewritten = repository.streamGhostChatTurn(
+                        history = emptyList(),
+                        userText = "Transform this response (${style.chipLabel}): ${style.instruction}\n\nReturn ONLY the rewritten text.\n\n$original",
+                        model = model,
+                        options = baseOptions.copy(enableTools = false),
+                        onDelta = { partial ->
+                            ghostMessages.update { list ->
+                                list.map { if (it.id == targetMessage.id) it.copy(content = partial) else it }
+                            }
+                        }
+                    )
+                    if (rewritten.isNotBlank()) {
+                        ghostMessages.update { list ->
+                            list.map { if (it.id == targetMessage.id) it.copy(content = rewritten) else it }
+                        }
+                        statusNotice.value = "MORPH // Applied ${style.chipLabel} in-place."
+                    }
+                } catch (ce: kotlinx.coroutines.CancellationException) {
+                    throw ce
+                } catch (err: Throwable) {
+                    ghostMessages.update { list ->
+                        list.map { if (it.id == targetMessage.id) it.copy(content = original) else it }
+                    }
+                    errorToast.value = err.message ?: "Morph failed."
+                } finally {
+                    morphingMessageId.value = null
+                    isStreaming.value = false
+                }
+            }
+            return
+        }
+
+        val convId = activeConversationId.value ?: return
+        activeStreamJob = viewModelScope.launch {
+            isStreaming.value = true
+            morphingMessageId.value = targetMessage.id
+            try {
+                repository.morphAssistantMessageInPlace(
+                    conversationId = convId,
+                    targetMessage = targetMessage,
+                    style = style,
+                    selectableModel = model,
+                    baseOptions = baseOptions,
+                    onStatus = { status -> statusNotice.value = status }
+                )
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (err: Throwable) {
+                errorToast.value = err.message ?: "Failed to morph response."
+            } finally {
+                morphingMessageId.value = null
+                isStreaming.value = false
+            }
+        }
+    }
+
     fun regenerateAsBranch(assistantMessage: MessageEntity) {
         val state = uiState.value
         val model = state.selectedModel ?: return
         val convId = activeConversationId.value ?: return
         if (isStreaming.value) return
-        val options = buildChatOptions(state.activePersona, state.agentsMd, state.requestParams, state.toolsEnabled)
+        val options = buildChatOptions(
+            persona = state.activePersona,
+            agentsMd = state.agentsMd,
+            params = state.requestParams,
+            enableTools = state.toolsEnabled,
+            reasoningEffort = state.reasoningEffort
+        )
 
         activeStreamJob = viewModelScope.launch {
             isStreaming.value = true
@@ -2494,6 +2637,7 @@ class ChatViewModel(
     fun stopGeneration() {
         activeStreamJob?.cancel()
         activeStreamJob = null
+        morphingMessageId.value = null
         isStreaming.value = false
     }
 
@@ -2505,7 +2649,8 @@ class ChatViewModel(
         guidedMode: Boolean = false,
         smartContext: SmartContextSnapshot = SmartContextSnapshot(),
         activeConstraints: Set<NegativeConstraint> = emptySet(),
-        checkpointSummary: String? = null
+        checkpointSummary: String? = null,
+        reasoningEffort: ReasoningEffort = ReasoningEffort.BALANCED
     ): ChatOptions {
         val combinedSystem = buildList {
             if (agentsMd.isNotBlank()) add("# Project Instructions (AGENTS.md)\n$agentsMd")
@@ -2522,6 +2667,9 @@ class ChatViewModel(
                     "# Guided Wizard Mode\nIf the user's request is broad, ambiguous, or a multi-step planning/architecture task, ask 2-3 brief, high-impact clarifying questions numbered 1..3 BEFORE producing a long final answer. If the user is answering your clarifying questions, deliver the complete tailored solution."
                 )
             }
+            if (reasoningEffort.systemHint.isNotBlank()) {
+                add("# Reasoning & Creativity Effort (${reasoningEffort.displayLabel})\n${reasoningEffort.systemHint}")
+            }
             if (activeConstraints.isNotEmpty()) {
                 add(
                     "# Strict Output Constraints\n" +
@@ -2535,11 +2683,12 @@ class ChatViewModel(
 
         return ChatOptions(
             systemPrompt = combinedSystem,
-            temperature = params.temperature ?: persona?.temperature,
+            temperature = params.temperature ?: reasoningEffort.temperatureOverride ?: persona?.temperature,
             topP = params.topP,
             maxTokens = params.maxTokens ?: persona?.maxTokens,
             jsonMode = params.jsonMode,
-            enableTools = enableTools
+            enableTools = enableTools,
+            reasoningEffort = reasoningEffort
         )
     }
 

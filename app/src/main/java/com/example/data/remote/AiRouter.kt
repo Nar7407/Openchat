@@ -100,6 +100,65 @@ class AiRouter(private val okHttpClient: OkHttpClient) {
             }
         }
 
+    /**
+     * Cross-Provider Payload Sanitizer:
+     * 1) Strips <think>...</think> and <reasoning>...</reasoning> blocks from prior assistant messages
+     *    so switching from a Thinking model (Gemini/Claude/DeepSeek-R1) to a strict endpoint never causes 400 errors.
+     * 2) Converts unsupported image attachments into clean text placeholders when the target model is text-only.
+     * 3) Normalizes consecutive same-role text messages for strict schema providers (Anthropic / DeepSeek / Groq).
+     */
+    private fun sanitizeMessagesForProvider(
+        provider: ProviderConfig,
+        modelId: String,
+        messages: List<ChatInputMessage>,
+        options: ChatOptions
+    ): List<ChatInputMessage> {
+        val thinkRegex = Regex("""<(?:think|reasoning)>[\s\S]*?</(?:think|reasoning)>""", RegexOption.IGNORE_CASE)
+        val lowerModel = modelId.lowercase()
+        val inferredTextOnly = !options.supportsVisionInput || (
+            provider.type == ProviderType.OPENAI_COMPATIBLE &&
+                (lowerModel.contains("deepseek") || lowerModel.contains("r1") || lowerModel.contains("qwen-2.5-coder"))
+            )
+
+        val cleaned = messages.map { msg ->
+            var text = msg.text
+            if (msg.role.equals("ASSISTANT", ignoreCase = true) && msg.toolCalls.isEmpty()) {
+                val stripped = text.replace(thinkRegex, "").trim()
+                if (stripped.isNotBlank()) text = stripped
+            }
+            if (inferredTextOnly && !msg.imageBase64.isNullOrBlank()) {
+                val note = "[Attached image omitted — current model ($modelId) is text-only]"
+                val mergedText = if (text.isBlank()) note else "$text\n\n$note"
+                msg.copy(
+                    text = mergedText,
+                    imageBase64 = null,
+                    imageMimeType = null
+                )
+            } else {
+                msg.copy(text = text)
+            }
+        }
+
+        // Collapse consecutive same-role non-tool text turns to prevent 400 Bad Request on strict providers
+        val normalized = mutableListOf<ChatInputMessage>()
+        for (msg in cleaned) {
+            val prev = normalized.lastOrNull()
+            val canMerge = prev != null &&
+                prev.role.equals(msg.role, ignoreCase = true) &&
+                !msg.role.equals("TOOL", ignoreCase = true) &&
+                prev.toolCalls.isEmpty() && msg.toolCalls.isEmpty() &&
+                prev.imageBase64 == null && msg.imageBase64 == null
+            if (canMerge && prev != null) {
+                normalized[normalized.lastIndex] = prev.copy(
+                    text = listOf(prev.text, msg.text).filter { it.isNotBlank() }.joinToString("\n\n")
+                )
+            } else {
+                normalized += msg
+            }
+        }
+        return normalized
+    }
+
     fun streamChat(
         provider: ProviderConfig,
         apiKey: String,
@@ -107,6 +166,7 @@ class AiRouter(private val okHttpClient: OkHttpClient) {
         messages: List<ChatInputMessage>,
         options: ChatOptions = ChatOptions()
     ): Flow<StreamEvent> = flow {
+        val sanitizedMessages = sanitizeMessagesForProvider(provider, modelId, messages, options)
         val candidates = orderedCandidates(provider.id, apiKey)
         var lastError: Throwable? = null
 
@@ -114,9 +174,9 @@ class AiRouter(private val okHttpClient: OkHttpClient) {
             var emittedText = false
             try {
                 val upstream = when (provider.type) {
-                    ProviderType.GEMINI -> gemini.streamChat(provider, singleKey, modelId, messages, options)
-                    ProviderType.OPENAI_COMPATIBLE -> openAi.streamChat(provider, singleKey, modelId, messages, options)
-                    ProviderType.ANTHROPIC -> anthropic.streamChat(provider, singleKey, modelId, messages, options)
+                    ProviderType.GEMINI -> gemini.streamChat(provider, singleKey, modelId, sanitizedMessages, options)
+                    ProviderType.OPENAI_COMPATIBLE -> openAi.streamChat(provider, singleKey, modelId, sanitizedMessages, options)
+                    ProviderType.ANTHROPIC -> anthropic.streamChat(provider, singleKey, modelId, sanitizedMessages, options)
                 }
                 upstream.collect { event ->
                     if (event is StreamEvent.TextDelta) emittedText = true

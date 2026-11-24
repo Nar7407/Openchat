@@ -365,8 +365,15 @@ object ClientToolEngine {
         val contactName = args.optString("contact_name").trim().ifBlank { label }
         val rawPhone = args.optString("phone_number").trim()
 
-        val resolvedContact = if (rawPhone.isBlank() && contactName.isNotBlank()) {
-            DeviceActionEngine.resolveContact(contactName, contacts)
+        val matchedContacts = if (rawPhone.isBlank() && contactName.isNotBlank()) {
+            DeviceActionEngine.resolveMatchingContacts(contactName, contacts, requirePhone = type in listOf("make_call", "dial_phone", "call", "send_whatsapp", "whatsapp", "send_sms", "sms"))
+        } else emptyList()
+        val distinctPhoneMatches = matchedContacts.distinctBy { DeviceActionEngine.normalizePhoneNumber(it.phoneNumber) }
+        val isAmbiguousPhone = rawPhone.isBlank() && distinctPhoneMatches.size >= 2
+        val resolvedContact = if (!isAmbiguousPhone) {
+            matchedContacts.firstOrNull()
+                ?: if (contactName.isNotBlank()) DeviceActionEngine.resolveContact(contactName, contacts) else null
+                ?: if (rawPhone.isNotBlank()) DeviceActionEngine.resolveContactByPhone(rawPhone, contacts) else null
         } else null
 
         val action: DeviceAction? = when (type) {
@@ -378,7 +385,8 @@ object ClientToolEngine {
                 }
                 DeviceAction.DialPhone(
                     phoneNumber = number,
-                    contactLabel = resolvedContact?.name ?: contactName.takeIf { it.isNotBlank() }
+                    contactLabel = resolvedContact?.name ?: contactName.takeIf { it.isNotBlank() },
+                    ambiguousMatches = if (isAmbiguousPhone) distinctPhoneMatches else emptyList()
                 )
             }
             "open_youtube", "youtube", "play_youtube" -> {
@@ -404,7 +412,8 @@ object ClientToolEngine {
                 DeviceAction.SendWhatsApp(
                     phoneNumber = digits,
                     message = msg,
-                    contactLabel = resolvedContact?.name ?: contactName.takeIf { it.isNotBlank() }
+                    contactLabel = resolvedContact?.name ?: contactName.takeIf { it.isNotBlank() },
+                    ambiguousMatches = if (isAmbiguousPhone) distinctPhoneMatches else emptyList()
                 )
             }
             "set_alarm" -> DeviceAction.SetAlarm(

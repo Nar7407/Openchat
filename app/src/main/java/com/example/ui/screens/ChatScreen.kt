@@ -163,6 +163,9 @@ import com.example.domain.model.ContextWindowEstimator
 import com.example.domain.model.CostEstimator
 import com.example.domain.model.DisplayCurrency
 import com.example.domain.model.ModelCapability
+import com.example.domain.model.ReasoningEffort
+import com.example.domain.model.ReplyMorphStyle
+import com.example.util.DeviceAction
 import com.example.ui.components.AgentsMdInitDialog
 import com.example.ui.components.ChatMinimapScrubber
 import com.example.ui.components.CitationPillsRow
@@ -991,7 +994,7 @@ fun ChatScreen(
                 .fillMaxSize()
                 .background(SwissCanvas)
         ) {
-            val isCompactViewport = maxHeight < 520.dp || maxWidth < 360.dp
+            val isCompactViewport = maxHeight < 500.dp || maxWidth < 380.dp
             val isWideScreen = maxWidth >= 720.dp
             val effectiveMiniMode = state.miniModeEnabled || isCompactViewport
 
@@ -1057,6 +1060,27 @@ fun ChatScreen(
                             onSelectAutoRoute = { viewModel.setAutoRouteEnabled(true) },
                             modifier = Modifier.weight(1f)
                         )
+
+                        // Compact Live 429/503 Provider Cooldown Timer Pill directly in Header Model Bar
+                        val headerCooldownSec = state.cooldownMap.values
+                            .map { ((it - cooldownNowMs) / 1000L).toInt() }
+                            .filter { it > 0 }
+                            .maxOrNull() ?: 0
+                        if (headerCooldownSec > 0) {
+                            Box(
+                                modifier = Modifier
+                                    .background(SwissSignalRed, RectangleShape)
+                                    .padding(horizontal = 6.dp, vertical = 4.dp)
+                                    .testTag("header_cooldown_timer_badge")
+                            ) {
+                                Text(
+                                    text = "429 ${headerCooldownSec}s",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SwissWhite,
+                                    maxLines = 1
+                                )
+                            }
+                        }
 
                         val convTokens = (state.activeConversation?.totalPromptTokens ?: 0) +
                             (state.activeConversation?.totalCompletionTokens ?: 0)
@@ -1525,13 +1549,38 @@ fun ChatScreen(
                 contentAlignment = Alignment.Center
             ) {
                 if (displayedNodes.isEmpty()) {
-                    ChatEmptyState(
-                        hasConfiguredModels = state.availableModels.isNotEmpty(),
-                        onOpenSettings = onOpenSettings,
-                        onSelectStarter = { starter ->
-                            inputText = starter
+                    if (effectiveMiniMode) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 14.dp, vertical = 12.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Text(
+                                text = "ALLCHAT // COMPACT MODE",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = SwissInk
+                            )
+                            Text(
+                                text = if (state.availableModels.isNotEmpty()) {
+                                    "Type a message, call a contact, or tap Mic below."
+                                } else {
+                                    "Connect a provider in Settings to start chatting."
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = SwissMuted
+                            )
                         }
-                    )
+                    } else {
+                        ChatEmptyState(
+                            hasConfiguredModels = state.availableModels.isNotEmpty(),
+                            onOpenSettings = onOpenSettings,
+                            onSelectStarter = { starter ->
+                                inputText = starter
+                            }
+                        )
+                    }
                 } else {
                     LazyColumn(
                         state = listState,
@@ -1613,6 +1662,40 @@ fun ChatScreen(
                                     },
                                     onOpenProxySettings = onOpenSettings
                                 )
+                                // Live Response Tuning: 1-Row Inline Tone & Length Morph Bar right below the latest AI reply
+                                if (isLastAssistant && !msg.isError && msg.content.isNotBlank() && (!state.isStreaming || state.morphingMessageId == msg.id)) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .horizontalScroll(rememberScrollState())
+                                            .testTag("inline_reply_morph_bar"),
+                                        horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = if (state.morphingMessageId == msg.id) "TUNING…" else "TUNE //",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = if (state.morphingMessageId == msg.id) SwissSignalRed else SwissMuted,
+                                            modifier = Modifier.padding(end = 2.dp)
+                                        )
+                                        ReplyMorphStyle.entries.forEach { style ->
+                                            val busy = state.isStreaming
+                                            Text(
+                                                text = style.chipLabel,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = if (busy) SwissMuted else SwissInk,
+                                                modifier = Modifier
+                                                    .background(SwissPaper, RectangleShape)
+                                                    .border(1.dp, if (busy) SwissConcrete else SwissInk, RectangleShape)
+                                                    .clickable(enabled = !busy) {
+                                                        viewModel.morphAssistantMessage(msg, style)
+                                                    }
+                                                    .padding(horizontal = 8.dp, vertical = 5.dp)
+                                                    .testTag("morph_chip_${style.name.lowercase()}")
+                                            )
+                                        }
+                                    }
+                                }
                                 if (checkpointAfter != null) {
                                     ThreadCheckpointDividerCard(
                                         checkpoint = checkpointAfter,
@@ -1932,7 +2015,9 @@ fun ChatScreen(
                             onExecute = {
                                 DeviceActionEngine.execute(context, devAction)
                                     .onSuccess { msg ->
-                                        viewModel.dismissDeviceAction()
+                                        if (devAction !is DeviceAction.DialPhone) {
+                                            viewModel.dismissDeviceAction()
+                                        }
                                         viewModel.showNotice("ACTION // $msg")
                                     }
                                     .onFailure { err ->
@@ -2778,6 +2863,42 @@ fun ChatScreen(
                         cellSize = 48.dp,
                         modifier = Modifier.testTag("voice_dictation_button")
                     )
+
+                    // Per-Message Creativity / Thinking Effort Override Dial (LOW / BAL / DEEP)
+                    Box(
+                        modifier = Modifier
+                            .height(48.dp)
+                            .background(
+                                when (state.reasoningEffort) {
+                                    ReasoningEffort.DEEP -> SwissInk
+                                    ReasoningEffort.LOW -> SwissSubtleFill
+                                    ReasoningEffort.BALANCED -> SwissPaper
+                                },
+                                RectangleShape
+                            )
+                            .border(
+                                1.dp,
+                                if (state.reasoningEffort == ReasoningEffort.DEEP) SwissSignalRed else SwissInk,
+                                RectangleShape
+                            )
+                            .clickable(onClick = viewModel::cycleReasoningEffort)
+                            .padding(horizontal = 8.dp)
+                            .testTag("reasoning_effort_dial"),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(
+                                text = "THINK",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (state.reasoningEffort == ReasoningEffort.DEEP) SwissSignalRed else SwissMuted
+                            )
+                            Text(
+                                text = state.reasoningEffort.shortLabel,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (state.reasoningEffort == ReasoningEffort.DEEP) SwissWhite else SwissInk
+                            )
+                        }
+                    }
 
                     if (state.isStreaming) {
                         SwissIconCell(

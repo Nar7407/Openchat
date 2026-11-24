@@ -221,6 +221,7 @@ class ApiKeyVault(private val context: Context) {
                     val phone = o.optString("phoneNumber")
                     val email = o.optString("email")
                     val upiId = o.optString("upiId")
+                    val nicknames = o.optString("nicknames")
                     if (name.isNotBlank() && (phone.isNotBlank() || email.isNotBlank() || upiId.isNotBlank())) {
                         add(
                             QuickContact(
@@ -228,7 +229,8 @@ class ApiKeyVault(private val context: Context) {
                                 name = name,
                                 phoneNumber = phone,
                                 email = email,
-                                upiId = upiId
+                                upiId = upiId,
+                                nicknames = nicknames
                             )
                         )
                     }
@@ -237,21 +239,9 @@ class ApiKeyVault(private val context: Context) {
         }.getOrDefault(emptyList())
     }
 
-    suspend fun saveQuickContact(contact: QuickContact) {
-        val current = quickContactsFlow.first().toMutableList()
-        val id = contact.id.ifBlank { "qc_${System.currentTimeMillis()}" }
-        val existing = current.firstOrNull { it.id == id || it.name.equals(contact.name.trim(), ignoreCase = true) }
-        val normalized = contact.copy(
-            id = existing?.id ?: id,
-            name = contact.name.trim(),
-            phoneNumber = contact.phoneNumber.trim().ifBlank { existing?.phoneNumber.orEmpty() },
-            email = contact.email.trim().ifBlank { existing?.email.orEmpty() },
-            upiId = contact.upiId.trim().ifBlank { existing?.upiId.orEmpty() }
-        )
-        val idx = current.indexOfFirst { it.id == normalized.id }
-        if (idx >= 0) current[idx] = normalized else current.add(0, normalized)
+    private fun serializeQuickContacts(list: List<QuickContact>): String {
         val arr = JSONArray()
-        current.forEach { c ->
+        list.forEach { c ->
             arr.put(
                 JSONObject()
                     .put("id", c.id)
@@ -259,25 +249,97 @@ class ApiKeyVault(private val context: Context) {
                     .put("phoneNumber", c.phoneNumber)
                     .put("email", c.email)
                     .put("upiId", c.upiId)
+                    .put("nicknames", c.nicknames)
             )
         }
-        context.keyVaultDataStore.edit { it[KEY_QUICK_CONTACTS] = arr.toString() }
+        return arr.toString()
+    }
+
+    suspend fun saveQuickContact(contact: QuickContact) {
+        val current = quickContactsFlow.first().toMutableList()
+        val id = contact.id.ifBlank { "qc_${System.currentTimeMillis()}_${current.size}" }
+        val cleanName = contact.name.trim()
+        val cleanPhone = contact.phoneNumber.trim()
+        val existing = current.firstOrNull {
+            it.id == id || (
+                it.name.equals(cleanName, ignoreCase = true) &&
+                    (cleanPhone.isBlank() || it.phoneNumber.isBlank() || it.phoneNumber == cleanPhone)
+                )
+        }
+        val mergedNicknames = listOf(existing?.nicknames.orEmpty(), contact.nicknames.trim())
+            .flatMap { it.split(',', ';') }
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinctBy { it.lowercase() }
+            .joinToString(", ")
+        val normalized = contact.copy(
+            id = existing?.id ?: id,
+            name = cleanName,
+            phoneNumber = cleanPhone.ifBlank { existing?.phoneNumber.orEmpty() },
+            email = contact.email.trim().ifBlank { existing?.email.orEmpty() },
+            upiId = contact.upiId.trim().ifBlank { existing?.upiId.orEmpty() },
+            nicknames = mergedNicknames
+        )
+        val idx = current.indexOfFirst { it.id == normalized.id }
+        if (idx >= 0) current[idx] = normalized else current.add(0, normalized)
+        context.keyVaultDataStore.edit { it[KEY_QUICK_CONTACTS] = serializeQuickContacts(current) }
+    }
+
+    suspend fun saveQuickContactsBulk(contacts: List<QuickContact>): Int {
+        if (contacts.isEmpty()) return 0
+        val current = quickContactsFlow.first().toMutableList()
+        var addedOrUpdated = 0
+        val baseTs = System.currentTimeMillis()
+        contacts.forEachIndexed { idxOffset, raw ->
+            val cleanName = raw.name.trim()
+            val cleanPhone = raw.phoneNumber.trim()
+            val cleanEmail = raw.email.trim()
+            val cleanUpi = raw.upiId.trim()
+            if (cleanName.isBlank() || (cleanPhone.isBlank() && cleanEmail.isBlank() && cleanUpi.isBlank())) {
+                return@forEachIndexed
+            }
+            val existingIdx = current.indexOfFirst {
+                it.name.equals(cleanName, ignoreCase = true) &&
+                    (cleanPhone.isBlank() || it.phoneNumber == cleanPhone)
+            }
+            if (existingIdx >= 0) {
+                val ex = current[existingIdx]
+                val mergedAliases = listOf(ex.nicknames, raw.nicknames)
+                    .flatMap { it.split(',', ';') }
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                    .distinctBy { it.lowercase() }
+                    .joinToString(", ")
+                current[existingIdx] = ex.copy(
+                    phoneNumber = cleanPhone.ifBlank { ex.phoneNumber },
+                    email = cleanEmail.ifBlank { ex.email },
+                    upiId = cleanUpi.ifBlank { ex.upiId },
+                    nicknames = mergedAliases
+                )
+            } else {
+                current.add(
+                    0,
+                    QuickContact(
+                        id = raw.id.ifBlank { "qc_${baseTs}_$idxOffset" },
+                        name = cleanName,
+                        phoneNumber = cleanPhone,
+                        email = cleanEmail,
+                        upiId = cleanUpi,
+                        nicknames = raw.nicknames.trim()
+                    )
+                )
+            }
+            addedOrUpdated++
+        }
+        if (addedOrUpdated > 0) {
+            context.keyVaultDataStore.edit { it[KEY_QUICK_CONTACTS] = serializeQuickContacts(current) }
+        }
+        return addedOrUpdated
     }
 
     suspend fun deleteQuickContact(id: String) {
         val updated = quickContactsFlow.first().filterNot { it.id == id }
-        val arr = JSONArray()
-        updated.forEach { c ->
-            arr.put(
-                JSONObject()
-                    .put("id", c.id)
-                    .put("name", c.name)
-                    .put("phoneNumber", c.phoneNumber)
-                    .put("email", c.email)
-                    .put("upiId", c.upiId)
-            )
-        }
-        context.keyVaultDataStore.edit { it[KEY_QUICK_CONTACTS] = arr.toString() }
+        context.keyVaultDataStore.edit { it[KEY_QUICK_CONTACTS] = serializeQuickContacts(updated) }
     }
 
     val customAppsFlow: Flow<List<CustomAppEntry>> = context.keyVaultDataStore.data.map { prefs ->

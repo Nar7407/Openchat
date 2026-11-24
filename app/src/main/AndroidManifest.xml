@@ -191,13 +191,14 @@
                 android:resource="@xml/shortcuts" />
         </activity>
 
-        <!-- Translucent Floating Micro-Overlay for Direct Home Screen Widget Ask & Mic (Never Opens Main App) -->
+        <!-- Translucent Floating Micro-Overlay for Direct Home Screen Widget Ask, Mic & Device Actions -->
         <activity
             android:name=".widget.WidgetPromptActivity"
+            android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation"
             android:excludeFromRecents="true"
             android:exported="false"
             android:launchMode="singleInstance"
-            android:noHistory="true"
+            android:resizeableActivity="true"
             android:taskAffinity=""
             android:theme="@style/Theme.AllChat.WidgetOverlay"
             android:windowSoftInputMode="adjustResize" />

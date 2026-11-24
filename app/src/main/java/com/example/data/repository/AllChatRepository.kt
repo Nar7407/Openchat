@@ -71,6 +71,7 @@ import com.example.domain.model.ProviderConfig
 import com.example.domain.model.ProviderType
 import com.example.domain.model.QuickContact
 import com.example.domain.model.QuizQuestion
+import com.example.domain.model.ReplyMorphStyle
 import com.example.domain.model.RewritePreset
 import com.example.domain.model.RoutineStep
 import com.example.domain.model.RoutineStepType
@@ -185,6 +186,27 @@ class AllChatRepository(
         _cooldownSnapshotFlow.value = modelCooldownUntilMs.toMap()
     }
 
+    private fun markProviderRateLimited(providerId: Long, allModels: List<SelectableModel>, durationMs: Long = 60_000L) {
+        val until = System.currentTimeMillis() + durationMs
+        val providerModels = allModels.filter { it.provider.id == providerId }
+        if (providerModels.isEmpty()) return
+        providerModels.forEach { m ->
+            modelCooldownUntilMs[m.model.id] = until
+        }
+        _cooldownSnapshotFlow.value = modelCooldownUntilMs.toMap()
+    }
+
+    private fun isRateLimitOrUnavailableError(t: Throwable): Boolean {
+        if (isRateLimitError(t)) return true
+        val msg = t.message.orEmpty().lowercase()
+        return msg.contains("503") ||
+            msg.contains("service unavailable") ||
+            msg.contains("overloaded") ||
+            msg.contains("temporarily unavailable") ||
+            msg.contains("capacity") ||
+            msg.contains("server busy")
+    }
+
     // --- Vault Lock, Themes & Command Preferences ---
 
     val isLockedFlow: StateFlow<Boolean> = apiKeyVault.isLocked
@@ -244,6 +266,9 @@ class AllChatRepository(
 
     suspend fun saveQuickContact(contact: QuickContact) =
         apiKeyVault.saveQuickContact(contact)
+
+    suspend fun saveQuickContactsBulk(contacts: List<QuickContact>): Int =
+        apiKeyVault.saveQuickContactsBulk(contacts)
 
     suspend fun deleteQuickContact(id: String) =
         apiKeyVault.deleteQuickContact(id)
@@ -1323,6 +1348,193 @@ class AllChatRepository(
         }
     }
 
+    /**
+     * Inline Tone & Length Morph: regenerates a specific assistant reply cleanly in-place
+     * without cluttering chat history with extra user turns.
+     */
+    suspend fun morphAssistantMessageInPlace(
+        conversationId: Long,
+        targetMessage: MessageEntity,
+        style: ReplyMorphStyle,
+        selectableModel: SelectableModel,
+        baseOptions: ChatOptions = ChatOptions(),
+        onStatus: ((String) -> Unit)? = null
+    ) {
+        val freshModel = resolveFreshModel(selectableModel.model.id) ?: selectableModel
+        val apiKey = apiKeyVault.getApiKey(freshModel.provider.id)
+        val originalContent = targetMessage.content
+        if (originalContent.isBlank()) return
+
+        onStatus?.invoke("MORPH // Rewriting (${style.chipLabel})…")
+        val morphSystem = buildString {
+            appendLine("You are AllChat's Live Response Tuner.")
+            appendLine("Apply the requested transformation cleanly to the assistant response below.")
+            appendLine("Return ONLY the rewritten response — no meta-commentary like 'Here is the shorter version'.")
+            appendLine()
+            appendLine("Requested Transformation (${style.chipLabel}):")
+            appendLine(style.instruction)
+        }.trim()
+
+        val morphInput = listOf(
+            ChatInputMessage(
+                role = "USER",
+                text = "Transform this response according to the instructions (${style.chipLabel}):\n\n$originalContent"
+            )
+        )
+        val morphOptions = baseOptions.copy(
+            systemPrompt = morphSystem,
+            enableTools = false,
+            enableGeminiGoogleSearch = false,
+            supportsVisionInput = false
+        )
+
+        val buffer = StringBuilder()
+        var promptTokens = 0
+        var completionTokens = 0
+
+        try {
+            withTimeout(25_000L) {
+                aiRouter.streamChat(
+                    provider = freshModel.provider,
+                    apiKey = apiKey,
+                    modelId = freshModel.model.modelId,
+                    messages = morphInput,
+                    options = morphOptions
+                ).collect { event ->
+                    when (event) {
+                        is StreamEvent.TextDelta -> {
+                            buffer.append(event.text)
+                            val costUsd = CostEstimator.calculateUsd(
+                                promptTokens,
+                                completionTokens,
+                                freshModel.model.inputPricePerMillion,
+                                freshModel.model.outputPricePerMillion
+                            )
+                            messageDao.updateStreamingMessage(
+                                id = targetMessage.id,
+                                content = buffer.toString(),
+                                promptTokens = promptTokens.takeIf { it > 0 },
+                                completionTokens = completionTokens.takeIf { it > 0 },
+                                estimatedCostUsd = costUsd
+                            )
+                        }
+                        is StreamEvent.Usage -> {
+                            promptTokens = event.promptTokens
+                            completionTokens = event.completionTokens
+                        }
+                        else -> Unit
+                    }
+                }
+            }
+            if (buffer.isBlank()) {
+                // Restore original content if model returned nothing
+                messageDao.updateStreamingMessage(
+                    id = targetMessage.id,
+                    content = originalContent,
+                    promptTokens = targetMessage.promptTokens,
+                    completionTokens = targetMessage.completionTokens
+                )
+            } else {
+                val finalCostUsd = CostEstimator.calculateUsd(
+                    promptTokens,
+                    completionTokens,
+                    freshModel.model.inputPricePerMillion,
+                    freshModel.model.outputPricePerMillion
+                )
+                if (promptTokens > 0 || completionTokens > 0) {
+                    conversationDao.addTokenUsage(conversationId, promptTokens, completionTokens, finalCostUsd)
+                }
+                onStatus?.invoke("MORPH // Applied ${style.chipLabel} in-place.")
+            }
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            if (buffer.isBlank()) {
+                messageDao.updateStreamingMessage(
+                    id = targetMessage.id,
+                    content = originalContent,
+                    promptTokens = targetMessage.promptTokens,
+                    completionTokens = targetMessage.completionTokens
+                )
+            }
+            throw ce
+        } catch (err: Throwable) {
+            // Preserve original reply cleanly on error
+            if (buffer.isBlank()) {
+                messageDao.updateStreamingMessage(
+                    id = targetMessage.id,
+                    content = originalContent,
+                    promptTokens = targetMessage.promptTokens,
+                    completionTokens = targetMessage.completionTokens
+                )
+            }
+            throw err
+        }
+    }
+
+    private fun isContextOverflowError(err: Throwable): Boolean {
+        val msg = err.message.orEmpty().lowercase()
+        return msg.contains("context_length_exceeded") ||
+            msg.contains("maximum context length") ||
+            msg.contains("context window") ||
+            msg.contains("413") ||
+            msg.contains("payload too large") ||
+            msg.contains("request entity too large") ||
+            msg.contains("too many tokens") ||
+            msg.contains("token limit") ||
+            msg.contains("prompt is too long") ||
+            msg.contains("exceeds the maximum") ||
+            msg.contains("input is too long")
+    }
+
+    /**
+     * Automatic Context-Overflow Trimmer:
+     * 1) Strips heavy base64 images from older messages, preserving only the latest image.
+     * 2) Compresses oldest non-recent turns into a compact summary anchor while keeping the latest turns intact.
+     * 3) Caps oversized historical messages to fit comfortably under smaller context limits.
+     */
+    private fun trimMessagesForContextOverflow(messages: List<ChatInputMessage>): List<ChatInputMessage> {
+        if (messages.isEmpty()) return messages
+        val lastImageIdx = messages.indexOfLast { !it.imageBase64.isNullOrBlank() }
+
+        val imageStripped = messages.mapIndexed { idx, msg ->
+            if (!msg.imageBase64.isNullOrBlank() && idx != lastImageIdx) {
+                val note = "[Earlier image attachment stripped to recover context window]"
+                msg.copy(
+                    text = if (msg.text.isBlank()) note else "${msg.text}\n\n$note",
+                    imageBase64 = null,
+                    imageMimeType = null
+                )
+            } else {
+                msg
+            }
+        }
+
+        val keepRecentCount = 6
+        val compacted = if (imageStripped.size > keepRecentCount) {
+            val dropped = imageStripped.dropLast(keepRecentCount)
+            val recent = imageStripped.takeLast(keepRecentCount)
+            val digest = dropped.takeLast(8).joinToString("\n") { m ->
+                val snippet = m.text.replace(Regex("\\s+"), " ").trim().take(160)
+                "- ${m.role}: $snippet"
+            }
+            val summaryHeader = ChatInputMessage(
+                role = "USER",
+                text = "[Auto-trimmed ${dropped.size} earlier turns to fit context window:\n$digest]"
+            )
+            listOf(summaryHeader) + recent
+        } else {
+            imageStripped
+        }
+
+        return compacted.mapIndexed { idx, msg ->
+            val maxLen = if (idx == compacted.lastIndex) 16_000 else 3_500
+            if (msg.text.length > maxLen) {
+                msg.copy(text = msg.text.take(maxLen) + "\n…[trimmed by Self-Healer]")
+            } else {
+                msg
+            }
+        }
+    }
+
     private suspend fun streamAssistantReply(
         conversationId: Long,
         parentUserMessageId: Long,
@@ -1431,21 +1643,30 @@ class AllChatRepository(
             }
         }
 
-        // 0. Inject enabled User Memory Bank facts into system prompt
+        // 0. Inject enabled User Memory Bank facts AND Saved Quick Contacts Directory into system prompt
         val enabledMemories = userMemoryDao.getEnabled()
-        if (enabledMemories.isNotEmpty()) {
-            val memoryBlock = buildString {
-                appendLine("### User Memory Bank (Persistent Preferences & Facts)")
-                enabledMemories.forEach { m ->
-                    appendLine("- [${m.category}] ${m.fact}")
-                }
+        val savedQuickContacts = quickContactsFlow.first()
+        val contactsBlock = DeviceActionEngine.formatContactsForSystemPrompt(savedQuickContacts)
+        val systemAddons = buildList {
+            effectiveOptions.systemPrompt?.trim()?.takeIf { it.isNotEmpty() }?.let { add(it) }
+            if (enabledMemories.isNotEmpty()) {
+                add(
+                    buildString {
+                        appendLine("### User Memory Bank (Persistent Preferences & Facts)")
+                        enabledMemories.forEach { m ->
+                            appendLine("- [${m.category}] ${m.fact}")
+                        }
+                    }.trim()
+                )
             }
-            val mergedSys = listOfNotNull(
-                effectiveOptions.systemPrompt?.trim()?.takeIf { it.isNotEmpty() },
-                memoryBlock
-            ).joinToString("\n\n")
-            effectiveOptions = effectiveOptions.copy(systemPrompt = mergedSys)
+            if (contactsBlock.isNotEmpty()) {
+                add(contactsBlock)
+            }
         }
+        effectiveOptions = effectiveOptions.copy(
+            systemPrompt = systemAddons.joinToString("\n\n").takeIf { it.isNotBlank() },
+            supportsVisionInput = selectableModel.model.supportsImageInput
+        )
 
         val inputMessages = branchHistory.mapIndexed { idx, msg ->
             val encodedImg = if (!msg.attachmentUri.isNullOrBlank()) {
@@ -1485,7 +1706,11 @@ class AllChatRepository(
         )
         onBranchCreated?.invoke(parentUserMessageId, assistantId)
 
-        val apiKey = apiKeyVault.getApiKey(selectableModel.provider.id)
+        var activeModel = selectableModel
+        var activeApiKey = apiKeyVault.getApiKey(activeModel.provider.id)
+        var activeOptions = effectiveOptions
+        val triedProviderIds = mutableSetOf(activeModel.provider.id)
+        var deviceActionTriggered = false
         val buffer = StringBuilder()
         val ttsSentenceBuffer = StringBuilder()
         val pendingArtifacts = mutableListOf<String>()
@@ -1500,107 +1725,157 @@ class AllChatRepository(
         try {
             var toolRound = 0
             val maxToolRounds = 4
+            var contextAutoHealed = false
             while (toolRound <= maxToolRounds) {
                 var requestedToolCalls: List<ToolCallInvocation> = emptyList()
                 val roundTextBuffer = StringBuilder()
 
-                withTimeout(timeoutMs) {
-                    aiRouter.streamChat(
-                        provider = selectableModel.provider,
-                        apiKey = apiKey,
-                        modelId = selectableModel.model.modelId,
-                        messages = inputMessages.toList(),
-                        options = effectiveOptions
-                    ).collect { event ->
-                    when (event) {
-                        is StreamEvent.DebugRequest -> {
-                            capturedRequestJson = "// POST ${event.endpointUrl}\n${event.requestJson}"
-                        }
-                        is StreamEvent.RawResponseChunk -> {
-                            rawChunkCount++
-                            if (rawResponseSamples.length < 10_000) {
-                                rawResponseSamples.append("/* chunk #$rawChunkCount */\n")
-                                rawResponseSamples.append(event.rawJson).append("\n\n")
+                try {
+                    withTimeout(timeoutMs) {
+                        aiRouter.streamChat(
+                            provider = activeModel.provider,
+                            apiKey = activeApiKey,
+                            modelId = activeModel.model.modelId,
+                            messages = inputMessages.toList(),
+                            options = activeOptions
+                        ).collect { event ->
+                        when (event) {
+                            is StreamEvent.DebugRequest -> {
+                                capturedRequestJson = "// POST ${event.endpointUrl}\n${event.requestJson}"
                             }
-                        }
-                        is StreamEvent.GroundingCitations -> {
-                            val existingUrls = collectedCitations.map { it.url }.toSet()
-                            event.citations.forEach { c ->
-                                if (c.url !in existingUrls) {
-                                    collectedCitations += c.copy(index = collectedCitations.size + 1)
+                            is StreamEvent.RawResponseChunk -> {
+                                rawChunkCount++
+                                if (rawResponseSamples.length < 10_000) {
+                                    rawResponseSamples.append("/* chunk #$rawChunkCount */\n")
+                                    rawResponseSamples.append(event.rawJson).append("\n\n")
                                 }
                             }
-                        }
-                        is StreamEvent.ToolCallRequest -> {
-                            requestedToolCalls = event.calls
-                        }
-                        is StreamEvent.TextDelta -> {
-                            val prevText = buffer.toString()
-                            roundTextBuffer.append(event.text)
-                            buffer.append(event.text)
-                            val curText = buffer.toString()
-                            if (thinkingStartMs == null && (curText.contains("<think>") || curText.contains("<reasoning>"))) {
-                                thinkingStartMs = System.currentTimeMillis()
-                            }
-                            if (thinkingStartMs != null && thinkingDurationSec == null &&
-                                ((!prevText.contains("</think>") && curText.contains("</think>")) ||
-                                    (!prevText.contains("</reasoning>") && curText.contains("</reasoning>")))
-                            ) {
-                                val elapsedSec = ((System.currentTimeMillis() - thinkingStartMs!!) / 1000L).toInt().coerceAtLeast(1)
-                                thinkingDurationSec = elapsedSec
-                            }
-                            if (onSentenceReady != null) {
-                                val insideThinkBlock = (curText.contains("<think>") && !curText.contains("</think>")) ||
-                                    (curText.contains("<reasoning>") && !curText.contains("</reasoning>"))
-                                if (!insideThinkBlock) {
-                                    ttsSentenceBuffer.append(event.text)
-                                    val currentChunk = ttsSentenceBuffer.toString()
-                                    val breakIdx = findSentenceBreak(currentChunk)
-                                    if (breakIdx > 0) {
-                                        val ready = cleanWidgetAnswerText(currentChunk.substring(0, breakIdx))
-                                        val rem = currentChunk.substring(breakIdx)
-                                        ttsSentenceBuffer.clear()
-                                        ttsSentenceBuffer.append(rem)
-                                        if (ready.length >= 6) {
-                                            onSentenceReady(ready)
-                                        }
+                            is StreamEvent.GroundingCitations -> {
+                                val existingUrls = collectedCitations.map { it.url }.toSet()
+                                event.citations.forEach { c ->
+                                    if (c.url !in existingUrls) {
+                                        collectedCitations += c.copy(index = collectedCitations.size + 1)
                                     }
                                 }
                             }
-                            val costUsd = CostEstimator.calculateUsd(
-                                promptTokens,
-                                completionTokens,
-                                selectableModel.model.inputPricePerMillion,
-                                selectableModel.model.outputPricePerMillion
-                            )
-                            messageDao.updateStreamingMessage(
-                                id = assistantId,
-                                content = curText,
-                                promptTokens = promptTokens.takeIf { it > 0 },
-                                completionTokens = completionTokens.takeIf { it > 0 },
-                                estimatedCostUsd = costUsd
-                            )
+                            is StreamEvent.ToolCallRequest -> {
+                                requestedToolCalls = event.calls
+                            }
+                            is StreamEvent.TextDelta -> {
+                                val prevText = buffer.toString()
+                                roundTextBuffer.append(event.text)
+                                buffer.append(event.text)
+                                val curText = buffer.toString()
+                                if (thinkingStartMs == null && (curText.contains("<think>") || curText.contains("<reasoning>"))) {
+                                    thinkingStartMs = System.currentTimeMillis()
+                                }
+                                if (thinkingStartMs != null && thinkingDurationSec == null &&
+                                    ((!prevText.contains("</think>") && curText.contains("</think>")) ||
+                                        (!prevText.contains("</reasoning>") && curText.contains("</reasoning>")))
+                                ) {
+                                    val elapsedSec = ((System.currentTimeMillis() - thinkingStartMs!!) / 1000L).toInt().coerceAtLeast(1)
+                                    thinkingDurationSec = elapsedSec
+                                }
+                                if (onSentenceReady != null) {
+                                    val insideThinkBlock = (curText.contains("<think>") && !curText.contains("</think>")) ||
+                                        (curText.contains("<reasoning>") && !curText.contains("</reasoning>"))
+                                    if (!insideThinkBlock) {
+                                        ttsSentenceBuffer.append(event.text)
+                                        val currentChunk = ttsSentenceBuffer.toString()
+                                        val breakIdx = findSentenceBreak(currentChunk)
+                                        if (breakIdx > 0) {
+                                            val ready = cleanWidgetAnswerText(currentChunk.substring(0, breakIdx))
+                                            val rem = currentChunk.substring(breakIdx)
+                                            ttsSentenceBuffer.clear()
+                                            ttsSentenceBuffer.append(rem)
+                                            if (ready.length >= 6) {
+                                                onSentenceReady(ready)
+                                            }
+                                        }
+                                    }
+                                }
+                                val costUsd = CostEstimator.calculateUsd(
+                                    promptTokens,
+                                    completionTokens,
+                                    selectableModel.model.inputPricePerMillion,
+                                    selectableModel.model.outputPricePerMillion
+                                )
+                                messageDao.updateStreamingMessage(
+                                    id = assistantId,
+                                    content = curText,
+                                    promptTokens = promptTokens.takeIf { it > 0 },
+                                    completionTokens = completionTokens.takeIf { it > 0 },
+                                    estimatedCostUsd = costUsd
+                                )
+                            }
+                            is StreamEvent.Usage -> {
+                                promptTokens = event.promptTokens
+                                completionTokens = event.completionTokens
+                                val costUsd = CostEstimator.calculateUsd(
+                                    promptTokens,
+                                    completionTokens,
+                                    selectableModel.model.inputPricePerMillion,
+                                    selectableModel.model.outputPricePerMillion
+                                )
+                                messageDao.updateStreamingMessage(
+                                    id = assistantId,
+                                    content = buffer.toString(),
+                                    promptTokens = promptTokens.takeIf { it > 0 },
+                                    completionTokens = completionTokens.takeIf { it > 0 },
+                                    estimatedCostUsd = costUsd
+                                )
+                            }
+                            StreamEvent.Completed -> Unit
                         }
-                        is StreamEvent.Usage -> {
-                            promptTokens = event.promptTokens
-                            completionTokens = event.completionTokens
-                            val costUsd = CostEstimator.calculateUsd(
-                                promptTokens,
-                                completionTokens,
-                                selectableModel.model.inputPricePerMillion,
-                                selectableModel.model.outputPricePerMillion
-                            )
-                            messageDao.updateStreamingMessage(
-                                id = assistantId,
-                                content = buffer.toString(),
-                                promptTokens = promptTokens.takeIf { it > 0 },
-                                completionTokens = completionTokens.takeIf { it > 0 },
-                                estimatedCostUsd = costUsd
-                            )
-                        }
-                        StreamEvent.Completed -> Unit
                     }
-                }
+                    }
+                } catch (err: Throwable) {
+                    if (err is kotlinx.coroutines.CancellationException) throw err
+                    // 1. Seamless HTTP 429 / 503 Auto-Failover (60s provider cooldown + transparent retry on next configured provider)
+                    if (roundTextBuffer.isEmpty() && isRateLimitOrUnavailableError(err)) {
+                        val allChatModels = runCatching {
+                            observeModelsForCapability(ModelCapability.TEXT_CHAT).first()
+                        }.getOrDefault(emptyList())
+                        val failedProviderName = activeModel.provider.name
+                        markModelRateLimited(activeModel.model.id, 60_000L)
+                        markProviderRateLimited(activeModel.provider.id, allChatModels, 60_000L)
+
+                        val nowMs = System.currentTimeMillis()
+                        val needsVision = inputMessages.any { !it.imageBase64.isNullOrBlank() }
+                        val candidates = allChatModels.filter { cand ->
+                            val isLocal = cand.provider.baseUrl.contains("localhost", ignoreCase = true) ||
+                                cand.provider.baseUrl.contains("127.0.0.1") ||
+                                cand.provider.baseUrl.contains("10.0.2.2")
+                            cand.provider.id !in triedProviderIds &&
+                                (modelCooldownUntilMs[cand.model.id] ?: 0L) <= nowMs &&
+                                (isLocal || !apiKeyVault.getApiKey(cand.provider.id).isNullOrBlank())
+                        }
+                        val nextModel = (if (needsVision) candidates.firstOrNull { it.model.supportsImageInput } else null)
+                            ?: candidates.firstOrNull()
+
+                        if (nextModel != null) {
+                            triedProviderIds.add(nextModel.provider.id)
+                            activeModel = nextModel
+                            activeApiKey = apiKeyVault.getApiKey(nextModel.provider.id)
+                            activeOptions = activeOptions.copy(
+                                supportsVisionInput = nextModel.model.supportsImageInput
+                            )
+                            onGroundingStatus?.invoke(
+                                "FAILOVER // $failedProviderName 429/503 (60s cooldown) → retrying on ${nextModel.provider.name} · ${nextModel.model.displayName}…"
+                            )
+                            continue
+                        }
+                    }
+                    // 2. Automatic Context-Overflow Trimmer & Self-Healer (413 / context_length_exceeded / token limit)
+                    if (!contextAutoHealed && roundTextBuffer.isEmpty() && isContextOverflowError(err)) {
+                        contextAutoHealed = true
+                        val trimmed = trimMessagesForContextOverflow(inputMessages.toList())
+                        inputMessages.clear()
+                        inputMessages.addAll(trimmed)
+                        onGroundingStatus?.invoke("SELF-HEALER // Context limit hit — trimmed oldest turns & stripped older images, retrying seamlessly…")
+                        continue
+                    }
+                    throw err
                 }
 
                 if (requestedToolCalls.isEmpty() || toolRound >= maxToolRounds) {
@@ -1628,6 +1903,7 @@ class AllChatRepository(
                     )
                     onGroundingStatus?.invoke(outcome.displaySummary)
                     outcome.triggeredDeviceAction?.let { triggered ->
+                        deviceActionTriggered = true
                         onDeviceActionTriggered?.invoke(triggered)
                     }
                     traceLines += "> **${outcome.displaySummary}**"
@@ -1651,6 +1927,24 @@ class AllChatRepository(
                     )
                 }
                 toolRound++
+            }
+
+            // Streamed Plain-Text Action Interceptor:
+            // If the model replied with plain confirmation text instead of calling execute_device_action,
+            // extract WhatsApp/Call action so the interactive confirmation card still appears reliably.
+            if (!deviceActionTriggered && onDeviceActionTriggered != null && buffer.isNotBlank()) {
+                val savedContacts = runCatching { quickContactsFlow.first() }.getOrDefault(emptyList())
+                val savedApps = runCatching { customAppsFlow.first() }.getOrDefault(emptyList())
+                val intercepted = DeviceActionEngine.parseFromAssistantReply(
+                    userPrompt = latestUserText,
+                    assistantReply = buffer.toString(),
+                    contacts = savedContacts,
+                    customApps = savedApps
+                )
+                if (intercepted != null) {
+                    deviceActionTriggered = true
+                    onDeviceActionTriggered.invoke(intercepted)
+                }
             }
 
             // Append any tool-generated chart/mermaid artifacts if not already in response
@@ -2475,6 +2769,8 @@ class AllChatRepository(
             ?: available.first()
 
         val enabledMemories = userMemoryDao.getEnabled()
+        val savedContacts = quickContactsFlow.first()
+        val contactsDirectory = DeviceActionEngine.formatContactsForSystemPrompt(savedContacts)
         val systemPrompt = buildString {
             appendLine("You are AllChat running inside a compact Android Home Screen Widget.")
             appendLine("Give a direct, accurate, concise answer in plain readable text (short paragraphs or brief bullets) so it fits cleanly on a widget.")
@@ -2482,6 +2778,10 @@ class AllChatRepository(
                 appendLine()
                 appendLine("User Memory Bank:")
                 enabledMemories.forEach { m -> appendLine("- [${m.category}] ${m.fact}") }
+            }
+            if (contactsDirectory.isNotEmpty()) {
+                appendLine()
+                appendLine(contactsDirectory)
             }
         }.trim()
 
@@ -2520,7 +2820,11 @@ class AllChatRepository(
                         apiKey = apiKey,
                         modelId = selectedModel.model.modelId,
                         messages = fullInputMessages,
-                        options = ChatOptions(systemPrompt = systemPrompt, maxTokens = 512)
+                        options = ChatOptions(
+                            systemPrompt = systemPrompt,
+                            maxTokens = 512,
+                            supportsVisionInput = selectedModel.model.supportsImageInput
+                        )
                     ).collect { event ->
                         if (event is StreamEvent.TextDelta) {
                             buffer.append(event.text)

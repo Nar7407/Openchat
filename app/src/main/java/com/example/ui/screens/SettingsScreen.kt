@@ -90,6 +90,7 @@ import com.example.domain.model.SelectableModel
 import com.example.domain.model.WebSearchProvider
 import com.example.ui.components.CustomAppsSettingsPanel
 import com.example.ui.components.DailyBudgetGuardPanel
+import com.example.ui.components.EarbudLaunchSetupPanel
 import com.example.ui.components.ModelPickerButton
 import com.example.ui.components.ModelPricingDialog
 import com.example.ui.components.PasswordPromptDialog
@@ -328,6 +329,14 @@ fun SettingsScreen(
                     }
                 }
 
+                // Hands-Free Bluetooth Earbud Launch Setup Guide (Deep Links + Key Mapper / MacroDroid)
+                item {
+                    EarbudLaunchSetupPanel(
+                        onTestLiveMic = { onTestAssistantOverlay?.invoke() },
+                        onCopiedNotice = { msg -> viewModel.showStatusMessage(msg) }
+                    )
+                }
+
                 // 1-Tap Assistant Routines & Macros Builder
                 item {
                     RoutinesSettingsPanel(
@@ -369,13 +378,14 @@ fun SettingsScreen(
                     )
                 }
 
-                // Quick Contacts Manager (Zero-Permission Phone Contact Picker + Email & UPI IDs)
+                // Quick Contacts Manager (Zero-Permission Phone Contact Picker + Bulk .vcf + Nicknames + Email & UPI IDs)
                 item {
                     QuickContactsSettingsPanel(
                         contacts = state.quickContacts,
-                        onSaveContact = { name, phone, email, upi ->
-                            viewModel.saveQuickContact(name, phone, email, upi)
+                        onSaveContact = { name, phone, email, upi, nicknames ->
+                            viewModel.saveQuickContact(name, phone, email, upi, nicknames)
                         },
+                        onImportContactsBulk = viewModel::importQuickContactsBulk,
                         onDeleteContact = viewModel::deleteQuickContact,
                         onReportError = viewModel::reportVaultError
                     )
