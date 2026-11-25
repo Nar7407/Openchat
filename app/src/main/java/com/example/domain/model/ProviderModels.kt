@@ -136,6 +136,46 @@ enum class ReplyMorphStyle(
     )
 }
 
+enum class MemoryProfile(val label: String) {
+    STUDY("STUDY"),
+    WORK("WORK"),
+    PERSONAL("PERSONAL"),
+    ALL("ALL");
+
+    fun next(): MemoryProfile = when (this) {
+        STUDY -> WORK
+        WORK -> PERSONAL
+        PERSONAL -> ALL
+        ALL -> STUDY
+    }
+}
+
+enum class OutputFormatMode(
+    val chipLabel: String,
+    val directive: String
+) {
+    AUTO("AUTO", ""),
+    STEPS(
+        "STEPS",
+        "STRICT OUTPUT FORMAT: Respond strictly as numbered concise steps (1., 2., 3., ...). Zero filler intro or outro."
+    ),
+    TABLE(
+        "TABLE",
+        "STRICT OUTPUT FORMAT: Respond strictly as a compact Markdown table comparing the key fields/results. Zero filler intro or outro."
+    ),
+    CODE(
+        "CODE",
+        "STRICT OUTPUT FORMAT: Respond strictly with clean, runnable code inside fenced code blocks. Zero prose intro or filler explanations."
+    );
+
+    fun next(): OutputFormatMode = when (this) {
+        AUTO -> STEPS
+        STEPS -> TABLE
+        TABLE -> CODE
+        CODE -> AUTO
+    }
+}
+
 data class ChatOptions(
     val systemPrompt: String? = null,
     val temperature: Float? = null,
@@ -145,7 +185,11 @@ data class ChatOptions(
     val enableGeminiGoogleSearch: Boolean = false,
     val enableTools: Boolean = false,
     val reasoningEffort: ReasoningEffort = ReasoningEffort.BALANCED,
-    val supportsVisionInput: Boolean = true
+    val supportsVisionInput: Boolean = true,
+    val injectMemory: Boolean = true,
+    val activeMemoryProfile: MemoryProfile = MemoryProfile.ALL,
+    val outputFormatMode: OutputFormatMode = OutputFormatMode.AUTO,
+    val semanticAutoAttach: Boolean = false
 )
 
 enum class WebSearchProvider(val label: String, val websiteUrl: String) {
@@ -321,11 +365,22 @@ enum class LiveLensMode(val label: String) {
     WHITEBOARD_TO_CODE("CODE / DIAGRAM")
 }
 
+data class LiveLensOverlayRegion(
+    val original: String,
+    val translated: String,
+    val x: Float,
+    val y: Float,
+    val w: Float,
+    val h: Float
+)
+
 data class UserMemoryInfo(
     val id: Long,
     val fact: String,
     val category: String = "Preference",
     val isEnabled: Boolean = true,
+    val isPinned: Boolean = false,
+    val profile: String = "ALL",
     val source: String = "Manual",
     val createdAt: Long = System.currentTimeMillis()
 )
@@ -442,7 +497,8 @@ data class CustomAppEntry(
 data class LiveLensAnalysisResult(
     val modelLabel: String,
     val answer: String,
-    val failoverNotice: String? = null
+    val failoverNotice: String? = null,
+    val overlayRegions: List<LiveLensOverlayRegion> = emptyList()
 )
 
 enum class RoutineStepType(val label: String) {

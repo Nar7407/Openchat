@@ -8,11 +8,21 @@ import android.provider.CalendarContract
 import android.provider.MediaStore
 import com.example.domain.model.CustomAppEntry
 import com.example.domain.model.QuickContact
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.TimeUnit
+
+data class DialExecutionResult(
+    val message: String,
+    val usedAutoDialBridge: Boolean = false
+)
 
 sealed interface DeviceAction {
     val badge: String
@@ -44,9 +54,47 @@ sealed interface DeviceAction {
         }
         override val subtitle: String = when {
             ambiguousMatches.size >= 2 && phoneNumber.isBlank() ->
-                "${ambiguousMatches.size} saved contacts match — tap a chip below to call"
+                "${ambiguousMatches.size} saved contacts match — say first or second, or tap one below"
             phoneNumber.isNotBlank() -> "Direct Dialer · $phoneNumber"
             else -> "Pick a Quick Contact or type a number"
+        }
+    }
+
+    data class WhatsAppCall(
+        val phoneNumber: String,
+        val contactLabel: String? = null,
+        val isVideoCall: Boolean = false,
+        val ambiguousMatches: List<QuickContact> = emptyList()
+    ) : DeviceAction {
+        override val badge: String = if (isVideoCall) "WHATSAPP // VIDEO CALL" else "WHATSAPP // VOICE CALL"
+        val displayBanner: String
+            get() {
+                val mode = if (isVideoCall) "WhatsApp Video Call" else "WhatsApp Voice Call"
+                return when {
+                    !contactLabel.isNullOrBlank() && phoneNumber.isNotBlank() ->
+                        "ACTION // $mode: $contactLabel (+$phoneNumber)"
+                    !contactLabel.isNullOrBlank() ->
+                        "ACTION // $mode: $contactLabel"
+                    phoneNumber.isNotBlank() ->
+                        "ACTION // $mode: +$phoneNumber"
+                    else -> "ACTION // Open WhatsApp Call"
+                }
+            }
+        override val title: String = when {
+            ambiguousMatches.size >= 2 && phoneNumber.isBlank() ->
+                "Choose Contact: ${contactLabel ?: "WhatsApp Call"}"
+            !contactLabel.isNullOrBlank() ->
+                "${if (isVideoCall) "WhatsApp Video Call" else "WhatsApp Call"} $contactLabel"
+            phoneNumber.isNotBlank() ->
+                "${if (isVideoCall) "WhatsApp Video Call" else "WhatsApp Call"} +$phoneNumber"
+            else -> if (isVideoCall) "WhatsApp Video Call" else "WhatsApp Voice Call"
+        }
+        override val subtitle: String = when {
+            ambiguousMatches.size >= 2 && phoneNumber.isBlank() ->
+                "${ambiguousMatches.size} matches found — say first or second, or tap one below"
+            phoneNumber.isNotBlank() ->
+                "+$phoneNumber · Opens contact's WhatsApp ${if (isVideoCall) "video" else "voice"} screen"
+            else -> "Pick a Quick Contact or enter a number for WhatsApp"
         }
     }
 
@@ -83,7 +131,7 @@ sealed interface DeviceAction {
         override val subtitle: String = buildString {
             when {
                 ambiguousMatches.size >= 2 && phoneNumber.isBlank() ->
-                    append("${ambiguousMatches.size} matches found — tap one below · ")
+                    append("${ambiguousMatches.size} matches found — say first or second, or tap one · ")
                 phoneNumber.isNotBlank() -> append("+$phoneNumber · ")
                 else -> append("Pick contact or enter number · ")
             }
@@ -169,7 +217,7 @@ sealed interface DeviceAction {
         override val subtitle: String = buildString {
             when {
                 ambiguousMatches.size >= 2 && phoneNumber.isBlank() ->
-                    append("${ambiguousMatches.size} matches found — tap one below · ")
+                    append("${ambiguousMatches.size} matches found — say first or second, or tap one · ")
                 phoneNumber.isNotBlank() -> append("$phoneNumber · ")
                 else -> append("Pick contact or enter number · ")
             }
@@ -644,12 +692,361 @@ object DeviceActionEngine {
         return null
     }
 
+    private val bridgeHttpClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(5, TimeUnit.SECONDS)
+            .writeTimeout(5, TimeUnit.SECONDS)
+            .build()
+    }
+
+    private val callMishearingWords = setOf(
+        "all", "coal", "cool", "carl", "paul", "hall", "tall", "wall", "fall", "gall",
+        "koll", "kol", "cal", "kaul", "corl", "cawl", "kohl", "crawl"
+    )
+    private val unambiguousCallTypos = setOf("coal", "koll", "kol", "kaul", "corl", "cawl", "cal")
+
+    /**
+     * Pre-processes voice-to-text transcripts to repair common STT mishearings at the start
+     * of Call and WhatsApp/Message commands (e.g., "all Manisha" / "coal Manisha" -> "call Manisha",
+     * "what's up Manisha hi" -> "whatsapp Manisha hi", "massage Manisha hi" -> "message Manisha hi").
+     */
+    fun preprocessVoiceCommand(
+        rawInput: String,
+        contacts: List<QuickContact> = emptyList()
+    ): String {
+        val trimmed = rawInput.trim()
+        if (trimmed.isEmpty() || trimmed.startsWith("/")) return trimmed
+
+        // Preserve any politeness prefix while inspecting the command head
+        val prefixRegex = Regex(
+            """^((?:hey\s+allchat[\s,]+|ok\s+allchat[\s,]+|please\s+|can\s+you\s+(?:please\s+)?|could\s+you\s+(?:please\s+)?)+)(.+)$""",
+            RegexOption.IGNORE_CASE
+        )
+        val prefixMatch = prefixRegex.find(trimmed)
+        val prefix = prefixMatch?.groupValues?.get(1).orEmpty()
+        val body = (prefixMatch?.groupValues?.get(2) ?: trimmed).trim()
+        if (body.isEmpty()) return trimmed
+
+        // 1. Repair "call to <target>" / "make call <target>" / "dial to <target>"
+        val callToMatch = Regex("""^(?:call\s+to|make\s+call(?:\s+to)?|dial\s+to)\s+(.+)$""", RegexOption.IGNORE_CASE).find(body)
+        if (callToMatch != null) {
+            return "${prefix}call ${callToMatch.groupValues[1].trim()}".trim()
+        }
+
+        // 2. Repair WhatsApp STT mishearings ("what's up Manisha hi", "whats app Manisha hi", "watsapp Manisha hi")
+        val waTypoMatch = Regex(
+            """^(?:what'?s\s+up|whatsup|whats\s+app|watsapp|watts\s+app|wattsapp)\s+(.+)$""",
+            RegexOption.IGNORE_CASE
+        ).find(body)
+        if (waTypoMatch != null) {
+            val rest = waTypoMatch.groupValues[1].trim()
+            val headWord = body.substringBefore(" ").lowercase(Locale.US)
+            val isUnambiguousWaTypo = headWord in setOf("watsapp", "wattsapp") ||
+                body.lowercase(Locale.US).startsWith("whats app ") ||
+                body.lowercase(Locale.US).startsWith("watts app ")
+            val hasPhone = Regex("""\+?\d[\d\s\-()]{6,18}\d""").containsMatchIn(rest)
+            val matchesContact = hasLeadingContactMatch(rest, contacts)
+            if (isUnambiguousWaTypo || hasPhone || matchesContact) {
+                return "${prefix}whatsapp $rest".trim()
+            }
+        }
+
+        // 3. Repair "massage <contact> <msg>" -> "message <contact> <msg>"
+        val massageMatch = Regex("""^massage\s+(.+)$""", RegexOption.IGNORE_CASE).find(body)
+        if (massageMatch != null) {
+            val rest = massageMatch.groupValues[1].trim()
+            if (hasLeadingContactMatch(rest, contacts) || Regex("""\+?\d[\d\s\-()]{6,18}\d""").containsMatchIn(rest)) {
+                return "${prefix}message $rest".trim()
+            }
+        }
+
+        // 4. Repair Call STT mishearings at the start ("all Manisha", "coal Manisha", "cal Mom")
+        val firstSpace = body.indexOf(' ')
+        if (firstSpace > 0) {
+            val firstWord = body.substring(0, firstSpace).lowercase(Locale.US).trimEnd(',', '.')
+            val rest = body.substring(firstSpace + 1).trim()
+            if (firstWord in callMishearingWords && rest.isNotBlank()) {
+                val cleanedTarget = rest.replace(Regex("""^(?:to|my)\s+""", RegexOption.IGNORE_CASE), "")
+                    .trim()
+                    .trimEnd('.', '!', '?')
+                val hasPhone = Regex("""^\+?\d[\d\s\-()]{5,18}\d$""").matches(cleanedTarget)
+                val matchesSavedContact = cleanedTarget.isNotBlank() &&
+                    resolveMatchingContacts(cleanedTarget, contacts, requirePhone = true).isNotEmpty()
+                val words = cleanedTarget.split(Regex("\\s+")).filter { it.isNotBlank() }
+                val looksLikeSingleProperName = firstWord in unambiguousCallTypos &&
+                    words.size in 1..2 &&
+                    words.firstOrNull()?.firstOrNull()?.isUpperCase() == true
+                if (hasPhone || matchesSavedContact || looksLikeSingleProperName) {
+                    return "${prefix}call $rest".trim()
+                }
+            }
+        }
+
+        return trimmed
+    }
+
+    private fun hasLeadingContactMatch(remainder: String, contacts: List<QuickContact>): Boolean {
+        if (contacts.isEmpty()) return false
+        val stripped = remainder.replace(Regex("""^(?:to|my)\s+""", RegexOption.IGNORE_CASE), "").trim()
+        if (stripped.isEmpty()) return false
+        val tokens = stripped.split(Regex("\\s+")).filter { it.isNotBlank() }
+        val maxPrefix = minOf(3, tokens.size)
+        for (len in maxPrefix downTo 1) {
+            val candidate = tokens.take(len).joinToString(" ").trimEnd(':', ',', '.', '!')
+            if (candidate.length >= 2 && resolveMatchingContacts(candidate, contacts, requirePhone = true).isNotEmpty()) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * Splits "<contact name> <message>" by matching the longest prefix against saved contacts.
+     */
+    private fun splitLeadingContactAndMessage(
+        remainder: String,
+        contacts: List<QuickContact>
+    ): Pair<String, String>? {
+        val stripped = remainder.replace(Regex("""^(?:to\s+)?(?:my\s+)?""", RegexOption.IGNORE_CASE), "").trim()
+        if (stripped.isEmpty()) return null
+        val tokens = stripped.split(Regex("\\s+")).filter { it.isNotBlank() }
+        if (tokens.isEmpty()) return null
+
+        // Check explicit separator keywords first ("Manisha saying hi", "Manisha: hi")
+        val sepMatch = Regex(
+            """^([^:]+?)(?:\s+(?:saying|telling\s+(?:him|her|them)|that|with\s+message|message)\s+|:\s*)(.+)$""",
+            RegexOption.IGNORE_CASE
+        ).find(stripped)
+        if (sepMatch != null) {
+            val cand = sepMatch.groupValues[1].trim().trimEnd(':', ',', '.', '!')
+            val msg = sepMatch.groupValues[2].trim()
+            if (cand.isNotBlank()) return cand to msg
+        }
+
+        // Try longest matching saved contact prefix (3 words -> 2 words -> 1 word)
+        val maxPrefix = minOf(3, tokens.size)
+        for (len in maxPrefix downTo 1) {
+            val cand = tokens.take(len).joinToString(" ").trimEnd(':', ',', '.', '!')
+            if (cand.length >= 2 && resolveMatchingContacts(cand, contacts, requirePhone = true).isNotEmpty()) {
+                val msg = tokens.drop(len).joinToString(" ").trim()
+                return cand to msg
+            }
+        }
+        return null
+    }
+
+    /**
+     * Sequential Multi-Action Chain Parser:
+     * Splits compound voice/text prompts (e.g. "Message Rahul I'm leaving and set an alarm for 8:30 AM")
+     * into an ordered queue of DeviceActions ONLY when every resulting segment independently resolves
+     * into a valid DeviceAction. Regular messages containing "and" (e.g. "Message Rahul bring bread and milk")
+     * stay intact as a single action.
+     */
+    fun parseActionChainFromPrompt(
+        rawInput: String,
+        contacts: List<QuickContact> = emptyList(),
+        customApps: List<CustomAppEntry> = emptyList()
+    ): List<DeviceAction> {
+        val trimmed = rawInput.trim()
+        if (trimmed.isEmpty() || trimmed.startsWith("/")) return emptyList()
+
+        val chained = splitCompoundActions(trimmed, contacts, customApps, depth = 0)
+        if (chained.size >= 2) return chained
+
+        return listOfNotNull(parseFromPrompt(trimmed, contacts, customApps))
+    }
+
+    private fun splitCompoundActions(
+        clause: String,
+        contacts: List<QuickContact>,
+        customApps: List<CustomAppEntry>,
+        depth: Int
+    ): List<DeviceAction> {
+        val clean = clause.trim().trimEnd('.', ';')
+        if (clean.isEmpty() || depth >= 4) {
+            return listOfNotNull(parseFromPrompt(clean, contacts, customApps))
+        }
+
+        // First try explicit clause separators (semicolon / multi-sentence)
+        val explicitSep = Regex("""\s*;\s*|\.\s+""")
+        val explicitParts = clean.split(explicitSep).map { it.trim() }.filter { it.isNotEmpty() }
+        if (explicitParts.size >= 2) {
+            val allParsed = explicitParts.flatMap { part ->
+                val sub = splitCompoundActions(part, contacts, customApps, depth + 1)
+                if (sub.isEmpty()) return emptyList()
+                sub
+            }
+            if (allParsed.size >= 2) return allParsed
+        }
+
+        // Scan chain connectors ("and then", "then", ", and", "and") and split ONLY when both sides parse cleanly
+        val connectorRegex = Regex(
+            """(?i)(?:,\s*and\s+then\s+|,\s*then\s+|\s+and\s+then\s+|\s+then\s+|,\s*and\s+|\s+and\s+|,\s+)"""
+        )
+        val matches = connectorRegex.findAll(clean).toList()
+        for (m in matches) {
+            val leftStr = clean.substring(0, m.range.first).trim()
+            val rightStr = clean.substring(m.range.last + 1).trim()
+            if (leftStr.length < 3 || rightStr.length < 3) continue
+            val leftAction = parseFromPrompt(leftStr, contacts, customApps) ?: continue
+            val rightActions = splitCompoundActions(rightStr, contacts, customApps, depth + 1)
+            if (rightActions.isNotEmpty()) {
+                return listOf(leftAction) + rightActions
+            }
+        }
+        return emptyList()
+    }
+
+    fun ambiguousMatchesOf(action: DeviceAction): List<QuickContact> = when (action) {
+        is DeviceAction.DialPhone -> action.ambiguousMatches
+        is DeviceAction.WhatsAppCall -> action.ambiguousMatches
+        is DeviceAction.SendWhatsApp -> action.ambiguousMatches
+        is DeviceAction.SendSms -> action.ambiguousMatches
+        else -> emptyList()
+    }
+
+    fun contactTargetNameOf(action: DeviceAction): String? = when (action) {
+        is DeviceAction.DialPhone -> action.contactLabel
+        is DeviceAction.WhatsAppCall -> action.contactLabel
+        is DeviceAction.SendWhatsApp -> action.contactLabel
+        is DeviceAction.SendSms -> action.contactLabel
+        is DeviceAction.SendEmail -> action.contactLabel
+        is DeviceAction.UpiPay -> action.payeeName
+        else -> null
+    }
+
+    /**
+     * Builds the spoken voice disambiguation prompt when multiple imported contacts match a spoken name.
+     */
+    fun buildDisambiguationSpeech(action: DeviceAction): String? {
+        val matches = ambiguousMatchesOf(action)
+        if (matches.size < 2) return null
+        val target = contactTargetNameOf(action)?.takeIf { it.isNotBlank() } ?: "that contact"
+        val spokenNames = matches.take(4).map { it.name }
+        val namesJoined = when (spokenNames.size) {
+            2 -> "${spokenNames[0]} and ${spokenNames[1]}"
+            else -> spokenNames.dropLast(1).joinToString(", ") + ", and " + spokenNames.last()
+        }
+        val ordinalHint = when (matches.size) {
+            2 -> "Say first or second, or tap one."
+            3 -> "Say first, second, or third, or tap one."
+            else -> "Say first, second, third, or fourth, or tap one."
+        }
+        return "Found ${matches.size} contacts named $target: $namesJoined. $ordinalHint"
+    }
+
+    /**
+     * Resolves a spoken or typed disambiguation reply ("first", "second", "2", "Rahul Verma")
+     * against an active action with duplicate matching contacts.
+     */
+    fun resolveDisambiguationVoiceReply(
+        rawTranscript: String,
+        pendingAction: DeviceAction
+    ): DeviceAction? {
+        val matches = ambiguousMatchesOf(pendingAction)
+        if (matches.size < 2) return null
+
+        val clean = rawTranscript.trim().lowercase(Locale.US)
+            .replace(Regex("""[^\w\s]"""), " ")
+            .replace(Regex("""\s+"""), " ")
+            .trim()
+        if (clean.isEmpty()) return null
+
+        val tokens = clean.split(" ")
+        var chosenIndex: Int? = null
+
+        if (tokens.size <= 5) {
+            val ordinalPatterns: List<Pair<Int, Regex>> = listOf(
+                0 to Regex("""\b(first|1st|one|1|top)\b"""),
+                1 to Regex("""\b(second|2nd|two|2)\b"""),
+                2 to Regex("""\b(third|3rd|three|3)\b"""),
+                3 to Regex("""\b(fourth|4th|four|4)\b"""),
+                4 to Regex("""\b(fifth|5th|five|5)\b""")
+            )
+            for ((idx, rx) in ordinalPatterns) {
+                if (idx < matches.size && rx.containsMatchIn(clean)) {
+                    chosenIndex = idx
+                    break
+                }
+            }
+        }
+
+        val chosenContact: QuickContact? = if (chosenIndex != null) {
+            matches.getOrNull(chosenIndex)
+        } else {
+            // Try matching spoken surname or full name within the ambiguous candidates
+            val directMatch = resolveMatchingContacts(clean, matches, requirePhone = false)
+            if (directMatch.size == 1) directMatch.first() else null
+        }
+
+        if (chosenContact == null) return null
+
+        return when (pendingAction) {
+            is DeviceAction.DialPhone -> pendingAction.copy(
+                phoneNumber = normalizePhoneNumber(chosenContact.phoneNumber),
+                contactLabel = chosenContact.name,
+                ambiguousMatches = emptyList()
+            )
+            is DeviceAction.WhatsAppCall -> pendingAction.copy(
+                phoneNumber = normalizeWhatsAppDigits(chosenContact.phoneNumber),
+                contactLabel = chosenContact.name,
+                ambiguousMatches = emptyList()
+            )
+            is DeviceAction.SendWhatsApp -> pendingAction.copy(
+                phoneNumber = normalizeWhatsAppDigits(chosenContact.phoneNumber),
+                contactLabel = chosenContact.name,
+                ambiguousMatches = emptyList()
+            )
+            is DeviceAction.SendSms -> pendingAction.copy(
+                phoneNumber = normalizePhoneNumber(chosenContact.phoneNumber),
+                contactLabel = chosenContact.name,
+                ambiguousMatches = emptyList()
+            )
+            else -> null
+        }
+    }
+
+    fun buildSpokenConfirmationPrompt(
+        action: DeviceAction,
+        stepIndex: Int = 0,
+        totalSteps: Int = 1
+    ): String {
+        val disambig = buildDisambiguationSpeech(action)
+        val stepPrefix = when {
+            totalSteps <= 1 -> ""
+            stepIndex == 0 -> "Queued $totalSteps actions. Step 1: "
+            else -> "Step ${stepIndex + 1} of $totalSteps: "
+        }
+        if (disambig != null) return stepPrefix + disambig
+        val core = when (action) {
+            is DeviceAction.DialPhone -> if (action.phoneNumber.isNotBlank()) {
+                "Ready to call ${action.contactLabel ?: action.phoneNumber}. Press earbud once to confirm, or double-press to cancel."
+            } else {
+                "Pick a saved contact or enter a number below to call ${action.contactLabel ?: ""}."
+            }
+            is DeviceAction.WhatsAppCall -> if (action.phoneNumber.isNotBlank()) {
+                val mode = if (action.isVideoCall) "WhatsApp video call" else "WhatsApp call"
+                "Ready for $mode with ${action.contactLabel ?: action.phoneNumber}. Press earbud once to confirm, or double-press to cancel."
+            } else {
+                "Select a contact or enter a phone number below for WhatsApp call."
+            }
+            is DeviceAction.SendWhatsApp -> if (action.phoneNumber.isNotBlank()) {
+                "Ready to send WhatsApp to ${action.contactLabel ?: action.phoneNumber}. Press earbud once to confirm, or double-press to cancel."
+            } else {
+                "Select a contact or enter a phone number below to send on WhatsApp."
+            }
+            else -> "Ready to ${action.title}. Press earbud once to confirm, or tap below."
+        }
+        return stepPrefix + core
+    }
+
     fun parseFromPrompt(
         rawInput: String,
         contacts: List<QuickContact> = emptyList(),
         customApps: List<CustomAppEntry> = emptyList()
     ): DeviceAction? {
-        val text = rawInput.trim()
+        val text = preprocessVoiceCommand(rawInput, contacts).trim()
         if (text.isEmpty() || text.startsWith("/")) return null
         val lower = text.lowercase(Locale.US)
 
@@ -672,6 +1069,10 @@ object DeviceActionEngine {
             }
         }
 
+        // 2.5 WhatsApp Voice / Video Call Routing (BEFORE generic Call & WhatsApp text messaging):
+        //     "WhatsApp call Rahul", "Video call Manisha", "WhatsApp video call Mom", "Call Rahul on WhatsApp"
+        parseWhatsAppCallPrompt(text, contacts)?.let { return it }
+
         // 3. Send WhatsApp Message:
         //    "Send WhatsApp to Rahul saying I'll be late"
         //    "Message Mom on WhatsApp: reaching in 10 mins"
@@ -680,6 +1081,9 @@ object DeviceActionEngine {
             val parsedWa = parseWhatsAppPrompt(text, contacts)
             if (parsedWa != null) return parsedWa
         }
+
+        // 3.5 Natural Messaging ("message Manisha hi", "msg Mom reached safely", "send message to Rahul hi") -> WhatsApp
+        parseGenericMessagePrompt(text, contacts)?.let { return it }
 
         // 4. Play / Open YouTube Video or Search:
         //    "Play Arijit Singh songs on YouTube", "Open MKBHD latest video on YouTube", "Open https://youtu.be/..."
@@ -1004,6 +1408,86 @@ object DeviceActionEngine {
         )
     }
 
+    /**
+     * Routes explicit WhatsApp voice/video call prompts ("WhatsApp call Rahul", "Video call Manisha",
+     * "WhatsApp video call Mom", "Call Rahul on WhatsApp") directly to DeviceAction.WhatsAppCall
+     * instead of the regular phone dialer or WhatsApp text message composer.
+     */
+    private fun parseWhatsAppCallPrompt(rawText: String, contacts: List<QuickContact>): DeviceAction.WhatsAppCall? {
+        val text = rawText.replace(
+            Regex("""^(?:hey\s+allchat[\s,]+|please\s+|can\s+you\s+(?:please\s+)?|could\s+you\s+(?:please\s+)?)+""", RegexOption.IGNORE_CASE),
+            ""
+        ).trim()
+        val lower = text.lowercase(Locale.US)
+        val hasVideoKeyword = lower.contains("video call") || lower.contains("videocall") || lower.contains("facetime")
+        val hasWaKeyword = lower.contains("whatsapp") || lower.startsWith("wa ") || lower.endsWith(" on wa")
+
+        if (!hasVideoKeyword && !hasWaKeyword) return null
+        if (!hasVideoKeyword && !lower.contains("call") && !lower.contains("ring")) return null
+
+        val patterns: List<Pair<Boolean, Regex>> = listOf(
+            // Video call patterns
+            true to Regex("""^(?:make\s+a\s+|start\s+a\s+)?(?:whatsapp|wa)\s+video\s*call\s+(?:to\s+)?(?:my\s+)?(.+)$""", RegexOption.IGNORE_CASE),
+            true to Regex("""^(?:make\s+a\s+|start\s+a\s+)?video\s*call\s+(?:to\s+)?(?:my\s+)?(.+?)(?:\s+on\s+(?:whatsapp|wa))?$""", RegexOption.IGNORE_CASE),
+            true to Regex("""^(?:call|ring)\s+(?:my\s+)?(.+?)\s+on\s+(?:whatsapp|wa)\s+video$""", RegexOption.IGNORE_CASE),
+            // Voice call on WhatsApp patterns
+            false to Regex("""^(?:make\s+a\s+|start\s+a\s+)?(?:whatsapp|wa)\s+(?:voice\s+)?call\s+(?:to\s+)?(?:my\s+)?(.+)$""", RegexOption.IGNORE_CASE),
+            false to Regex("""^(?:voice\s+call|call|ring|dial)\s+(?:to\s+)?(?:my\s+)?(.+?)\s+(?:on|via|using|in)\s+(?:whatsapp|wa)$""", RegexOption.IGNORE_CASE)
+        )
+
+        var isVideo = hasVideoKeyword
+        var rawTarget: String? = null
+        for ((videoFlag, rx) in patterns) {
+            val m = rx.find(text)
+            if (m != null) {
+                isVideo = videoFlag || hasVideoKeyword
+                rawTarget = m.groupValues[1].trim()
+                break
+            }
+        }
+        val cleanTarget = rawTarget
+            ?.replace(Regex("""\s+(?:on|via)\s+(?:whatsapp|wa)$""", RegexOption.IGNORE_CASE), "")
+            ?.trim()
+            ?.trimEnd(':', ',', '.', '!', '?')
+            .orEmpty()
+        if (cleanTarget.isBlank() || cleanTarget.length > 40) return null
+
+        val phoneInside = Regex("""(\+?\d[\d\s\-()]{6,18}\d)""").find(cleanTarget)
+        if (phoneInside != null) {
+            val digits = normalizeWhatsAppDigits(phoneInside.value)
+            val byPhone = resolveContactByPhone(digits, contacts)
+            return DeviceAction.WhatsAppCall(
+                phoneNumber = digits,
+                contactLabel = byPhone?.name,
+                isVideoCall = isVideo
+            )
+        }
+
+        val matches = resolveMatchingContacts(cleanTarget, contacts, requirePhone = true)
+        val distinctPhones = matches.distinctBy { normalizeWhatsAppDigits(it.phoneNumber) }
+        return when {
+            distinctPhones.size >= 2 -> DeviceAction.WhatsAppCall(
+                phoneNumber = "",
+                contactLabel = cleanTarget,
+                isVideoCall = isVideo,
+                ambiguousMatches = distinctPhones
+            )
+            distinctPhones.size == 1 -> {
+                val c = distinctPhones.first()
+                DeviceAction.WhatsAppCall(
+                    phoneNumber = normalizeWhatsAppDigits(c.phoneNumber),
+                    contactLabel = c.name,
+                    isVideoCall = isVideo
+                )
+            }
+            else -> DeviceAction.WhatsAppCall(
+                phoneNumber = "",
+                contactLabel = cleanTarget,
+                isVideoCall = isVideo
+            )
+        }
+    }
+
     private fun parseWhatsAppPrompt(rawText: String, contacts: List<QuickContact>): DeviceAction.SendWhatsApp? {
         val text = rawText.replace(
             Regex("""^(?:hey\s+allchat\s+|please\s+|can\s+you\s+(?:please\s+)?|could\s+you\s+(?:please\s+)?)+""", RegexOption.IGNORE_CASE),
@@ -1039,11 +1523,13 @@ object DeviceActionEngine {
             RegexOption.IGNORE_CASE
         ).find(text)
 
-        // Pattern C2: "whatsapp <single_word_name> <msg>" (e.g., "whatsapp mom i reached home")
-        val patternC2 = Regex(
-            """^(?:whatsapp|wa)\s+(?:to\s+)?(?:my\s+)?([A-Za-z][A-Za-z0-9._-]{1,20})\s+(.+)$""",
-            RegexOption.IGNORE_CASE
-        ).find(text)
+        // Pattern C2: "whatsapp <saved contact name (1-3 words)> <msg>"
+        val waRemainder = text.replace(Regex("""^(?:whatsapp|wa)\s+""", RegexOption.IGNORE_CASE), "").trim()
+        val contactSplitC2 = if ((lower.startsWith("whatsapp ") || lower.startsWith("wa ")) &&
+            !lower.startsWith("whatsapp is") && !lower.startsWith("whatsapp web")
+        ) {
+            splitLeadingContactAndMessage(waRemainder, contacts)
+        } else null
 
         // Pattern D: "send whatsapp to <target>" (no message yet)
         val patternD = Regex(
@@ -1056,9 +1542,7 @@ object DeviceActionEngine {
             patternB != null -> patternB.groupValues[1].trim() to patternB.groupValues[2].trim()
             patternB2 != null -> patternB2.groupValues[1].trim() to patternB2.groupValues[2].trim()
             patternC != null -> patternC.groupValues[1].trim() to patternC.groupValues[2].trim()
-            patternC2 != null && !lower.startsWith("whatsapp is") && !lower.startsWith("whatsapp web") &&
-                resolveMatchingContacts(patternC2.groupValues[1], contacts, requirePhone = true).isNotEmpty() ->
-                patternC2.groupValues[1].trim() to patternC2.groupValues[2].trim()
+            contactSplitC2 != null -> contactSplitC2
             patternD != null && !lower.contains("what is") && !lower.contains("how to") ->
                 patternD.groupValues[1].trim() to ""
             else -> return null
@@ -1067,10 +1551,12 @@ object DeviceActionEngine {
         val cleanTarget = rawTarget.trim().trimEnd(':', ',', '.', '!')
         val phoneInside = Regex("""(\+?\d[\d\s\-()]{6,18}\d)""").find(cleanTarget)
         if (phoneInside != null) {
+            val digits = normalizeWhatsAppDigits(phoneInside.value)
+            val byPhone = resolveContactByPhone(digits, contacts)
             return DeviceAction.SendWhatsApp(
-                phoneNumber = normalizeWhatsAppDigits(phoneInside.value),
+                phoneNumber = digits,
                 message = rawMsg.trim(),
-                contactLabel = null
+                contactLabel = byPhone?.name
             )
         }
 
@@ -1097,6 +1583,149 @@ object DeviceActionEngine {
                 message = rawMsg.trim(),
                 contactLabel = cleanTarget.takeIf { it.isNotBlank() }
             )
+        }
+    }
+
+    /**
+     * Handles natural messaging commands without an explicit "WhatsApp" keyword
+     * (e.g., "message Manisha hi", "msg Mom I reached safely", "send a message to Rahul hello").
+     */
+    private fun parseGenericMessagePrompt(
+        rawText: String,
+        contacts: List<QuickContact>
+    ): DeviceAction.SendWhatsApp? {
+        val text = rawText.replace(
+            Regex("""^(?:hey\s+allchat[\s,]+|please\s+|can\s+you\s+(?:please\s+)?|could\s+you\s+(?:please\s+)?)+""", RegexOption.IGNORE_CASE),
+            ""
+        ).trim()
+        val lower = text.lowercase(Locale.US)
+        if (lower.contains("sms") || lower.contains("email") || lower.contains("mail") ||
+            lower.contains("slack") || lower.contains("telegram") || lower.contains("instagram")
+        ) {
+            return null
+        }
+
+        val headMatch = Regex(
+            """^(?:send\s+(?:a\s+)?(?:message|msg)\s+to|message|msg)\s+(.+)$""",
+            RegexOption.IGNORE_CASE
+        ).find(text) ?: return null
+
+        val remainder = headMatch.groupValues[1].trim()
+        if (remainder.isEmpty()) return null
+
+        // Direct phone number: "message +91 9876543210 hi"
+        val phoneFirst = Regex("""^(\+?\d[\d\s\-()]{6,18}\d)(?:\s+(.+))?$""").find(remainder)
+        if (phoneFirst != null) {
+            val digits = normalizeWhatsAppDigits(phoneFirst.groupValues[1])
+            val byPhone = resolveContactByPhone(digits, contacts)
+            return DeviceAction.SendWhatsApp(
+                phoneNumber = digits,
+                message = phoneFirst.groupValues[2].trim(),
+                contactLabel = byPhone?.name
+            )
+        }
+
+        val split = splitLeadingContactAndMessage(remainder, contacts)
+        val (rawTarget, rawMsg) = if (split != null) {
+            split
+        } else {
+            val tokens = remainder.replace(Regex("""^(?:to\s+)?(?:my\s+)?""", RegexOption.IGNORE_CASE), "")
+                .trim()
+                .split(Regex("\\s+"))
+                .filter { it.isNotBlank() }
+            if (tokens.isEmpty()) return null
+            // If no saved contact matched, only interpret short direct commands like "message Manisha hi"
+            if (lower.startsWith("message ") || lower.startsWith("msg ") || lower.startsWith("send a message to ") || lower.startsWith("send message to ")) {
+                val targetWord = tokens.first().trimEnd(':', ',', '.', '!')
+                val msgBody = tokens.drop(1).joinToString(" ").trim()
+                targetWord to msgBody
+            } else {
+                return null
+            }
+        }
+
+        val cleanTarget = rawTarget.trim().trimEnd(':', ',', '.', '!')
+        if (cleanTarget.isBlank()) return null
+
+        val matches = resolveMatchingContacts(cleanTarget, contacts, requirePhone = true)
+        val distinctPhones = matches.distinctBy { normalizeWhatsAppDigits(it.phoneNumber) }
+        return when {
+            distinctPhones.size >= 2 -> DeviceAction.SendWhatsApp(
+                phoneNumber = "",
+                message = rawMsg.trim(),
+                contactLabel = cleanTarget,
+                ambiguousMatches = distinctPhones
+            )
+            distinctPhones.size == 1 -> {
+                val c = distinctPhones.first()
+                DeviceAction.SendWhatsApp(
+                    phoneNumber = normalizeWhatsAppDigits(c.phoneNumber),
+                    message = rawMsg.trim(),
+                    contactLabel = c.name
+                )
+            }
+            else -> DeviceAction.SendWhatsApp(
+                phoneNumber = "",
+                message = rawMsg.trim(),
+                contactLabel = cleanTarget
+            )
+        }
+    }
+
+    /**
+     * Executes a Call action using an optional user-configured local Auto-Dial Webhook URL
+     * (MacroDroid / Tasker ACTION_CALL bridge) for completely hands-free calling on 1-tap earbud
+     * confirmation, automatically falling back to the direct Android Dialer (`intent://` -> `tel:`).
+     */
+    suspend fun executeDialWithBridge(
+        context: Context,
+        action: DeviceAction.DialPhone,
+        autoDialWebhookUrl: String
+    ): Result<DialExecutionResult> {
+        val clean = action.phoneNumber.replace(Regex("""[^\d+*#]"""), "")
+        val resolvedName = action.contactLabel?.takeIf { it.isNotBlank() }
+        val targetLabel = when {
+            resolvedName != null && clean.isNotBlank() -> "$resolvedName ($clean)"
+            resolvedName != null -> resolvedName
+            clean.isNotBlank() -> clean
+            else -> "Phone Dialer"
+        }
+
+        val trimmedWebhook = autoDialWebhookUrl.trim()
+        if (clean.isNotBlank() && (trimmedWebhook.startsWith("http://") || trimmedWebhook.startsWith("https://"))) {
+            val bridgeOk = withContext(Dispatchers.IO) {
+                runCatching {
+                    val encodedNumber = URLEncoder.encode(clean, "UTF-8")
+                    val digitsOnly = clean.filter { it.isDigit() }
+                    val encodedName = URLEncoder.encode(resolvedName.orEmpty(), "UTF-8")
+                    val finalUrl = if (trimmedWebhook.contains("{number}") ||
+                        trimmedWebhook.contains("{digits}") ||
+                        trimmedWebhook.contains("{name}")
+                    ) {
+                        trimmedWebhook
+                            .replace("{number}", encodedNumber)
+                            .replace("{digits}", digitsOnly)
+                            .replace("{name}", encodedName)
+                    } else {
+                        val sep = if (trimmedWebhook.contains("?")) "&" else "?"
+                        "${trimmedWebhook}${sep}number=$encodedNumber&name=$encodedName"
+                    }
+                    val req = Request.Builder().url(finalUrl).get().build()
+                    bridgeHttpClient.newCall(req).execute().use { resp -> resp.isSuccessful }
+                }.getOrDefault(false)
+            }
+            if (bridgeOk) {
+                return Result.success(
+                    DialExecutionResult(
+                        message = "Calling $targetLabel via Auto-Dial Webhook",
+                        usedAutoDialBridge = true
+                    )
+                )
+            }
+        }
+
+        return execute(context, action).map { msg ->
+            DialExecutionResult(message = msg, usedAutoDialBridge = false)
         }
     }
 
@@ -1143,6 +1772,33 @@ object DeviceActionEngine {
                         clean.isNotBlank() -> "Calling $clean"
                         else -> "Opened Phone Dialer"
                     }
+                }
+
+                is DeviceAction.WhatsAppCall -> {
+                    val digits = normalizeWhatsAppDigits(action.phoneNumber)
+                    if (digits.isBlank()) {
+                        throw IllegalArgumentException("Enter or select a phone number first to open WhatsApp call.")
+                    }
+                    // Open the contact's WhatsApp screen directly via intent:// with https://wa.me/ fallback
+                    val directIntentUri =
+                        "intent://send?phone=$digits#Intent;package=com.whatsapp;scheme=whatsapp;end"
+                    val directIntent = runCatching {
+                        Intent.parseUri(directIntentUri, Intent.URI_INTENT_SCHEME).apply {
+                            setPackage("com.whatsapp")
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                    }.getOrNull()
+                    val fallbackWebIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://wa.me/$digits")).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    if (directIntent != null) {
+                        runCatching { context.startActivity(directIntent) }
+                            .onFailure { context.startActivity(fallbackWebIntent) }
+                    } else {
+                        context.startActivity(fallbackWebIntent)
+                    }
+                    val modeLabel = if (action.isVideoCall) "WhatsApp video call" else "WhatsApp voice call"
+                    "Opened $modeLabel screen for ${action.contactLabel ?: "+$digits"}"
                 }
 
                 is DeviceAction.OpenYouTube -> {
@@ -1480,11 +2136,38 @@ object DeviceActionEngine {
             lowerReply.contains("opening phone dialer") ||
             lowerReply.contains("ready to call") ||
             lowerReply.contains("calling ") ||
-            lowerReply.contains("dialing ")
+            lowerReply.contains("dialing ") ||
+            lowerReply.contains("wants to contact") ||
+            lowerReply.contains("wants to call") ||
+            lowerReply.contains("wants to message")
 
         // 2. If user prompt itself parses cleanly AND the assistant confirmed an action, return it
         if (soundsLikeConfirmation) {
             parseFromPrompt(userPrompt, contacts, customApps)?.let { return it }
+        }
+
+        // 2.5 If model replied "User wants to contact <Name>" without invoking tool, resolve directly to DialPhone
+        val wantsContactMatch = Regex(
+            """(?:wants\s+to\s+(?:contact|call|ring|reach)|contacting|calling)\s+\*?\*?([A-Za-z][A-Za-z0-9 ._-]{1,28})""",
+            RegexOption.IGNORE_CASE
+        ).find(visibleReply)
+        if (wantsContactMatch != null) {
+            val rawName = wantsContactMatch.groupValues[1]
+                .trim()
+                .trimEnd('.', ',', ':', ';', '*', '"', '\'')
+            if (rawName.isNotBlank()) {
+                val matches = resolveMatchingContacts(rawName, contacts, requirePhone = true)
+                    .distinctBy { normalizePhoneNumber(it.phoneNumber) }
+                if (matches.size >= 2) {
+                    return DeviceAction.DialPhone(phoneNumber = "", contactLabel = rawName, ambiguousMatches = matches)
+                }
+                matches.firstOrNull()?.let { c ->
+                    return DeviceAction.DialPhone(
+                        phoneNumber = normalizePhoneNumber(c.phoneNumber),
+                        contactLabel = c.name
+                    )
+                }
+            }
         }
 
         // 3. Extract WhatsApp intent from plain confirmation text

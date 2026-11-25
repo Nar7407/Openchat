@@ -15,6 +15,7 @@ import com.example.domain.model.IncomingAppAction
 import com.example.domain.model.IncomingSharePayload
 import com.example.ui.AllChatApp
 import com.example.ui.theme.AllChatTheme
+import com.example.util.CommandPaletteBus
 import com.example.util.EarbudKeyBus
 import com.example.widget.AllChatWidgetProvider
 
@@ -60,6 +61,9 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (CommandPaletteBus.handleKeyEvent(event)) {
+            return true
+        }
         if (EarbudKeyBus.handleHardwareKeyEvent(event)) {
             return true
         }

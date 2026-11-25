@@ -628,11 +628,14 @@ fun VisionFallbackSettingsPanel(
 
 @Composable
 fun EarbudLaunchSetupPanel(
+    autoDialWebhookUrl: String = "",
+    onSaveAutoDialWebhookUrl: (String) -> Unit = {},
     onTestLiveMic: () -> Unit,
     onCopiedNotice: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val clipboard = LocalClipboardManager.current
+    var webhookDraft by remember(autoDialWebhookUrl) { mutableStateOf(autoDialWebhookUrl) }
     val deepLinks = remember {
         listOf(
             "ANDROID DEEP LINK" to "allchat://live",
@@ -729,6 +732,70 @@ fun EarbudLaunchSetupPanel(
                         style = MaterialTheme.typography.bodySmall,
                         color = SwissInk
                     )
+                }
+
+                // Optional Local Auto-Dial Webhook URL (MacroDroid / Tasker ACTION_CALL bridge)
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(SwissCanvas, RectangleShape)
+                        .border(1.dp, SwissInk, RectangleShape)
+                        .padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = "AUTO-DIAL WEBHOOK URL (OPTIONAL · MACRODROID / TASKER ACTION_CALL)",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = SwissSignalRed
+                    )
+                    Text(
+                        text = "When configured, 1-tap earbud call confirmation fires this local HTTP URL (supports {number}, {digits}, {name}) to connect hands-free without touching the screen. Automatically falls back to Android Dialer if unreachable.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = SwissMuted
+                    )
+                    OutlinedTextField(
+                        value = webhookDraft,
+                        onValueChange = { webhookDraft = it },
+                        placeholder = {
+                            Text(
+                                text = "http://127.0.0.1:8080/call?number={number}&name={name}",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        },
+                        singleLine = true,
+                        shape = RectangleShape,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                        colors = swissTextFieldColors(containerColor = SwissPaper),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("settings_auto_dial_webhook_input")
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        SwissButton(
+                            text = "Save Auto-Dial URL",
+                            variant = SwissButtonVariant.PRIMARY,
+                            minHeight = 40.dp,
+                            onClick = { onSaveAutoDialWebhookUrl(webhookDraft) },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("settings_save_auto_dial_webhook")
+                        )
+                        if (autoDialWebhookUrl.isNotBlank() || webhookDraft.isNotBlank()) {
+                            SwissButton(
+                                text = "Clear",
+                                variant = SwissButtonVariant.OUTLINE,
+                                minHeight = 40.dp,
+                                onClick = {
+                                    webhookDraft = ""
+                                    onSaveAutoDialWebhookUrl("")
+                                },
+                                modifier = Modifier.testTag("settings_clear_auto_dial_webhook")
+                            )
+                        }
+                    }
                 }
 
                 SwissButton(

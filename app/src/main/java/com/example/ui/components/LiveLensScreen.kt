@@ -10,7 +10,9 @@ import android.hardware.SensorManager
 import android.view.ViewGroup
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
@@ -18,6 +20,8 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -28,6 +32,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
@@ -70,14 +76,18 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
@@ -85,6 +95,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.repository.AllChatRepository
 import com.example.domain.model.LiveLensMode
+import com.example.domain.model.LiveLensOverlayRegion
 import com.example.domain.model.ModelCapability
 import com.example.domain.model.SelectableModel
 import com.example.ui.theme.SwissCanvas
@@ -94,11 +105,18 @@ import com.example.ui.theme.SwissMuted
 import com.example.ui.theme.SwissPaper
 import com.example.ui.theme.SwissSignalRed
 import com.example.ui.theme.SwissWhite
+import com.example.util.LiveLensHistoryEntry
+import com.example.util.LiveLensHistoryStore
+import com.example.util.LiveLensScanProcessor
 import com.example.util.ReadAloudController
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 @Composable
@@ -146,6 +164,18 @@ fun LiveLensScreen(
     var useFrontCamera by remember { mutableStateOf(false) }
     var autoCaptureOnSteady by remember { mutableStateOf(false) }
     var palmGestureFreezeEnabled by remember { mutableStateOf(false) }
+    var scanEnhanceEnabled by remember { mutableStateOf(false) }
+    var translateOverlayEnabled by remember { mutableStateOf(false) }
+    var frozenSelectFrame by remember { mutableStateOf<Bitmap?>(null) }
+    var translateOverlayFrame by remember { mutableStateOf<Bitmap?>(null) }
+    var translateOverlayRegions by remember { mutableStateOf<List<LiveLensOverlayRegion>>(emptyList()) }
+    var boundCamera by remember { mutableStateOf<Camera?>(null) }
+    var zoomRatio by remember { mutableFloatStateOf(1f) }
+    var minZoomRatio by remember { mutableFloatStateOf(1f) }
+    var maxZoomRatio by remember { mutableFloatStateOf(3f) }
+    var focusTapOffset by remember { mutableStateOf<Offset?>(null) }
+    var historyEntries by remember { mutableStateOf<List<LiveLensHistoryEntry>>(emptyList()) }
+    var selectedHistoryEntry by remember { mutableStateOf<LiveLensHistoryEntry?>(null) }
     var lastClearFrame by remember { mutableStateOf<Bitmap?>(null) }
     var annotatingFrame by remember { mutableStateOf<Bitmap?>(null) }
     var paletteFrame by remember { mutableStateOf<Bitmap?>(null) }
@@ -158,9 +188,24 @@ fun LiveLensScreen(
     var failoverNotice by remember { mutableStateOf<String?>(null) }
     var showFallbackDialog by remember { mutableStateOf(false) }
     var steadyProgress by remember { mutableFloatStateOf(0f) }
+    var frameMotionDelta by remember { mutableFloatStateOf(0f) }
+    var isCameraShaking by remember { mutableStateOf(false) }
     var lastAutoCaptureMs by remember { mutableLongStateOf(0L) }
     var speakingId by remember { mutableStateOf<Long?>(null) }
     var analyzeJob by remember { mutableStateOf<Job?>(null) }
+
+    // Load persisted Live Lens History (last 10 scans)
+    LaunchedEffect(context) {
+        historyEntries = LiveLensHistoryStore.loadAll(context)
+    }
+
+    // Auto-clear tap-to-focus reticle after 1.4s
+    LaunchedEffect(focusTapOffset) {
+        if (focusTapOffset != null) {
+            delay(1400L)
+            focusTapOffset = null
+        }
+    }
 
     // Auto-dismiss non-blocking 429 Failover Toast Pill after 4.5s
     LaunchedEffect(failoverNotice) {
@@ -205,33 +250,99 @@ fun LiveLensScreen(
         }
     }
 
-    fun captureAndAnalyze(overrideFrame: Bitmap? = null) {
+    fun applyZoom(target: Float) {
+        val clamped = target.coerceIn(minZoomRatio, maxZoomRatio)
+        zoomRatio = clamped
+        runCatching { boundCamera?.cameraControl?.setZoomRatio(clamped) }
+    }
+
+    fun triggerTapFocus(offset: Offset) {
+        focusTapOffset = offset
+        val cam = boundCamera ?: return
+        runCatching {
+            val point = previewView.meteringPointFactory.createPoint(offset.x, offset.y)
+            val action = FocusMeteringAction.Builder(
+                point,
+                FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE
+            )
+                .setAutoCancelDuration(3, TimeUnit.SECONDS)
+                .build()
+            cam.cameraControl.startFocusAndMetering(action)
+        }
+    }
+
+    fun captureAndAnalyze(
+        overrideFrame: Bitmap? = null,
+        skipEnhance: Boolean = false,
+        forceEnhance: Boolean = false,
+        runOverlayTranslate: Boolean = translateOverlayEnabled,
+        multiBoxCount: Int = 0
+    ) {
         if (isAnalyzing) return
-        val frame = overrideFrame ?: runCatching { previewView.bitmap }.getOrNull()
-        if (frame == null) {
+        val rawFrame = overrideFrame ?: runCatching { previewView.bitmap }.getOrNull()
+        if (rawFrame == null) {
             errorText = "Camera frame not ready yet. Point at a subject and tap Scan."
             return
         }
-        lastClearFrame = frame
+        lastClearFrame = rawFrame
         isAnalyzing = true
         errorText = null
+        selectedHistoryEntry = null
         ttsController.stop()
         analyzeJob?.cancel()
         analyzeJob = scope.launch {
             try {
+                var frameToSend = rawFrame
+                var didEnhance = false
+                var didAutoCrop = false
+                if ((forceEnhance || scanEnhanceEnabled) && !skipEnhance) {
+                    val enhanced = withContext(Dispatchers.Default) {
+                        LiveLensScanProcessor.enhanceDocumentBitmap(rawFrame)
+                    }
+                    frameToSend = enhanced.bitmap
+                    didEnhance = true
+                    didAutoCrop = enhanced.wasAutoCropped
+                }
                 val res = repository.analyzeLiveLensFrame(
-                    bitmap = frame,
+                    bitmap = frameToSend,
                     mode = lensMode,
                     targetLanguage = targetLanguage,
                     preferredModel = preferredModel,
+                    overlayTranslateMode = runOverlayTranslate,
+                    multiBoxCount = multiBoxCount,
                     onModelFailover = { notice -> failoverNotice = notice }
                 )
-                resultModelLabel = res.modelLabel
+                val multiSuffix = if (multiBoxCount >= 2) " · ${multiBoxCount}×CROP" else ""
+                val enhanceSuffix = when {
+                    didEnhance && didAutoCrop -> " · SCAN+CROP$multiSuffix"
+                    didEnhance -> " · ENHANCED$multiSuffix"
+                    else -> multiSuffix
+                }
+                // Optional Fast Utility Model lightweight image tag (non-blocking / <= 20 tokens)
+                val quickTag = runCatching {
+                    repository.tagLiveLensAnswerFast(res.answer, preferredModel)
+                }.getOrNull()
+                val tagSuffix = if (!quickTag.isNullOrBlank()) " · #$quickTag" else ""
+                resultModelLabel = "${res.modelLabel}$enhanceSuffix$tagSuffix"
                 resultText = res.answer
+                if (runOverlayTranslate && res.overlayRegions.isNotEmpty()) {
+                    translateOverlayFrame = rawFrame
+                    translateOverlayRegions = res.overlayRegions
+                }
                 if (!res.failoverNotice.isNullOrBlank()) {
                     failoverNotice = res.failoverNotice
                 }
-                if (!muteTts) {
+                historyEntries = LiveLensHistoryStore.saveEntry(
+                    context = context,
+                    bitmap = frameToSend,
+                    modeName = lensMode.name,
+                    targetLanguage = targetLanguage,
+                    modelLabel = res.modelLabel,
+                    answer = res.answer,
+                    scanEnhanced = didEnhance,
+                    wasAutoCropped = didAutoCrop
+                )
+                if (!muteTts && !runOverlayTranslate) {
                     ttsController.speak(System.currentTimeMillis(), res.answer)
                 }
             } catch (ce: CancellationException) {
@@ -244,7 +355,7 @@ fun LiveLensScreen(
         }
     }
 
-    // Bind CameraX Preview
+    // Bind CameraX Preview + Zoom/Focus Control
     LaunchedEffect(hasCameraPermission, useFrontCamera, lifecycleOwner) {
         if (!hasCameraPermission) return@LaunchedEffect
         val future = ProcessCameraProvider.getInstance(context)
@@ -260,7 +371,12 @@ fun LiveLensScreen(
                     CameraSelector.DEFAULT_BACK_CAMERA
                 }
                 cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(lifecycleOwner, selector, preview)
+                val cam = cameraProvider.bindToLifecycle(lifecycleOwner, selector, preview)
+                boundCamera = cam
+                val zs = cam.cameraInfo.zoomState.value
+                minZoomRatio = (zs?.minZoomRatio ?: 1f).coerceAtLeast(1f)
+                maxZoomRatio = (zs?.maxZoomRatio ?: 3f).coerceAtLeast(minZoomRatio)
+                zoomRatio = (zs?.zoomRatio ?: 1f).coerceIn(minZoomRatio, maxZoomRatio)
             }.onFailure {
                 errorText = "Camera preview unavailable: ${it.message ?: "check permissions"}"
             }
@@ -273,12 +389,37 @@ fun LiveLensScreen(
         }
     }
 
-    // Mode A: Adjustable Interval Timer Auto-Scan (3s / 5s / 10s / 15s) to avoid hitting free-tier RPM limits
+    // Real-Time Shake / Blur Guard: lightweight frame-to-frame 16x16 luma delta so blurry frames never upload
+    LaunchedEffect(hasCameraPermission, isAnalyzing, frozenSelectFrame, translateOverlayFrame) {
+        if (!hasCameraPermission || isAnalyzing || frozenSelectFrame != null || translateOverlayFrame != null) {
+            isCameraShaking = false
+            return@LaunchedEffect
+        }
+        var prevSample: IntArray? = null
+        while (true) {
+            delay(200L)
+            val bmp = runCatching { previewView.bitmap }.getOrNull() ?: continue
+            val sample = withContext(Dispatchers.Default) { sampleLumaGrid16x16(bmp) }
+            val prev = prevSample
+            if (prev != null && prev.size == sample.size) {
+                var diffSum = 0
+                for (i in sample.indices) {
+                    diffSum += kotlin.math.abs(sample[i] - prev[i])
+                }
+                val meanDelta = (diffSum.toFloat() / (sample.size * 255f)).coerceIn(0f, 1f)
+                frameMotionDelta = meanDelta
+                isCameraShaking = meanDelta > 0.045f
+            }
+            prevSample = sample
+        }
+    }
+
+    // Mode A: Adjustable Interval Timer Auto-Scan (gated by Shake/Blur Guard so blurry frames aren't uploaded)
     LaunchedEffect(autoCaptureOnSteady, intervalSec, hasCameraPermission, lensMode, targetLanguage) {
         if (!autoCaptureOnSteady || !hasCameraPermission || intervalSec <= 0) return@LaunchedEffect
         while (true) {
             delay(intervalSec * 1000L)
-            if (!isAnalyzing) {
+            if (!isAnalyzing && !isCameraShaking) {
                 captureAndAnalyze()
             }
         }
@@ -355,7 +496,7 @@ fun LiveLensScreen(
                 val delta = sqrt(dx * dx + dy * dy + dz * dz)
                 val now = System.currentTimeMillis()
 
-                if (delta > 0.35f) {
+                if (delta > 0.35f || isCameraShaking) {
                     steadySinceMs = now
                     steadyProgress = 0f
                 } else {
@@ -393,6 +534,49 @@ fun LiveLensScreen(
                 factory = { previewView },
                 modifier = Modifier.fillMaxSize()
             )
+            // Pinch-to-Zoom & Tap-to-Focus / Exposure Targeting Overlay
+            val reticleHalfPx = with(LocalDensity.current) { 32.dp.toPx() }
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .pointerInput(boundCamera, minZoomRatio, maxZoomRatio) {
+                        detectTransformGestures { _, _, zoom, _ ->
+                            if (zoom != 1f) {
+                                applyZoom(zoomRatio * zoom)
+                            }
+                        }
+                    }
+                    .pointerInput(boundCamera, previewView) {
+                        detectTapGestures { offset ->
+                            triggerTapFocus(offset)
+                        }
+                    }
+                    .testTag("live_lens_camera_gesture_surface")
+            ) {
+                focusTapOffset?.let { tap ->
+                    Box(
+                        modifier = Modifier
+                            .offset {
+                                IntOffset(
+                                    x = (tap.x - reticleHalfPx).roundToInt(),
+                                    y = (tap.y - reticleHalfPx).roundToInt()
+                                )
+                            }
+                            .size(64.dp)
+                            .border(2.dp, SwissSignalRed, RectangleShape)
+                    ) {
+                        Text(
+                            text = "AF/AE",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SwissWhite,
+                            modifier = Modifier
+                                .align(Alignment.BottomEnd)
+                                .background(SwissSignalRed, RectangleShape)
+                                .padding(horizontal = 3.dp, vertical = 1.dp)
+                        )
+                    }
+                }
+            }
         } else {
             Column(
                 modifier = Modifier
@@ -433,6 +617,33 @@ fun LiveLensScreen(
                         shape = RectangleShape
                     )
             ) {
+                if (isCameraShaking && !isAnalyzing) {
+                    Text(
+                        text = "STABILIZING… HOLD STEADY",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = SwissWhite,
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .fillMaxWidth()
+                            .background(SwissSignalRed.copy(alpha = 0.92f))
+                            .padding(vertical = 4.dp)
+                            .testTag("live_lens_stabilizing_badge"),
+                        textAlign = TextAlign.Center
+                    )
+                } else if (!isAnalyzing && frameMotionDelta > 0f) {
+                    Text(
+                        text = "OPTICS // CRISP LOCKED",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = SwissWhite.copy(alpha = 0.85f),
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .background(SwissInk.copy(alpha = 0.65f))
+                            .padding(horizontal = 8.dp, vertical = 2.dp)
+                            .testTag("live_lens_crisp_badge"),
+                        textAlign = TextAlign.Center
+                    )
+                }
+
                 if (autoCaptureOnSteady && intervalSec == 0 && steadyProgress > 0.05f && !isAnalyzing) {
                     Column(
                         modifier = Modifier
@@ -457,7 +668,7 @@ fun LiveLensScreen(
                     }
                 } else if (autoCaptureOnSteady && intervalSec > 0 && !isAnalyzing) {
                     Text(
-                        text = "AUTO TIMER // EVERY ${intervalSec}s",
+                        text = if (isCameraShaking) "AUTO PAUSED // STABILIZING…" else "AUTO TIMER // EVERY ${intervalSec}s",
                         style = MaterialTheme.typography.labelSmall,
                         color = SwissSignalRed,
                         modifier = Modifier
@@ -554,7 +765,10 @@ fun LiveLensScreen(
                 SwissIconCell(
                     icon = Icons.Filled.Cameraswitch,
                     contentDescription = "Switch camera lens",
-                    onClick = { useFrontCamera = !useFrontCamera },
+                    onClick = {
+                        zoomRatio = 1f
+                        useFrontCamera = !useFrontCamera
+                    },
                     inverted = true,
                     cellSize = 40.dp
                 )
@@ -634,6 +848,36 @@ fun LiveLensScreen(
                     )
                 }
                 Text(
+                    text = if (translateOverlayEnabled) "TRANSLATE VIEW: ON" else "TRANSLATE VIEW",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = SwissWhite,
+                    modifier = Modifier
+                        .background(if (translateOverlayEnabled) SwissSignalRed else Color.Transparent, RectangleShape)
+                        .border(1.dp, if (translateOverlayEnabled) SwissSignalRed else SwissWhite.copy(alpha = 0.5f), RectangleShape)
+                        .clickable {
+                            translateOverlayEnabled = !translateOverlayEnabled
+                            if (translateOverlayEnabled) {
+                                lensMode = LiveLensMode.LIVE_TRANSLATOR
+                            } else {
+                                translateOverlayFrame = null
+                                translateOverlayRegions = emptyList()
+                            }
+                        }
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                        .testTag("lens_translate_overlay_toggle")
+                )
+                Text(
+                    text = if (scanEnhanceEnabled) "ENHANCE: ON" else "SCAN ENHANCE",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = SwissWhite,
+                    modifier = Modifier
+                        .background(if (scanEnhanceEnabled) SwissSignalRed else Color.Transparent, RectangleShape)
+                        .border(1.dp, if (scanEnhanceEnabled) SwissSignalRed else SwissWhite.copy(alpha = 0.5f), RectangleShape)
+                        .clickable { scanEnhanceEnabled = !scanEnhanceEnabled }
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                        .testTag("lens_scan_enhance_toggle")
+                )
+                Text(
                     text = if (palmGestureFreezeEnabled) "PALM: ON" else "PALM FREEZE",
                     style = MaterialTheme.typography.labelSmall,
                     color = SwissWhite,
@@ -710,12 +954,28 @@ fun LiveLensScreen(
             }
         }
 
-        // Bottom Controls + Clean Result Bottom Sheet
+        // Bottom Controls + Clean Result Bottom Sheet + Zoom Pill + Persistent History Strip
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
+                .navigationBarsPadding()
         ) {
+            if (hasCameraPermission) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 6.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    LiveLensZoomPillBar(
+                        currentZoom = zoomRatio,
+                        minZoom = minZoomRatio,
+                        maxZoom = maxZoomRatio,
+                        onSelectZoom = { target -> applyZoom(target) }
+                    )
+                }
+            }
             AnimatedVisibility(visible = errorText != null) {
                 errorText?.let { err ->
                     Row(
@@ -799,6 +1059,30 @@ fun LiveLensScreen(
                                 horizontalArrangement = Arrangement.spacedBy(10.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
+                                selectedHistoryEntry?.let { savedEntry ->
+                                    Text(
+                                        text = "RE-RUN",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = SwissWhite,
+                                        modifier = Modifier
+                                            .background(SwissSignalRed, RectangleShape)
+                                            .clickable {
+                                                scope.launch {
+                                                    val savedBmp = LiveLensHistoryStore.loadBitmap(savedEntry)
+                                                    if (savedBmp != null) {
+                                                        captureAndAnalyze(
+                                                            overrideFrame = savedBmp,
+                                                            skipEnhance = savedEntry.scanEnhanced
+                                                        )
+                                                    } else {
+                                                        errorText = "Saved scan image is no longer available."
+                                                    }
+                                                }
+                                            }
+                                            .padding(horizontal = 7.dp, vertical = 3.dp)
+                                            .testTag("live_lens_rerun_history")
+                                    )
+                                }
                                 Icon(
                                     imageVector = if (speakingId != null) Icons.Outlined.VolumeOff else Icons.Outlined.VolumeUp,
                                     contentDescription = "Read aloud result",
@@ -844,6 +1128,7 @@ fun LiveLensScreen(
                                         .clickable {
                                             ttsController.stop()
                                             resultText = null
+                                            selectedHistoryEntry = null
                                         }
                                 )
                             }
@@ -851,11 +1136,30 @@ fun LiveLensScreen(
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .heightIn(max = 260.dp)
+                                .heightIn(max = 310.dp)
                                 .verticalScroll(rememberScrollState())
                                 .padding(12.dp)
                         ) {
-                            if (lensMode == LiveLensMode.SOLVE_STEP_BY_STEP || lensMode == LiveLensMode.WHITEBOARD_TO_CODE) {
+                            val parsedSolver = remember(answer, lensMode) {
+                                if (lensMode == LiveLensMode.SOLVE_STEP_BY_STEP || answer.contains("STEP 01", ignoreCase = true)) {
+                                    parseSolverResponse(answer)
+                                } else {
+                                    null
+                                }
+                            }
+                            if (parsedSolver != null) {
+                                InteractiveSolverCardsView(
+                                    solution = parsedSolver,
+                                    onRequestWhyExplanation = { step ->
+                                        repository.explainSolverStepWhy(
+                                            stepTitle = step.title,
+                                            stepBody = step.content,
+                                            problemSummary = answer.take(400),
+                                            preferredModel = preferredModel
+                                        )
+                                    }
+                                )
+                            } else if (lensMode == LiveLensMode.SOLVE_STEP_BY_STEP || lensMode == LiveLensMode.WHITEBOARD_TO_CODE) {
                                 LatexMathMarkdownView(content = answer)
                                 val htmlSnippet = extractHtmlBlock(answer)
                                 if (htmlSnippet != null) {
@@ -879,6 +1183,29 @@ fun LiveLensScreen(
                     }
                 }
             }
+
+            // Persistent 10-Scan Live Lens History Strip
+            LiveLensHistoryStrip(
+                entries = historyEntries,
+                selectedEntryId = selectedHistoryEntry?.id,
+                onSelectEntry = { entry ->
+                    ttsController.stop()
+                    selectedHistoryEntry = entry
+                    resultText = entry.answer
+                    val enhTag = if (entry.scanEnhanced) " · ENHANCED" else ""
+                    resultModelLabel = "${entry.modelLabel}$enhTag · SAVED"
+                    errorText = null
+                    runCatching { LiveLensMode.valueOf(entry.modeName) }.getOrNull()?.let {
+                        lensMode = it
+                    }
+                },
+                onClearHistory = {
+                    scope.launch {
+                        historyEntries = LiveLensHistoryStore.clearAll(context)
+                        selectedHistoryEntry = null
+                    }
+                }
+            )
 
             // Bottom Shutter & Auto-Capture Control Bar
             Row(
@@ -933,23 +1260,92 @@ fun LiveLensScreen(
                     modifier = Modifier.testTag("live_lens_palette_btn")
                 )
 
-                // Primary Scan / Translate / Solve / Code Button
+                // Primary Shutter: Freezes frame for Finger-Circle / Crop-Box selection (or runs Translate View directly)
                 SwissButton(
                     text = when {
                         isAnalyzing -> "Scanning…"
-                        lensMode == LiveLensMode.LIVE_TRANSLATOR -> "Translate ($targetLanguage)"
-                        lensMode == LiveLensMode.SOLVE_STEP_BY_STEP -> "Solve Step-by-Step"
-                        lensMode == LiveLensMode.WHITEBOARD_TO_CODE -> "Digitize to Code"
-                        else -> "Explain View"
+                        translateOverlayEnabled -> "Translate View"
+                        lensMode == LiveLensMode.LIVE_TRANSLATOR -> "Freeze & Translate"
+                        lensMode == LiveLensMode.SOLVE_STEP_BY_STEP -> "Freeze & Solve"
+                        lensMode == LiveLensMode.WHITEBOARD_TO_CODE -> "Freeze & Code"
+                        else -> "Freeze & Scan"
                     },
                     variant = SwissButtonVariant.PRIMARY,
                     enabled = hasCameraPermission && !isAnalyzing,
-                    onClick = { captureAndAnalyze() },
+                    onClick = {
+                        if (translateOverlayEnabled) {
+                            captureAndAnalyze(runOverlayTranslate = true)
+                        } else {
+                            val snap = runCatching { previewView.bitmap }.getOrNull()
+                            if (snap != null) {
+                                frozenSelectFrame = snap
+                            } else {
+                                captureAndAnalyze()
+                            }
+                        }
+                    },
                     modifier = Modifier
                         .weight(1f)
                         .testTag("live_lens_capture_button")
                 )
             }
+        }
+
+        // Freeze-Frame Finger-Circle & Crop-Box Selection Canvas Overlay
+        frozenSelectFrame?.let { frozen ->
+            val actionVerb = when (lensMode) {
+                LiveLensMode.LIVE_TRANSLATOR -> "Translate"
+                LiveLensMode.SOLVE_STEP_BY_STEP -> "Solve"
+                LiveLensMode.WHITEBOARD_TO_CODE -> "Digitize"
+                LiveLensMode.AUTO_EXPLAIN -> "Explain"
+            }
+            LiveLensFreezeSelectOverlay(
+                frozenFrame = frozen,
+                actionLabel = actionVerb,
+                onAnalyzeCropped = { croppedBmp, wasCropped, boxCount ->
+                    frozenSelectFrame = null
+                    captureAndAnalyze(
+                        overrideFrame = croppedBmp,
+                        forceEnhance = wasCropped,
+                        runOverlayTranslate = translateOverlayEnabled,
+                        multiBoxCount = boxCount
+                    )
+                },
+                onAnalyzeFullFrame = {
+                    val full = frozen
+                    frozenSelectFrame = null
+                    captureAndAnalyze(
+                        overrideFrame = full,
+                        runOverlayTranslate = translateOverlayEnabled
+                    )
+                },
+                onCancel = { frozenSelectFrame = null }
+            )
+        }
+
+        // Live Camera Overlay Translation View ("Translate View")
+        val overlayBmp = translateOverlayFrame
+        if (overlayBmp != null && translateOverlayRegions.isNotEmpty()) {
+            LiveLensTranslateOverlay(
+                frozenFrame = overlayBmp,
+                targetLanguage = targetLanguage,
+                regions = translateOverlayRegions,
+                modelLabel = resultModelLabel,
+                onCopyAll = {
+                    val joined = translateOverlayRegions.joinToString("\n") { it.translated }
+                    clipboard.setText(AnnotatedString(joined))
+                    failoverNotice = "Copied ${translateOverlayRegions.size} translated blocks."
+                },
+                onRescan = {
+                    translateOverlayFrame = null
+                    translateOverlayRegions = emptyList()
+                    captureAndAnalyze(runOverlayTranslate = true)
+                },
+                onReturnLive = {
+                    translateOverlayFrame = null
+                    translateOverlayRegions = emptyList()
+                }
+            )
         }
     }
 
@@ -1240,6 +1636,25 @@ private fun estimateFrameLuma(bitmap: Bitmap): Int {
         y += stepY
     }
     return if (count > 0L) (sum / count).toInt() else 128
+}
+
+private fun sampleLumaGrid16x16(bitmap: Bitmap): IntArray {
+    val grid = IntArray(256)
+    val w = bitmap.width.coerceAtLeast(1)
+    val h = bitmap.height.coerceAtLeast(1)
+    var idx = 0
+    for (gy in 0 until 16) {
+        val py = ((gy + 0.5f) / 16f * h).toInt().coerceIn(0, h - 1)
+        for (gx in 0 until 16) {
+            val px = ((gx + 0.5f) / 16f * w).toInt().coerceIn(0, w - 1)
+            val pixel = bitmap.getPixel(px, py)
+            val r = (pixel shr 16) and 0xFF
+            val g = (pixel shr 8) and 0xFF
+            val b = pixel and 0xFF
+            grid[idx++] = ((299 * r + 587 * g + 114 * b) / 1000)
+        }
+    }
+    return grid
 }
 
 private fun extractHtmlBlock(markdown: String): String? {

@@ -25,8 +25,10 @@ import com.example.domain.model.FactCheckClaim
 import com.example.domain.model.KnowledgeDocInfo
 import com.example.domain.model.McpCheckResult
 import com.example.domain.model.McpServerConfig
+import com.example.domain.model.MemoryProfile
 import com.example.domain.model.MindMapNode
 import com.example.domain.model.ModelCapability
+import com.example.domain.model.OutputFormatMode
 import com.example.domain.model.PersonaInfo
 import com.example.domain.model.QuickContact
 import com.example.domain.model.RequestParamsOverride
@@ -146,7 +148,15 @@ data class ChatUiState(
     val customSlashCommands: List<CustomSlashCommand> = emptyList(),
     val knowledgeDocs: List<KnowledgeDocInfo> = emptyList(),
     val memories: List<UserMemoryInfo> = emptyList(),
-    val autoExtractMemories: Boolean = false,
+    val autoExtractMemories: Boolean = true,
+    val memoryInjectionEnabled: Boolean = true,
+    val memoryUpdatedToast: String? = null,
+    val activeMemoryProfile: MemoryProfile = MemoryProfile.ALL,
+    val outputFormatMode: OutputFormatMode = OutputFormatMode.AUTO,
+    val semanticAutoAttach: Boolean = false,
+    val fastUtilityModelId: Long? = null,
+    val pinnedModelIds: List<Long> = emptyList(),
+    val modelLatencyMs: Map<Long, Long> = emptyMap(),
     val quotedMessage: MessageEntity? = null,
     val miniModeEnabled: Boolean = false,
     val pendingDocumentTitle: String? = null,
@@ -160,8 +170,10 @@ data class ChatUiState(
     val liveCamEnabled: Boolean = false,
     val liveVoiceActive: Boolean = false,
     val pendingDeviceAction: DeviceAction? = null,
+    val queuedDeviceActions: List<DeviceAction> = emptyList(),
     val quickContacts: List<QuickContact> = emptyList(),
     val customApps: List<CustomAppEntry> = emptyList(),
+    val autoDialWebhookUrl: String = "",
     val routines: List<AssistantRoutine> = emptyList(),
     val voiceNotes: List<VoiceNoteInfo> = emptyList(),
     val isSavingNote: Boolean = false,
@@ -245,7 +257,10 @@ class ChatViewModel(
     private val pendingBatchDocuments = MutableStateFlow<List<Pair<String, String>>>(emptyList())
     private val liveCamEnabled = MutableStateFlow(false)
     private val liveVoiceActive = MutableStateFlow(false)
-    private val pendingDeviceAction = MutableStateFlow<DeviceAction?>(null)
+    private val queuedDeviceActions = MutableStateFlow<List<DeviceAction>>(emptyList())
+    private val memoryInjectionEnabled = MutableStateFlow(true)
+    private val memoryUpdatedToast = MutableStateFlow<String?>(null)
+    private val outputFormatMode = MutableStateFlow(OutputFormatMode.AUTO)
     private val lastFailedPrompt = MutableStateFlow<String?>(null)
     private val isSavingNote = MutableStateFlow(false)
     private val tokenDietEnabled = MutableStateFlow(false)
@@ -533,15 +548,20 @@ class ChatViewModel(
         state.copy(pendingAttachmentUri = att)
     }.combine(
         combine(
-            pendingDeviceAction,
+            queuedDeviceActions,
             repository.quickContactsFlow,
-            repository.customAppsFlow
-        ) { devAction, contacts, apps -> Triple(devAction, contacts, apps) }
-    ) { state, (devAction, contacts, apps) ->
+            repository.customAppsFlow,
+            repository.autoDialWebhookUrlFlow
+        ) { devQueue, contacts, apps, dialWebhook ->
+            DeviceBridgeBundle(devQueue, contacts, apps, dialWebhook)
+        }
+    ) { state, bundle ->
         state.copy(
-            pendingDeviceAction = devAction,
-            quickContacts = contacts,
-            customApps = apps
+            pendingDeviceAction = bundle.queuedDeviceActions.firstOrNull(),
+            queuedDeviceActions = bundle.queuedDeviceActions,
+            quickContacts = bundle.quickContacts,
+            customApps = bundle.customApps,
+            autoDialWebhookUrl = bundle.autoDialWebhookUrl
         )
     }.combine(
         combine(
@@ -618,6 +638,38 @@ class ChatViewModel(
         state.copy(
             reasoningEffort = effort,
             morphingMessageId = morphId
+        )
+    }.combine(
+        combine(
+            memoryInjectionEnabled,
+            memoryUpdatedToast,
+            repository.pinnedModelIdsFlow,
+            repository.modelLatencyMsFlow
+        ) { memOn, memToast, pinnedIds, latencies ->
+            NavigationAndMemoryBundle(memOn, memToast, pinnedIds, latencies)
+        }
+    ) { state, navMem ->
+        state.copy(
+            memoryInjectionEnabled = navMem.memoryInjectionEnabled,
+            memoryUpdatedToast = navMem.memoryUpdatedToast,
+            pinnedModelIds = navMem.pinnedModelIds,
+            modelLatencyMs = navMem.modelLatencyMs
+        )
+    }.combine(
+        combine(
+            repository.activeMemoryProfileFlow,
+            outputFormatMode,
+            repository.semanticAutoAttachFlow,
+            repository.fastUtilityModelIdFlow
+        ) { profile, fmtMode, semAuto, fastId ->
+            ProfileAndFormatBundle(profile, fmtMode, semAuto, fastId)
+        }
+    ) { state, pf ->
+        state.copy(
+            activeMemoryProfile = pf.activeMemoryProfile,
+            outputFormatMode = pf.outputFormatMode,
+            semanticAutoAttach = pf.semanticAutoAttach,
+            fastUtilityModelId = pf.fastUtilityModelId
         )
     }.stateIn(
         scope = viewModelScope,
@@ -1343,21 +1395,108 @@ class ChatViewModel(
         }
     }
 
-    fun setPendingDeviceAction(action: DeviceAction?) {
-        val enriched = if (action is DeviceAction.DialPhone && action.contactLabel.isNullOrBlank() && action.phoneNumber.isNotBlank()) {
-            val matched = DeviceActionEngine.resolveContactByPhone(action.phoneNumber, uiState.value.quickContacts)
-            if (matched != null) action.copy(contactLabel = matched.name) else action
-        } else {
-            action
-        }
-        pendingDeviceAction.value = enriched
-        if (enriched is DeviceAction.DialPhone && enriched.phoneNumber.isNotBlank()) {
-            statusNotice.value = enriched.displayBanner
+    private fun enrichDeviceAction(action: DeviceAction): DeviceAction {
+        val contacts = uiState.value.quickContacts
+        return when (action) {
+            is DeviceAction.DialPhone -> {
+                if (action.contactLabel.isNullOrBlank() && action.phoneNumber.isNotBlank()) {
+                    val matched = DeviceActionEngine.resolveContactByPhone(action.phoneNumber, contacts)
+                    if (matched != null) action.copy(contactLabel = matched.name) else action
+                } else action
+            }
+            is DeviceAction.WhatsAppCall -> {
+                if (action.contactLabel.isNullOrBlank() && action.phoneNumber.isNotBlank()) {
+                    val matched = DeviceActionEngine.resolveContactByPhone(action.phoneNumber, contacts)
+                    if (matched != null) action.copy(contactLabel = matched.name) else action
+                } else action
+            }
+            is DeviceAction.SendWhatsApp -> {
+                if (action.contactLabel.isNullOrBlank() && action.phoneNumber.isNotBlank()) {
+                    val matched = DeviceActionEngine.resolveContactByPhone(action.phoneNumber, contacts)
+                    if (matched != null) action.copy(contactLabel = matched.name) else action
+                } else action
+            }
+            else -> action
         }
     }
 
+    private fun noticeForActiveAction(action: DeviceAction, totalSteps: Int = 1): String {
+        val disambig = DeviceActionEngine.buildDisambiguationSpeech(action)
+        val chainPrefix = if (totalSteps > 1) "CHAIN ($totalSteps STEPS) // " else ""
+        if (disambig != null) return "${chainPrefix}$disambig"
+        return when (action) {
+            is DeviceAction.DialPhone -> if (action.phoneNumber.isNotBlank()) {
+                action.displayBanner
+            } else {
+                "${chainPrefix}PHONE // Select a matching contact or enter number below."
+            }
+            is DeviceAction.WhatsAppCall -> if (action.phoneNumber.isNotBlank()) {
+                action.displayBanner
+            } else {
+                "${chainPrefix}WHATSAPP CALL // Select a matching contact or enter number below."
+            }
+            is DeviceAction.SendWhatsApp -> if (action.phoneNumber.isNotBlank()) {
+                "${chainPrefix}WHATSAPP // Ready for ${action.contactLabel ?: action.phoneNumber} — auto-opening in 3s."
+            } else {
+                "${chainPrefix}WHATSAPP // Select a matching contact or enter number below."
+            }
+            else -> "${chainPrefix}${action.badge} // Ready — tap confirmation button below."
+        }
+    }
+
+    fun setPendingDeviceAction(action: DeviceAction?) {
+        if (action == null) {
+            dismissDeviceAction()
+            return
+        }
+        val enriched = enrichDeviceAction(action)
+        val current = queuedDeviceActions.value
+        val updatedQueue = if (current.isEmpty()) listOf(enriched) else listOf(enriched) + current.drop(1)
+        queuedDeviceActions.value = updatedQueue
+        statusNotice.value = noticeForActiveAction(enriched, updatedQueue.size)
+    }
+
+    fun enqueueDeviceActions(actions: List<DeviceAction>) {
+        if (actions.isEmpty()) return
+        val enrichedList = actions.map { enrichDeviceAction(it) }
+        queuedDeviceActions.value = enrichedList
+        val first = enrichedList.first()
+        statusNotice.value = noticeForActiveAction(first, enrichedList.size)
+        DeviceActionEngine.buildDisambiguationSpeech(first)?.let { disambigSpeech ->
+            _events.tryEmit(ChatUiEvent.SpeakRoutineText(disambigSpeech))
+        }
+    }
+
+    fun advanceDeviceActionQueue() {
+        val remaining = queuedDeviceActions.value.drop(1)
+        queuedDeviceActions.value = remaining
+        val next = remaining.firstOrNull()
+        if (next != null) {
+            statusNotice.value = "NEXT STEP (${remaining.size} LEFT) // ${noticeForActiveAction(next, remaining.size)}"
+            DeviceActionEngine.buildDisambiguationSpeech(next)?.let { disambigSpeech ->
+                _events.tryEmit(ChatUiEvent.SpeakRoutineText(disambigSpeech))
+            }
+        }
+    }
+
+    fun removeQueuedDeviceAction(index: Int) {
+        val current = queuedDeviceActions.value
+        if (index !in current.indices) return
+        val updated = current.filterIndexed { i, _ -> i != index }
+        queuedDeviceActions.value = updated
+        if (index == 0) {
+            updated.firstOrNull()?.let { next ->
+                statusNotice.value = noticeForActiveAction(next, updated.size)
+            }
+        }
+    }
+
+    fun clearAllDeviceActions() {
+        queuedDeviceActions.value = emptyList()
+    }
+
     fun dismissDeviceAction() {
-        pendingDeviceAction.value = null
+        advanceDeviceActionQueue()
     }
 
     fun saveQuickContact(
@@ -1441,7 +1580,7 @@ class ChatViewModel(
                     modelLabel = result.modelLabel
                 )
                 if (result.pendingDeviceAction != null) {
-                    pendingDeviceAction.value = result.pendingDeviceAction
+                    enqueueDeviceActions(listOf(result.pendingDeviceAction))
                 }
                 if (!result.spokenText.isNullOrBlank()) {
                     _events.tryEmit(ChatUiEvent.SpeakRoutineText(result.spokenText))
@@ -1475,9 +1614,9 @@ class ChatViewModel(
         }
     }
 
-    fun addMemory(fact: String, category: String = "Preference") {
+    fun addMemory(fact: String, category: String = "Preference", profile: String? = null) {
         viewModelScope.launch {
-            val id = repository.addMemory(fact, category, source = "Manual")
+            val id = repository.addMemory(fact, category, source = "Manual", profile = profile)
             if (id > 0L) {
                 statusNotice.value = "MEMORY // Saved to Memory Bank."
             }
@@ -1500,6 +1639,101 @@ class ChatViewModel(
         viewModelScope.launch {
             repository.deleteMemory(id)
         }
+    }
+
+    fun setMemoryPinned(id: Long, pinned: Boolean) {
+        viewModelScope.launch {
+            repository.setMemoryPinned(id, pinned)
+        }
+    }
+
+    fun clearAllMemories() {
+        viewModelScope.launch {
+            repository.clearAllMemories()
+            statusNotice.value = "MEMORY // All saved memories cleared."
+        }
+    }
+
+    fun toggleSessionMemory() {
+        val next = !memoryInjectionEnabled.value
+        memoryInjectionEnabled.value = next
+        statusNotice.value = if (next) {
+            "MEMORY // Personal memory injection ON for this session."
+        } else {
+            "MEMORY // Muted for clean, unbiased queries in this session."
+        }
+    }
+
+    fun cycleMemoryProfile() {
+        val next = uiState.value.activeMemoryProfile.next()
+        setMemoryProfile(next)
+    }
+
+    fun setMemoryProfile(profile: MemoryProfile) {
+        viewModelScope.launch {
+            repository.setActiveMemoryProfile(profile)
+            statusNotice.value = "PROFILE // ${profile.label} context active for memory injection."
+        }
+    }
+
+    fun cycleOutputFormatMode() {
+        val next = outputFormatMode.value.next()
+        outputFormatMode.value = next
+        statusNotice.value = if (next == OutputFormatMode.AUTO) {
+            "FORMAT LOCK // Auto (default free-form response)."
+        } else {
+            "FORMAT LOCK // ${next.chipLabel} structure enforced on outgoing prompts."
+        }
+    }
+
+    fun setOutputFormatMode(mode: OutputFormatMode) {
+        outputFormatMode.value = mode
+    }
+
+    fun setSemanticAutoAttach(enabled: Boolean) {
+        viewModelScope.launch {
+            repository.setSemanticAutoAttach(enabled)
+            statusNotice.value = if (enabled) {
+                "SEMANTIC RAG // Auto-attaching top conceptual match on outgoing prompts."
+            } else {
+                "SEMANTIC RAG // Auto-attach disabled."
+            }
+        }
+    }
+
+    fun dismissMemoryUpdatedToast() {
+        memoryUpdatedToast.value = null
+    }
+
+    fun togglePinnedModel(modelDbId: Long) {
+        viewModelScope.launch {
+            val (isPinned, hitLimit) = repository.togglePinnedModelId(modelDbId, maxPins = 4)
+            if (hitLimit) {
+                statusNotice.value = "MODELS // Max 4 pinned favorites reached. Unpin one first."
+            } else {
+                val name = uiState.value.availableModels.firstOrNull { it.model.id == modelDbId }?.model?.displayName ?: "Model"
+                statusNotice.value = if (isPinned) "PINNED // $name locked to top favorites." else "UNPINNED // Removed $name from favorites."
+            }
+        }
+    }
+
+    fun cyclePinnedModel() {
+        val state = uiState.value
+        val pinnedList = state.pinnedModelIds.mapNotNull { pid ->
+            state.availableModels.firstOrNull { it.model.id == pid }
+        }
+        val cyclePool = if (pinnedList.size >= 2) pinnedList else state.availableModels
+        if (cyclePool.size < 2) {
+            statusNotice.value = "MODELS // Pin at least 2 models in the picker to 1-tap cycle."
+            return
+        }
+        val currentId = state.selectedModel?.model?.id
+        val currentIdx = cyclePool.indexOfFirst { it.model.id == currentId }
+        val nextModel = cyclePool[(currentIdx + 1) % cyclePool.size]
+        selectModel(nextModel)
+        val ms = state.modelLatencyMs[nextModel.model.id]
+        val msSuffix = if (ms != null) " (${ms}ms)" else ""
+        statusNotice.value = "CYCLE // Switched to ${nextModel.model.displayName}$msSuffix"
     }
 
     fun generateStudyPackForMessage(message: MessageEntity) {
@@ -2101,28 +2335,24 @@ class ChatViewModel(
             }
         }
 
-        // 1b. Intercept Device Action commands (Call, WhatsApp, SMS, Email, Maps, Calendar, UPI, YouTube, Alarm, Timer, Open App)
+        // 1b. Intercept Voice/Text Disambiguation Replies ("first", "second", "Rahul Verma") & Sequential Multi-Action Chains
         if (attachment == null && batchDocs.isEmpty()) {
-            val parsedDeviceAction = DeviceActionEngine.parseFromPrompt(
+            val activePending = queuedDeviceActions.value.firstOrNull()
+            if (activePending != null && DeviceActionEngine.ambiguousMatchesOf(activePending).size >= 2) {
+                val resolvedDisambig = DeviceActionEngine.resolveDisambiguationVoiceReply(trimmed, activePending)
+                if (resolvedDisambig != null) {
+                    setPendingDeviceAction(resolvedDisambig)
+                    return
+                }
+            }
+
+            val parsedChain = DeviceActionEngine.parseActionChainFromPrompt(
                 rawInput = trimmed,
                 contacts = state.quickContacts,
                 customApps = state.customApps
             )
-            if (parsedDeviceAction != null) {
-                pendingDeviceAction.value = parsedDeviceAction
-                statusNotice.value = when (parsedDeviceAction) {
-                    is DeviceAction.DialPhone -> if (parsedDeviceAction.phoneNumber.isNotBlank()) {
-                        parsedDeviceAction.displayBanner
-                    } else {
-                        "PHONE // Select a matching contact or enter number below."
-                    }
-                    is DeviceAction.SendWhatsApp -> if (parsedDeviceAction.phoneNumber.isNotBlank()) {
-                        "WHATSAPP // Ready for ${parsedDeviceAction.contactLabel ?: parsedDeviceAction.phoneNumber} — auto-opening in 3s."
-                    } else {
-                        "WHATSAPP // Select a matching contact or enter number below."
-                    }
-                    else -> "${parsedDeviceAction.badge} // Ready — tap confirmation button below."
-                }
+            if (parsedChain.isNotEmpty()) {
+                enqueueDeviceActions(parsedChain)
                 return
             }
         }
@@ -2290,7 +2520,11 @@ class ChatViewModel(
             smartContext = state.smartContext,
             activeConstraints = state.activeConstraints,
             checkpointSummary = latestCheckpoint?.summaryMarkdown,
-            reasoningEffort = state.reasoningEffort
+            reasoningEffort = state.reasoningEffort,
+            injectMemory = state.memoryInjectionEnabled,
+            activeMemoryProfile = state.activeMemoryProfile,
+            outputFormatMode = state.outputFormatMode,
+            semanticAutoAttach = state.semanticAutoAttach
         )
         val searchOn = state.webSearchEnabled
         val shouldAutoExtractMemory = state.autoExtractMemories
@@ -2411,20 +2645,17 @@ class ChatViewModel(
                         selectedBranchByParent.update { it + (parentKey to childId) }
                     },
                     onDeviceActionTriggered = { triggered ->
-                        val enriched = if (triggered is DeviceAction.DialPhone && triggered.contactLabel.isNullOrBlank() && triggered.phoneNumber.isNotBlank()) {
-                            val matched = DeviceActionEngine.resolveContactByPhone(triggered.phoneNumber, uiState.value.quickContacts)
-                            if (matched != null) triggered.copy(contactLabel = matched.name) else triggered
-                        } else {
-                            triggered
+                        val enriched = enrichDeviceAction(triggered)
+                        queuedDeviceActions.update { existing ->
+                            if (existing.contains(enriched)) existing else existing + enriched
                         }
-                        pendingDeviceAction.value = enriched
-                        statusNotice.value = when (enriched) {
-                            is DeviceAction.DialPhone -> if (enriched.phoneNumber.isNotBlank()) {
-                                enriched.displayBanner
-                            } else {
-                                "PHONE // Select a matching contact or enter number below."
+                        val updatedQueue = queuedDeviceActions.value
+                        val activeHead = updatedQueue.firstOrNull() ?: enriched
+                        statusNotice.value = noticeForActiveAction(activeHead, updatedQueue.size)
+                        if (updatedQueue.size == 1) {
+                            DeviceActionEngine.buildDisambiguationSpeech(activeHead)?.let { disambigSpeech ->
+                                _events.tryEmit(ChatUiEvent.SpeakRoutineText(disambigSpeech))
                             }
-                            else -> "${enriched.badge} // Ready — tap confirmation button below."
                         }
                     },
                     onRequestError = { errMsg ->
@@ -2466,8 +2697,20 @@ class ChatViewModel(
                         viewModelScope.launch {
                             val savedCount = repository.extractMemoriesFromTurn(effectivePrompt, lastReply, model)
                             if (savedCount > 0) {
-                                statusNotice.value = "MEMORY // Auto-saved $savedCount preference${if (savedCount > 1) "s" else ""} to Memory Bank."
+                                memoryUpdatedToast.value = "MEMORY // UPDATED (+$savedCount)"
                             }
+                        }
+                    }
+
+                    // Route lightweight session auto-titling to the Fast Utility Model (<= 800 char trimmed)
+                    if (state.messages.size <= 1 && effectivePrompt.length >= 12) {
+                        viewModelScope.launch {
+                            repository.autoTitleConversationFast(
+                                conversationId = convId,
+                                userMessage = effectivePrompt.ifBlank { finalPrompt.take(400) },
+                                assistantMessage = lastReply,
+                                fallbackModel = model
+                            )
                         }
                     }
                 }
@@ -2491,7 +2734,16 @@ class ChatViewModel(
             return
         }
         val convId = activeConversationId.value ?: return
-        val options = buildChatOptions(state.activePersona, state.agentsMd, state.requestParams, state.toolsEnabled)
+        val options = buildChatOptions(
+            persona = state.activePersona,
+            agentsMd = state.agentsMd,
+            params = state.requestParams,
+            enableTools = state.toolsEnabled,
+            injectMemory = state.memoryInjectionEnabled,
+            activeMemoryProfile = state.activeMemoryProfile,
+            outputFormatMode = state.outputFormatMode,
+            semanticAutoAttach = state.semanticAutoAttach
+        )
 
         activeStreamJob = viewModelScope.launch {
             isStreaming.value = true
@@ -2612,7 +2864,11 @@ class ChatViewModel(
             agentsMd = state.agentsMd,
             params = state.requestParams,
             enableTools = state.toolsEnabled,
-            reasoningEffort = state.reasoningEffort
+            reasoningEffort = state.reasoningEffort,
+            injectMemory = state.memoryInjectionEnabled,
+            activeMemoryProfile = state.activeMemoryProfile,
+            outputFormatMode = state.outputFormatMode,
+            semanticAutoAttach = state.semanticAutoAttach
         )
 
         activeStreamJob = viewModelScope.launch {
@@ -2650,7 +2906,11 @@ class ChatViewModel(
         smartContext: SmartContextSnapshot = SmartContextSnapshot(),
         activeConstraints: Set<NegativeConstraint> = emptySet(),
         checkpointSummary: String? = null,
-        reasoningEffort: ReasoningEffort = ReasoningEffort.BALANCED
+        reasoningEffort: ReasoningEffort = ReasoningEffort.BALANCED,
+        injectMemory: Boolean = true,
+        activeMemoryProfile: MemoryProfile = MemoryProfile.ALL,
+        outputFormatMode: OutputFormatMode = OutputFormatMode.AUTO,
+        semanticAutoAttach: Boolean = false
     ): ChatOptions {
         val combinedSystem = buildList {
             if (agentsMd.isNotBlank()) add("# Project Instructions (AGENTS.md)\n$agentsMd")
@@ -2688,9 +2948,27 @@ class ChatViewModel(
             maxTokens = params.maxTokens ?: persona?.maxTokens,
             jsonMode = params.jsonMode,
             enableTools = enableTools,
-            reasoningEffort = reasoningEffort
+            reasoningEffort = reasoningEffort,
+            injectMemory = injectMemory,
+            activeMemoryProfile = activeMemoryProfile,
+            outputFormatMode = outputFormatMode,
+            semanticAutoAttach = semanticAutoAttach
         )
     }
+
+    private data class NavigationAndMemoryBundle(
+        val memoryInjectionEnabled: Boolean,
+        val memoryUpdatedToast: String?,
+        val pinnedModelIds: List<Long>,
+        val modelLatencyMs: Map<Long, Long>
+    )
+
+    private data class ProfileAndFormatBundle(
+        val activeMemoryProfile: MemoryProfile,
+        val outputFormatMode: OutputFormatMode,
+        val semanticAutoAttach: Boolean,
+        val fastUtilityModelId: Long?
+    )
 
     private data class PowerFeaturesBundle(
         val webSearchEnabled: Boolean,
@@ -2795,5 +3073,11 @@ class ChatViewModel(
         val voiceFormTemplates: List<VoiceFormTemplate>,
         val checkpointsByConv: Map<Long, List<ThreadCheckpoint>>,
         val summarizingCheckpointMsgId: Long?
+    )
+    private data class DeviceBridgeBundle(
+        val queuedDeviceActions: List<DeviceAction>,
+        val quickContacts: List<QuickContact>,
+        val customApps: List<CustomAppEntry>,
+        val autoDialWebhookUrl: String
     )
 }

@@ -16,6 +16,7 @@ import com.example.domain.model.CustomSlashCommand
 import com.example.domain.model.DailyBudgetConfig
 import com.example.domain.model.DisplayCurrency
 import com.example.domain.model.McpServerConfig
+import com.example.domain.model.MemoryProfile
 import com.example.domain.model.QuickContact
 import com.example.domain.model.SmartZone
 import com.example.domain.model.ThreadCheckpoint
@@ -93,6 +94,14 @@ class ApiKeyVault(private val context: Context) {
         val KEY_AUTO_LOCK_MINUTES = intPreferencesKey("auto_lock_idle_minutes")
         val KEY_LOCK_ON_APP_SWITCH = booleanPreferencesKey("lock_on_app_switch")
         val KEY_THREAD_CHECKPOINTS = stringPreferencesKey("thread_checkpoints_json")
+        val KEY_AUTO_DIAL_WEBHOOK_URL = stringPreferencesKey("auto_dial_webhook_url")
+        val KEY_PINNED_MEMORY_IDS = stringPreferencesKey("pinned_memory_ids_json")
+        val KEY_PINNED_MODEL_IDS = stringPreferencesKey("pinned_model_ids_json")
+        val KEY_MODEL_LATENCY_MAP = stringPreferencesKey("model_latency_ms_json")
+        val KEY_FAST_UTILITY_MODEL_ID = longPreferencesKey("fast_utility_model_db_id")
+        val KEY_ACTIVE_MEMORY_PROFILE = stringPreferencesKey("active_memory_profile")
+        val KEY_MEMORY_PROFILE_MAP = stringPreferencesKey("memory_profile_map_json")
+        val KEY_SEMANTIC_AUTO_ATTACH = booleanPreferencesKey("semantic_auto_attach")
     }
 
     private val sessionPinKey = MutableStateFlow<SecretKey?>(null)
@@ -177,7 +186,194 @@ class ApiKeyVault(private val context: Context) {
     }
 
     val autoExtractMemoriesFlow: Flow<Boolean> = context.keyVaultDataStore.data.map { prefs ->
-        prefs[KEY_AUTO_EXTRACT_MEMORIES] ?: false
+        prefs[KEY_AUTO_EXTRACT_MEMORIES] ?: true
+    }
+
+    val pinnedMemoryIdsFlow: Flow<Set<Long>> = context.keyVaultDataStore.data.map { prefs ->
+        val raw = prefs[KEY_PINNED_MEMORY_IDS].orEmpty()
+        if (raw.isBlank()) return@map emptySet()
+        runCatching {
+            val arr = JSONArray(raw)
+            buildSet {
+                for (i in 0 until arr.length()) {
+                    val v = arr.optLong(i, -1L)
+                    if (v > 0L) add(v)
+                }
+            }
+        }.getOrDefault(emptySet())
+    }
+
+    suspend fun setMemoryPinned(id: Long, pinned: Boolean) {
+        context.keyVaultDataStore.edit { prefs ->
+            val current = runCatching {
+                val arr = JSONArray(prefs[KEY_PINNED_MEMORY_IDS].orEmpty().ifBlank { "[]" })
+                buildSet {
+                    for (i in 0 until arr.length()) {
+                        val v = arr.optLong(i, -1L)
+                        if (v > 0L) add(v)
+                    }
+                }
+            }.getOrDefault(emptySet()).toMutableSet()
+            if (pinned) current.add(id) else current.remove(id)
+            val out = JSONArray()
+            current.forEach { out.put(it) }
+            prefs[KEY_PINNED_MEMORY_IDS] = out.toString()
+        }
+    }
+
+    suspend fun clearPinnedMemoryIds() {
+        context.keyVaultDataStore.edit { prefs ->
+            prefs.remove(KEY_PINNED_MEMORY_IDS)
+        }
+    }
+
+    val pinnedModelIdsFlow: Flow<List<Long>> = context.keyVaultDataStore.data.map { prefs ->
+        val raw = prefs[KEY_PINNED_MODEL_IDS].orEmpty()
+        if (raw.isBlank()) return@map emptyList()
+        runCatching {
+            val arr = JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val v = arr.optLong(i, -1L)
+                    if (v > 0L && v !in this) add(v)
+                }
+            }.take(4)
+        }.getOrDefault(emptyList())
+    }
+
+    /**
+     * Toggles a model DB ID in the pinned favorites list (max 4).
+     * Returns true if pinned after toggle, false if unpinned or rejected due to max limit.
+     */
+    suspend fun togglePinnedModelId(modelDbId: Long, maxPins: Int = 4): Pair<Boolean, Boolean> {
+        var isNowPinned = false
+        var hitLimit = false
+        context.keyVaultDataStore.edit { prefs ->
+            val current = runCatching {
+                val arr = JSONArray(prefs[KEY_PINNED_MODEL_IDS].orEmpty().ifBlank { "[]" })
+                buildList {
+                    for (i in 0 until arr.length()) {
+                        val v = arr.optLong(i, -1L)
+                        if (v > 0L && v !in this) add(v)
+                    }
+                }
+            }.getOrDefault(emptyList()).toMutableList()
+
+            if (modelDbId in current) {
+                current.remove(modelDbId)
+                isNowPinned = false
+            } else if (current.size >= maxPins) {
+                isNowPinned = false
+                hitLimit = true
+            } else {
+                current.add(modelDbId)
+                isNowPinned = true
+            }
+            val out = JSONArray()
+            current.take(maxPins).forEach { out.put(it) }
+            prefs[KEY_PINNED_MODEL_IDS] = out.toString()
+        }
+        return isNowPinned to hitLimit
+    }
+
+    val modelLatencyMsFlow: Flow<Map<Long, Long>> = context.keyVaultDataStore.data.map { prefs ->
+        val raw = prefs[KEY_MODEL_LATENCY_MAP].orEmpty()
+        if (raw.isBlank()) return@map emptyMap()
+        runCatching {
+            val obj = JSONObject(raw)
+            buildMap {
+                val keys = obj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val id = k.toLongOrNull() ?: continue
+                    val ms = obj.optLong(k, -1L)
+                    if (ms > 0L) put(id, ms)
+                }
+            }
+        }.getOrDefault(emptyMap())
+    }
+
+    suspend fun recordModelLatency(modelDbId: Long, latencyMs: Long) {
+        if (modelDbId <= 0L || latencyMs <= 0L) return
+        context.keyVaultDataStore.edit { prefs ->
+            val obj = runCatching {
+                JSONObject(prefs[KEY_MODEL_LATENCY_MAP].orEmpty().ifBlank { "{}" })
+            }.getOrDefault(JSONObject())
+            val prev = obj.optLong(modelDbId.toString(), -1L)
+            // Exponential moving average so latency badges stay smooth yet responsive
+            val blended = if (prev > 0L) ((prev * 0.45) + (latencyMs * 0.55)).toLong() else latencyMs
+            obj.put(modelDbId.toString(), blended.coerceIn(1L, 120_000L))
+            prefs[KEY_MODEL_LATENCY_MAP] = obj.toString()
+        }
+    }
+
+    val fastUtilityModelIdFlow: Flow<Long?> = context.keyVaultDataStore.data.map { prefs ->
+        prefs[KEY_FAST_UTILITY_MODEL_ID]?.takeIf { it > 0L }
+    }
+
+    suspend fun setFastUtilityModelId(modelDbId: Long?) {
+        context.keyVaultDataStore.edit { prefs ->
+            if (modelDbId == null || modelDbId <= 0L) {
+                prefs.remove(KEY_FAST_UTILITY_MODEL_ID)
+            } else {
+                prefs[KEY_FAST_UTILITY_MODEL_ID] = modelDbId
+            }
+        }
+    }
+
+    val activeMemoryProfileFlow: Flow<MemoryProfile> = context.keyVaultDataStore.data.map { prefs ->
+        runCatching {
+            MemoryProfile.valueOf(prefs[KEY_ACTIVE_MEMORY_PROFILE] ?: MemoryProfile.STUDY.name)
+        }.getOrDefault(MemoryProfile.STUDY)
+    }
+
+    suspend fun setActiveMemoryProfile(profile: MemoryProfile) {
+        context.keyVaultDataStore.edit { prefs ->
+            prefs[KEY_ACTIVE_MEMORY_PROFILE] = profile.name
+        }
+    }
+
+    val memoryProfileMapFlow: Flow<Map<Long, String>> = context.keyVaultDataStore.data.map { prefs ->
+        val raw = prefs[KEY_MEMORY_PROFILE_MAP].orEmpty()
+        if (raw.isBlank()) return@map emptyMap()
+        runCatching {
+            val obj = JSONObject(raw)
+            buildMap {
+                val keys = obj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val id = k.toLongOrNull() ?: continue
+                    val p = obj.optString(k, "ALL").uppercase()
+                    if (p.isNotBlank()) put(id, p)
+                }
+            }
+        }.getOrDefault(emptyMap())
+    }
+
+    suspend fun setMemoryProfile(memoryId: Long, profile: String) {
+        if (memoryId <= 0L) return
+        val normalized = profile.trim().uppercase().ifBlank { "ALL" }
+        context.keyVaultDataStore.edit { prefs ->
+            val obj = runCatching {
+                JSONObject(prefs[KEY_MEMORY_PROFILE_MAP].orEmpty().ifBlank { "{}" })
+            }.getOrDefault(JSONObject())
+            obj.put(memoryId.toString(), normalized)
+            prefs[KEY_MEMORY_PROFILE_MAP] = obj.toString()
+        }
+    }
+
+    suspend fun clearMemoryProfiles() {
+        context.keyVaultDataStore.edit { it.remove(KEY_MEMORY_PROFILE_MAP) }
+    }
+
+    val semanticAutoAttachFlow: Flow<Boolean> = context.keyVaultDataStore.data.map { prefs ->
+        prefs[KEY_SEMANTIC_AUTO_ATTACH] ?: false
+    }
+
+    suspend fun setSemanticAutoAttach(enabled: Boolean) {
+        context.keyVaultDataStore.edit { prefs ->
+            prefs[KEY_SEMANTIC_AUTO_ATTACH] = enabled
+        }
     }
 
     val activeConversationIdFlow: Flow<Long?> = context.keyVaultDataStore.data.map { prefs ->
@@ -451,6 +647,14 @@ class ApiKeyVault(private val context: Context) {
     val lockOnAppSwitchFlow: Flow<Boolean> = context.keyVaultDataStore.data.map { it[KEY_LOCK_ON_APP_SWITCH] ?: false }
     suspend fun setLockOnAppSwitch(enabled: Boolean) {
         context.keyVaultDataStore.edit { it[KEY_LOCK_ON_APP_SWITCH] = enabled }
+    }
+
+    val autoDialWebhookUrlFlow: Flow<String> = context.keyVaultDataStore.data.map { it[KEY_AUTO_DIAL_WEBHOOK_URL].orEmpty() }
+    suspend fun setAutoDialWebhookUrl(url: String) {
+        val clean = url.trim()
+        context.keyVaultDataStore.edit { prefs ->
+            if (clean.isEmpty()) prefs.remove(KEY_AUTO_DIAL_WEBHOOK_URL) else prefs[KEY_AUTO_DIAL_WEBHOOK_URL] = clean
+        }
     }
 
     val dailyBudgetConfigFlow: Flow<DailyBudgetConfig> = context.keyVaultDataStore.data.map { prefs ->

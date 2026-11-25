@@ -191,7 +191,7 @@ object ClientToolEngine {
         ),
         ToolSchema(
             name = "execute_device_action",
-            description = "Triggers a native Android device action confirmation card for phone calls (make_call), YouTube (open_youtube), WhatsApp (send_whatsapp), Maps directions/search (open_maps), Calendar event insert (create_calendar_event), SMS (send_sms), Email (send_email), UPI payment confirmation (upi_pay), launching apps (open_app), alarms (set_alarm), or countdown timers (set_timer).",
+            description = "Triggers a native Android device action confirmation card for phone calls (make_call), WhatsApp voice/video calls (whatsapp_call, whatsapp_video_call), YouTube (open_youtube), WhatsApp messages (send_whatsapp), Maps directions/search (open_maps), Calendar event insert (create_calendar_event), SMS (send_sms), Email (send_email), UPI payment confirmation (upi_pay), launching apps (open_app), alarms (set_alarm), or countdown timers (set_timer). You can call this tool multiple times in one turn for sequential multi-action requests.",
             parameters = JSONObject()
                 .put("type", "object")
                 .put(
@@ -201,11 +201,11 @@ object ClientToolEngine {
                             "action_type",
                             JSONObject()
                                 .put("type", "string")
-                                .put("description", "One of: 'make_call', 'open_youtube', 'send_whatsapp', 'open_maps', 'create_calendar_event', 'send_sms', 'send_email', 'upi_pay', 'open_app', 'set_alarm', 'set_timer'.")
+                                .put("description", "One of: 'make_call', 'whatsapp_call', 'whatsapp_video_call', 'open_youtube', 'send_whatsapp', 'open_maps', 'create_calendar_event', 'send_sms', 'send_email', 'upi_pay', 'open_app', 'set_alarm', 'set_timer'.")
                         )
                         .put(
                             "phone_number",
-                            JSONObject().put("type", "string").put("description", "Phone number for make_call, send_whatsapp, or send_sms.")
+                            JSONObject().put("type", "string").put("description", "Phone number for make_call, whatsapp_call, whatsapp_video_call, send_whatsapp, or send_sms.")
                         )
                         .put(
                             "contact_name",
@@ -366,7 +366,15 @@ object ClientToolEngine {
         val rawPhone = args.optString("phone_number").trim()
 
         val matchedContacts = if (rawPhone.isBlank() && contactName.isNotBlank()) {
-            DeviceActionEngine.resolveMatchingContacts(contactName, contacts, requirePhone = type in listOf("make_call", "dial_phone", "call", "send_whatsapp", "whatsapp", "send_sms", "sms"))
+            DeviceActionEngine.resolveMatchingContacts(
+                contactName,
+                contacts,
+                requirePhone = type in listOf(
+                    "make_call", "dial_phone", "call",
+                    "whatsapp_call", "whatsapp_voice_call", "wa_call", "whatsapp_video_call", "video_call",
+                    "send_whatsapp", "whatsapp", "send_sms", "sms"
+                )
+            )
         } else emptyList()
         val distinctPhoneMatches = matchedContacts.distinctBy { DeviceActionEngine.normalizePhoneNumber(it.phoneNumber) }
         val isAmbiguousPhone = rawPhone.isBlank() && distinctPhoneMatches.size >= 2
@@ -386,6 +394,20 @@ object ClientToolEngine {
                 DeviceAction.DialPhone(
                     phoneNumber = number,
                     contactLabel = resolvedContact?.name ?: contactName.takeIf { it.isNotBlank() },
+                    ambiguousMatches = if (isAmbiguousPhone) distinctPhoneMatches else emptyList()
+                )
+            }
+            "whatsapp_call", "whatsapp_voice_call", "wa_call", "whatsapp_video_call", "video_call" -> {
+                val digits = when {
+                    rawPhone.isNotBlank() -> DeviceActionEngine.normalizeWhatsAppDigits(rawPhone)
+                    resolvedContact != null -> DeviceActionEngine.normalizeWhatsAppDigits(resolvedContact.phoneNumber)
+                    else -> ""
+                }
+                val isVideo = type == "whatsapp_video_call" || type == "video_call"
+                DeviceAction.WhatsAppCall(
+                    phoneNumber = digits,
+                    contactLabel = resolvedContact?.name ?: contactName.takeIf { it.isNotBlank() },
+                    isVideoCall = isVideo,
                     ambiguousMatches = if (isAmbiguousPhone) distinctPhoneMatches else emptyList()
                 )
             }
@@ -466,7 +488,8 @@ object ClientToolEngine {
                 DeviceAction.SendSms(
                     phoneNumber = number,
                     message = args.optString("message").trim(),
-                    contactLabel = resolvedContact?.name ?: contactName.takeIf { it.isNotBlank() }
+                    contactLabel = resolvedContact?.name ?: contactName.takeIf { it.isNotBlank() },
+                    ambiguousMatches = if (isAmbiguousPhone) distinctPhoneMatches else emptyList()
                 )
             }
             "send_email", "email" -> {

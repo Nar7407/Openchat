@@ -21,6 +21,7 @@ import com.example.domain.model.RoutineStep
 import com.example.domain.model.RoutineStepType
 import com.example.domain.model.SelectableModel
 import com.example.domain.model.SmartZone
+import com.example.domain.model.UserMemoryInfo
 import com.example.domain.model.WebSearchProvider
 import com.example.domain.model.WebhookActionInfo
 import com.example.util.CurlImporter
@@ -86,7 +87,11 @@ data class SettingsUiState(
     val dailyBudgetConfig: DailyBudgetConfig = DailyBudgetConfig(),
     val todaySpendUsd: Double = 0.0,
     val autoLockMinutes: Int = 5,
-    val lockOnAppSwitch: Boolean = false
+    val lockOnAppSwitch: Boolean = false,
+    val autoDialWebhookUrl: String = "",
+    val memories: List<UserMemoryInfo> = emptyList(),
+    val autoExtractMemories: Boolean = true,
+    val fastUtilityModelId: Long? = null
 ) {
     val visionModels: List<SelectableModel>
         get() = textChatModels.filter { it.model.supportsImageInput }.ifEmpty { textChatModels }
@@ -228,6 +233,22 @@ class SettingsViewModel(
             todaySpendUsd = bl.todaySpendUsd,
             autoLockMinutes = bl.autoLockMinutes,
             lockOnAppSwitch = bl.lockOnAppSwitch
+        )
+    }.combine(
+        combine(
+            repository.autoDialWebhookUrlFlow,
+            repository.memoriesFlow,
+            repository.autoExtractMemoriesFlow,
+            repository.fastUtilityModelIdFlow
+        ) { dialUrl, memories, autoMem, fastId ->
+            MemoryAndRoutingBundle(dialUrl, memories, autoMem, fastId)
+        }
+    ) { state, mr ->
+        state.copy(
+            autoDialWebhookUrl = mr.autoDialWebhookUrl,
+            memories = mr.memories,
+            autoExtractMemories = mr.autoExtractMemories,
+            fastUtilityModelId = mr.fastUtilityModelId
         )
     }.stateIn(
         scope = viewModelScope,
@@ -864,6 +885,99 @@ class SettingsViewModel(
             repository.setLockOnAppSwitch(enabled)
         }
     }
+
+    fun saveAutoDialWebhookUrl(url: String) {
+        val clean = url.trim()
+        viewModelScope.launch {
+            if (clean.isNotEmpty() && !clean.startsWith("http://") && !clean.startsWith("https://")) {
+                vaultErrorMessage.value = "Auto-Dial Webhook URL must start with http:// or https://"
+                return@launch
+            }
+            vaultErrorMessage.value = null
+            repository.setAutoDialWebhookUrl(clean)
+            vaultStatusMessage.value = if (clean.isNotEmpty()) {
+                "Saved Auto-Dial Webhook URL for hands-free 1-tap earbud calls."
+            } else {
+                "Cleared Auto-Dial Webhook URL (using direct Android Dialer)."
+            }
+        }
+    }
+
+    fun setAutoExtractMemories(enabled: Boolean) {
+        viewModelScope.launch {
+            repository.setAutoExtractMemories(enabled)
+            vaultStatusMessage.value = if (enabled) {
+                "Silent cross-session memory extraction enabled."
+            } else {
+                "Silent memory extraction paused."
+            }
+        }
+    }
+
+    fun addMemory(fact: String, category: String = "Preference") {
+        viewModelScope.launch {
+            val id = repository.addMemory(fact, category, source = "Manual")
+            if (id > 0L) {
+                vaultStatusMessage.value = "MEMORY // Saved to Memory Bank."
+            }
+        }
+    }
+
+    fun updateMemory(memory: UserMemoryInfo) {
+        viewModelScope.launch {
+            repository.updateMemory(memory)
+            vaultStatusMessage.value = "MEMORY // Entry updated."
+        }
+    }
+
+    fun toggleMemoryEnabled(id: Long, enabled: Boolean) {
+        viewModelScope.launch {
+            repository.toggleMemory(id, enabled)
+        }
+    }
+
+    fun setMemoryPinned(id: Long, pinned: Boolean) {
+        viewModelScope.launch {
+            repository.setMemoryPinned(id, pinned)
+            vaultStatusMessage.value = if (pinned) {
+                "MEMORY // Pinned to always include in new sessions."
+            } else {
+                "MEMORY // Unpinned."
+            }
+        }
+    }
+
+    fun deleteMemory(id: Long) {
+        viewModelScope.launch {
+            repository.deleteMemory(id)
+        }
+    }
+
+    fun clearAllMemories() {
+        viewModelScope.launch {
+            repository.clearAllMemories()
+            vaultStatusMessage.value = "MEMORY // All saved memories cleared."
+        }
+    }
+
+    fun setFastUtilityModelId(modelDbId: Long?) {
+        viewModelScope.launch {
+            repository.setFastUtilityModelId(modelDbId)
+            val label = uiState.value.textChatModels.firstOrNull { it.model.id == modelDbId }?.model?.displayName
+            vaultStatusMessage.value = if (label != null) {
+                "FAST LANE // Background utility tasks routed to $label."
+            } else {
+                "FAST LANE // Reset to use active primary model."
+            }
+        }
+    }
+
+    private data class MemoryAndRoutingBundle(
+        val autoDialWebhookUrl: String,
+        val memories: List<UserMemoryInfo>,
+        val autoExtractMemories: Boolean,
+        val fastUtilityModelId: Long?
+    )
 
     private data class BudgetAndLockBundle(
         val budget: DailyBudgetConfig,

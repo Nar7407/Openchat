@@ -29,6 +29,7 @@ import androidx.compose.material.icons.outlined.PersonAdd
 import androidx.compose.material.icons.outlined.PlayCircleOutline
 import androidx.compose.material.icons.outlined.Sms
 import androidx.compose.material.icons.outlined.Timer
+import androidx.compose.material.icons.outlined.Videocam
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -74,11 +75,14 @@ fun DeviceActionConfirmCard(
     autoLaunchDialer: Boolean = true,
     autoLaunchWhatsApp: Boolean = true,
     showEarbudHints: Boolean = true,
+    autoDialWebhookUrl: String = "",
+    onDialLaunched: ((DeviceAction.DialPhone, Boolean) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
     val icon = when (action) {
         is DeviceAction.DialPhone -> Icons.Outlined.Call
+        is DeviceAction.WhatsAppCall -> if (action.isVideoCall) Icons.Outlined.Videocam else Icons.Outlined.Call
         is DeviceAction.OpenYouTube -> Icons.Outlined.PlayCircleOutline
         is DeviceAction.SendWhatsApp -> Icons.Outlined.Chat
         is DeviceAction.SetAlarm -> Icons.Outlined.Alarm
@@ -101,6 +105,22 @@ fun DeviceActionConfirmCard(
                     action
                 }
             }
+            is DeviceAction.WhatsAppCall -> {
+                if (action.contactLabel.isNullOrBlank() && action.phoneNumber.isNotBlank()) {
+                    val matched = DeviceActionEngine.resolveContactByPhone(action.phoneNumber, quickContacts)
+                    if (matched != null) action.copy(contactLabel = matched.name) else action
+                } else {
+                    action
+                }
+            }
+            is DeviceAction.SendWhatsApp -> {
+                if (action.contactLabel.isNullOrBlank() && action.phoneNumber.isNotBlank()) {
+                    val matched = DeviceActionEngine.resolveContactByPhone(action.phoneNumber, quickContacts)
+                    if (matched != null) action.copy(contactLabel = matched.name) else action
+                } else {
+                    action
+                }
+            }
             else -> action
         }
     }
@@ -109,6 +129,11 @@ fun DeviceActionConfirmCard(
         is DeviceAction.DialPhone -> {
             val target = effectiveAction.contactLabel?.takeIf { it.isNotBlank() }
             if (target != null) "OPEN DIALER / CALL ${target.uppercase()}" else "OPEN DIALER"
+        }
+        is DeviceAction.WhatsAppCall -> {
+            val target = effectiveAction.contactLabel?.takeIf { it.isNotBlank() }?.uppercase()
+            val mode = if (effectiveAction.isVideoCall) "WHATSAPP VIDEO" else "WHATSAPP CALL"
+            if (target != null) "OPEN $mode · $target" else "OPEN $mode"
         }
         is DeviceAction.OpenYouTube -> "OPEN YOUTUBE"
         is DeviceAction.SendWhatsApp -> "SEND ON WHATSAPP"
@@ -124,6 +149,7 @@ fun DeviceActionConfirmCard(
 
     val ambiguousMatches: List<QuickContact> = when (action) {
         is DeviceAction.DialPhone -> action.ambiguousMatches
+        is DeviceAction.WhatsAppCall -> action.ambiguousMatches
         is DeviceAction.SendWhatsApp -> action.ambiguousMatches
         is DeviceAction.SendSms -> action.ambiguousMatches
         else -> emptyList()
@@ -131,6 +157,7 @@ fun DeviceActionConfirmCard(
 
     val needsPhoneNumber = when (action) {
         is DeviceAction.DialPhone -> action.phoneNumber.isBlank()
+        is DeviceAction.WhatsAppCall -> action.phoneNumber.isBlank()
         is DeviceAction.SendWhatsApp -> action.phoneNumber.isBlank()
         is DeviceAction.SendSms -> action.phoneNumber.isBlank()
         else -> false
@@ -141,13 +168,17 @@ fun DeviceActionConfirmCard(
     var inlineDraft by remember(action) { mutableStateOf("") }
     var dialerAutoTriggered by remember(action) { mutableStateOf(false) }
 
-    // 1. Streamlined Phone Calling: immediately launch direct Android dialer when a clean resolved number arrives,
-    // while keeping this action card visible with "Open Dialer / Call [Name]" so the user can re-tap anytime.
-    LaunchedEffect(effectiveAction, autoLaunchDialer) {
+    // 1. Streamlined Phone Calling: immediately launch direct Android dialer (or Auto-Dial Webhook bridge)
+    // when a clean resolved number arrives, while keeping the full-screen Calling Overlay & action card visible.
+    LaunchedEffect(effectiveAction, autoLaunchDialer, autoDialWebhookUrl) {
         if (autoLaunchDialer && effectiveAction is DeviceAction.DialPhone && effectiveAction.phoneNumber.isNotBlank() && effectiveAction.ambiguousMatches.isEmpty()) {
             if (!dialerAutoTriggered) {
                 dialerAutoTriggered = true
-                DeviceActionEngine.execute(context, effectiveAction)
+                onDialLaunched?.invoke(effectiveAction, autoDialWebhookUrl.trim().startsWith("http"))
+                DeviceActionEngine.executeDialWithBridge(context, effectiveAction, autoDialWebhookUrl)
+                    .onSuccess { res ->
+                        onDialLaunched?.invoke(effectiveAction, res.usedAutoDialBridge)
+                    }
             }
         }
     }
@@ -179,6 +210,11 @@ fun DeviceActionConfirmCard(
         return when (action) {
             is DeviceAction.DialPhone -> action.copy(
                 phoneNumber = DeviceActionEngine.normalizePhoneNumber(clean),
+                contactLabel = labelOverride ?: action.contactLabel,
+                ambiguousMatches = emptyList()
+            )
+            is DeviceAction.WhatsAppCall -> action.copy(
+                phoneNumber = DeviceActionEngine.normalizeWhatsAppDigits(clean),
                 contactLabel = labelOverride ?: action.contactLabel,
                 ambiguousMatches = emptyList()
             )
@@ -243,7 +279,8 @@ fun DeviceActionConfirmCard(
         }
 
         // Dedicated High-Contrast WhatsApp Confirmation Panel (Recipient Name, Number, Preview, 3s Auto-Launch + Large CTA)
-        if (action is DeviceAction.SendWhatsApp) {
+        if (effectiveAction is DeviceAction.SendWhatsApp) {
+            val waAction = effectiveAction
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -257,16 +294,16 @@ fun DeviceActionConfirmCard(
                 ) {
                     Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                         Text(
-                            text = action.contactLabel?.takeIf { it.isNotBlank() } ?: "WhatsApp Recipient",
+                            text = waAction.contactLabel?.takeIf { it.isNotBlank() } ?: "WhatsApp Recipient",
                             style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
                             color = SwissInk,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
                         Text(
-                            text = if (action.phoneNumber.isNotBlank()) "+${action.phoneNumber}" else "Select a saved contact or enter phone number below",
+                            text = if (waAction.phoneNumber.isNotBlank()) "+${waAction.phoneNumber}" else "Select a saved contact or enter phone number below",
                             style = MaterialTheme.typography.labelSmall,
-                            color = if (action.phoneNumber.isNotBlank()) SwissVerifiedInk else SwissSignalRed
+                            color = if (waAction.phoneNumber.isNotBlank()) SwissVerifiedInk else SwissSignalRed
                         )
                     }
                     if (canAutoLaunchWhatsApp && !waAutoCancelled && waCountdownSec > 0) {
@@ -295,7 +332,7 @@ fun DeviceActionConfirmCard(
                                     .testTag("whatsapp_cancel_countdown")
                             )
                         }
-                    } else if (waAutoCancelled && action.phoneNumber.isNotBlank()) {
+                    } else if (waAutoCancelled && waAction.phoneNumber.isNotBlank()) {
                         Text(
                             text = "AUTO-OPEN PAUSED",
                             style = MaterialTheme.typography.labelSmall,
@@ -319,7 +356,7 @@ fun DeviceActionConfirmCard(
                         color = SwissMuted
                     )
                     Text(
-                        text = action.message.ifBlank { "(Open WhatsApp chat directly — no pre-filled message)" },
+                        text = waAction.message.ifBlank { "(Open WhatsApp chat directly — no pre-filled message)" },
                         style = MaterialTheme.typography.bodyMedium,
                         color = SwissInk,
                         maxLines = 4,
@@ -363,7 +400,7 @@ fun DeviceActionConfirmCard(
                             )
                         }
                     }
-                    if (showEarbudHints && !needsPhoneNumber && action.ambiguousMatches.isEmpty()) {
+                    if (showEarbudHints && !needsPhoneNumber && waAction.ambiguousMatches.isEmpty()) {
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -398,6 +435,97 @@ fun DeviceActionConfirmCard(
                                         waAutoCancelled = true
                                         onDismiss()
                                     }
+                                    .padding(horizontal = 6.dp, vertical = 5.dp)
+                            )
+                        }
+                    }
+                }
+            }
+        } else if (effectiveAction is DeviceAction.WhatsAppCall) {
+            // Dedicated WhatsApp Voice / Video Call Confirmation Card (opens contact's WhatsApp screen directly)
+            val waCall = effectiveAction
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        text = waCall.title,
+                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                        color = SwissInk,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = waCall.subtitle,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (waCall.phoneNumber.isNotBlank()) SwissVerifiedInk else SwissSignalRed,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                if (waCall.phoneNumber.isNotBlank() && waCall.ambiguousMatches.isEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .background(SwissSignalRed, RectangleShape)
+                            .clickable { onExecute() }
+                            .padding(horizontal = 14.dp, vertical = 12.dp)
+                            .testTag("execute_device_action"),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = if (waCall.isVideoCall) Icons.Outlined.Videocam else Icons.Outlined.Call,
+                                contentDescription = null,
+                                tint = SwissWhite,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Text(
+                                text = ctaLabel,
+                                style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                                color = SwissWhite,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                    if (showEarbudHints) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("earbud_action_status_pill"),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = "[🎧 1x TAP EARBUD: CONFIRM]",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissWhite,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .background(SwissInk, RectangleShape)
+                                    .clickable { onExecute() }
+                                    .padding(horizontal = 6.dp, vertical = 5.dp)
+                            )
+                            Text(
+                                text = "[⏭ 2x TAP: CANCEL]",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissSignalRed,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier
+                                    .background(SwissCanvas, RectangleShape)
+                                    .border(1.dp, SwissSignalRed, RectangleShape)
+                                    .clickable { onDismiss() }
                                     .padding(horizontal = 6.dp, vertical = 5.dp)
                             )
                         }
@@ -585,6 +713,7 @@ fun DeviceActionConfirmCard(
             ) {
                 val targetName = when (action) {
                     is DeviceAction.DialPhone -> action.contactLabel
+                    is DeviceAction.WhatsAppCall -> action.contactLabel
                     is DeviceAction.SendWhatsApp -> action.contactLabel
                     is DeviceAction.SendSms -> action.contactLabel
                     is DeviceAction.SendEmail -> action.contactLabel
@@ -593,7 +722,7 @@ fun DeviceActionConfirmCard(
                 }
                 val promptLabel = when {
                     ambiguousMatches.size >= 2 ->
-                        "MULTIPLE NUMBERS MATCH \"${targetName.orEmpty()}\" // TAP ONE TO SELECT"
+                        "FOUND ${ambiguousMatches.size} CONTACTS NAMED \"${targetName.orEmpty()}\" // SAY \"FIRST\" OR \"SECOND\", OR TAP ONE"
                     needsUpi -> "UPI ID NEEDED${targetName?.let { " FOR \"$it\"" }.orEmpty()} // PICK SAVED OR ENTER VPA"
                     needsEmail -> "EMAIL NEEDED${targetName?.let { " FOR \"$it\"" }.orEmpty()} // PICK SAVED OR ENTER BELOW"
                     else -> "NUMBER NEEDED${targetName?.let { " FOR \"$it\"" }.orEmpty()} // PICK SAVED OR ENTER BELOW"
@@ -629,9 +758,11 @@ fun DeviceActionConfirmCard(
                                 needsEmail -> contact.email
                                 else -> contact.phoneNumber
                             }
+                            val isDisambig = ambiguousMatches.size >= 2
                             Row(
                                 modifier = Modifier
-                                    .background(if (ambiguousMatches.size >= 2) SwissInk else SwissPaper, RectangleShape)
+                                    .heightIn(min = if (isDisambig) 44.dp else 36.dp)
+                                    .background(if (isDisambig) SwissInk else SwissPaper, RectangleShape)
                                     .border(1.dp, SwissInk, RectangleShape)
                                     .clickable {
                                         when {
@@ -644,19 +775,31 @@ fun DeviceActionConfirmCard(
                                         }
                                     }
                                     .padding(horizontal = 9.dp, vertical = 7.dp)
-                                    .testTag("contact_quick_chip_$idx"),
-                                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                    .testTag(if (isDisambig) "contact_disambig_pill_$idx" else "contact_quick_chip_$idx"),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
+                                if (isDisambig) {
+                                    Text(
+                                        text = "${idx + 1}",
+                                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                        color = SwissWhite,
+                                        modifier = Modifier
+                                            .background(SwissSignalRed, RectangleShape)
+                                            .padding(horizontal = 5.dp, vertical = 2.dp)
+                                    )
+                                }
                                 Text(
                                     text = contact.name,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = if (ambiguousMatches.size >= 2) SwissWhite else SwissInk
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontWeight = if (isDisambig) FontWeight.Bold else FontWeight.Medium
+                                    ),
+                                    color = if (isDisambig) SwissWhite else SwissInk
                                 )
                                 Text(
                                     text = chipValue,
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = if (ambiguousMatches.size >= 2) SwissSignalRed else SwissMuted
+                                    color = if (isDisambig) SwissSignalRed else SwissMuted
                                 )
                             }
                         }

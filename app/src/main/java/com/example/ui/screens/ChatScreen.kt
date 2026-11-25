@@ -10,6 +10,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.util.Rational
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -58,6 +59,7 @@ import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.outlined.AccountTree
 import androidx.compose.material.icons.outlined.AutoAwesome
+import androidx.compose.material.icons.outlined.Autorenew
 import androidx.compose.material.icons.outlined.BugReport
 import androidx.compose.material.icons.outlined.Build
 import androidx.compose.material.icons.outlined.CameraAlt
@@ -162,16 +164,27 @@ import com.example.domain.model.BranchMessageNode
 import com.example.domain.model.ContextWindowEstimator
 import com.example.domain.model.CostEstimator
 import com.example.domain.model.DisplayCurrency
+import com.example.domain.model.MemoryProfile
 import com.example.domain.model.ModelCapability
+import com.example.domain.model.OutputFormatMode
 import com.example.domain.model.ReasoningEffort
 import com.example.domain.model.ReplyMorphStyle
 import com.example.util.DeviceAction
+import com.example.util.LiveLensHistoryEntry
+import com.example.util.LiveLensHistoryStore
+import com.example.util.PromptPasteMinifier
+import com.example.util.SemanticEmbeddingEngine
+import com.example.util.SemanticSearchHit
+import com.example.ui.components.ActiveToolsDrawerSheet
 import com.example.ui.components.AgentsMdInitDialog
+import com.example.ui.components.CallingLaunchOverlay
 import com.example.ui.components.ChatMinimapScrubber
 import com.example.ui.components.CitationPillsRow
 import com.example.ui.components.CommandHelpSheet
+import com.example.ui.components.CommandPaletteDialog
 import com.example.ui.components.CustomSlashCommandsSheet
 import com.example.ui.components.DeviceActionConfirmCard
+import com.example.ui.components.DeviceActionQueueStack
 import com.example.ui.components.EditMessageForkDialog
 import com.example.ui.components.ErrorBanner
 import com.example.ui.components.ExportStudioDialog
@@ -246,6 +259,7 @@ import com.example.ui.components.VoiceFormFillerDialog
 import com.example.ui.components.WatchlistDialog
 import com.example.ui.viewmodel.ChatUiEvent
 import com.example.ui.viewmodel.ChatViewModel
+import com.example.util.CommandPaletteBus
 import com.example.util.DeviceActionEngine
 import com.example.util.MathExpressionEvaluator
 import com.example.util.ReadAloudController
@@ -287,6 +301,10 @@ fun ChatScreen(
     val listState = rememberLazyListState()
 
     var inputText by remember { mutableStateOf("") }
+    var preMinifyInputBackup by remember { mutableStateOf<String?>(null) }
+    var sidebarSemanticMode by remember { mutableStateOf(false) }
+    var sidebarLensHistory by remember { mutableStateOf<List<LiveLensHistoryEntry>>(emptyList()) }
+    var sidebarSemanticHits by remember { mutableStateOf<List<SemanticSearchHit>>(emptyList()) }
     var showPlusMenu by remember { mutableStateOf(false) }
     var showPersonaManager by remember { mutableStateOf(false) }
     var showPersonaQuickBar by remember { mutableStateOf(false) }
@@ -307,7 +325,53 @@ fun ChatScreen(
     var showMcpSheet by remember { mutableStateOf(false) }
     var showInitDialog by remember { mutableStateOf(false) }
     var showMemoryBank by remember { mutableStateOf(false) }
+    var showCommandPalette by remember { mutableStateOf(false) }
+    var showActiveToolsDrawer by remember { mutableStateOf(false) }
     var showVoiceNotesSheet by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        CommandPaletteBus.openEvents.collect {
+            showCommandPalette = true
+        }
+    }
+
+    LaunchedEffect(state.memoryUpdatedToast) {
+        if (state.memoryUpdatedToast != null) {
+            delay(3600L)
+            viewModel.dismissMemoryUpdatedToast()
+        }
+    }
+
+    LaunchedEffect(drawerState.isOpen, sidebarSemanticMode) {
+        if (drawerState.isOpen && sidebarSemanticMode) {
+            sidebarLensHistory = LiveLensHistoryStore.loadAll(context)
+        }
+    }
+
+    LaunchedEffect(
+        sidebarSemanticMode,
+        state.searchQuery,
+        state.memories,
+        state.knowledgeDocs,
+        sidebarLensHistory
+    ) {
+        if (sidebarSemanticMode && state.searchQuery.trim().length >= 2) {
+            sidebarSemanticHits = SemanticEmbeddingEngine.searchCorpus(
+                query = state.searchQuery,
+                memories = state.memories,
+                knowledgeDocs = state.knowledgeDocs,
+                lensHistory = sidebarLensHistory,
+                topK = 10,
+                minScore = 0.12f
+            )
+        } else {
+            sidebarSemanticHits = emptyList()
+        }
+    }
+
+    BackHandler(enabled = showActiveToolsDrawer) {
+        showActiveToolsDrawer = false
+    }
     var editorInitialText by remember { mutableStateOf<String?>(null) }
     var shareDialogPayload by remember { mutableStateOf<Pair<String, String>?>(null) }
     var exportStudioPayload by remember { mutableStateOf<Pair<String, String>?>(null) }
@@ -344,6 +408,31 @@ fun ChatScreen(
     var splitPaneTab by remember { mutableIntStateOf(0) } // 0 = Canvas, 1 = Plotter
     var splitPlotExpr by remember { mutableStateOf("sin(x) + 0.2*x") }
     var cooldownNowMs by remember { mutableStateOf(System.currentTimeMillis()) }
+    var launchingCallAction by remember { mutableStateOf<DeviceAction.DialPhone?>(null) }
+    var launchingCallViaBridge by remember { mutableStateOf(false) }
+
+    fun launchDialAction(dial: DeviceAction.DialPhone) {
+        val enriched = if (dial.contactLabel.isNullOrBlank() && dial.phoneNumber.isNotBlank()) {
+            val matched = DeviceActionEngine.resolveContactByPhone(dial.phoneNumber, state.quickContacts)
+            if (matched != null) dial.copy(contactLabel = matched.name) else dial
+        } else {
+            dial
+        }
+        viewModel.showNotice(enriched.displayBanner)
+        launchingCallViaBridge = state.autoDialWebhookUrl.trim().startsWith("http")
+        launchingCallAction = enriched
+        scope.launch {
+            DeviceActionEngine.executeDialWithBridge(context, enriched, state.autoDialWebhookUrl)
+                .onSuccess { res ->
+                    launchingCallViaBridge = res.usedAutoDialBridge
+                    viewModel.showNotice("ACTION // ${res.message}")
+                }
+                .onFailure { err ->
+                    launchingCallAction = null
+                    viewModel.showToast(err.message ?: "Unable to launch dialer.")
+                }
+        }
+    }
 
     LaunchedEffect(state.cooldownMap) {
         if (state.cooldownMap.isEmpty()) return@LaunchedEffect
@@ -775,7 +864,12 @@ fun ChatScreen(
                         OutlinedTextField(
                             value = state.searchQuery,
                             onValueChange = viewModel::updateSearchQuery,
-                            placeholder = { Text("FILTER THREADS…", style = MaterialTheme.typography.labelMedium) },
+                            placeholder = {
+                                Text(
+                                    if (sidebarSemanticMode) "SEMANTIC SEARCH (PDF · LENS · MEM)…" else "FILTER THREADS…",
+                                    style = MaterialTheme.typography.labelMedium
+                                )
+                            },
                             leadingIcon = {
                                 Icon(Icons.Outlined.Search, contentDescription = null, tint = SwissInk)
                             },
@@ -786,6 +880,116 @@ fun ChatScreen(
                                 .fillMaxWidth()
                                 .testTag("chat_search_input")
                         )
+
+                        // Semantic Search Mode & Auto-Attach Context Strip
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = if (sidebarSemanticMode) "SEMANTIC // ON" else "SEMANTIC // OFF",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (sidebarSemanticMode) SwissWhite else SwissInk,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .background(if (sidebarSemanticMode) SwissInk else SwissPaper)
+                                    .border(1.dp, SwissInk, RectangleShape)
+                                    .clickable { sidebarSemanticMode = !sidebarSemanticMode }
+                                    .padding(horizontal = 8.dp, vertical = 6.dp)
+                                    .testTag("sidebar_semantic_mode_toggle")
+                            )
+                            Text(
+                                text = if (state.semanticAutoAttach) "AUTO-ATTACH: ON" else "AUTO-ATTACH: OFF",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (state.semanticAutoAttach) SwissWhite else SwissInk,
+                                modifier = Modifier
+                                    .background(if (state.semanticAutoAttach) SwissSignalRed else SwissPaper)
+                                    .border(1.dp, if (state.semanticAutoAttach) SwissSignalRed else SwissInk, RectangleShape)
+                                    .clickable { viewModel.setSemanticAutoAttach(!state.semanticAutoAttach) }
+                                    .padding(horizontal = 8.dp, vertical = 6.dp)
+                                    .testTag("sidebar_semantic_auto_attach_toggle")
+                            )
+                        }
+
+                        if (sidebarSemanticMode) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .border(1.dp, SwissInk, RectangleShape)
+                                    .background(SwissPaper)
+                                    .padding(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Text(
+                                    text = "LOCAL 384D INDEX // ${state.knowledgeDocs.size} DOCS · ${sidebarLensHistory.size} LENS · ${state.memories.size} MEM",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SwissMuted
+                                )
+                                if (state.searchQuery.trim().length < 2) {
+                                    Text(
+                                        text = "Type a concept above to rank saved PDFs, Live Lens scans, and Memory Bank facts by semantic similarity.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = SwissMuted
+                                    )
+                                } else if (sidebarSemanticHits.isEmpty()) {
+                                    Text(
+                                        text = "No conceptual matches above threshold yet.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = SwissMuted
+                                    )
+                                } else {
+                                    sidebarSemanticHits.take(5).forEach { hit ->
+                                        Column(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .background(SwissCanvas)
+                                                .border(1.dp, SwissGridLine, RectangleShape)
+                                                .clickable {
+                                                    val attached = SemanticEmbeddingEngine.formatAutoAttachSnippet(hit)
+                                                    inputText = if (inputText.isBlank()) {
+                                                        "$attached\n\n"
+                                                    } else {
+                                                        "$inputText\n\n$attached"
+                                                    }
+                                                    viewModel.showNotice("SEMANTIC // Attached ${hit.item.sourceType.badge} (${hit.matchPercent}% match).")
+                                                    scope.launch { drawerState.close() }
+                                                }
+                                                .padding(8.dp)
+                                                .testTag("sidebar_semantic_hit_${hit.item.id}"),
+                                            verticalArrangement = Arrangement.spacedBy(3.dp)
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Text(
+                                                    text = "[${hit.item.sourceType.badge}] ${hit.item.title}",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = SwissInk,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                    modifier = Modifier.weight(1f)
+                                                )
+                                                Text(
+                                                    text = "${hit.matchPercent}%",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = SwissSignalRed
+                                                )
+                                            }
+                                            Text(
+                                                text = hit.item.snippet,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = SwissMuted,
+                                                maxLines = 2,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
 
                         if (state.conversations.isEmpty()) {
                             Box(
@@ -1058,7 +1262,30 @@ fun ChatScreen(
                             supportsAutoRoute = true,
                             isAutoRouteEnabled = state.autoRouteEnabled,
                             onSelectAutoRoute = { viewModel.setAutoRouteEnabled(true) },
+                            pinnedModelIds = state.pinnedModelIds,
+                            modelLatencyMs = state.modelLatencyMs,
+                            onTogglePinModel = viewModel::togglePinnedModel,
                             modifier = Modifier.weight(1f)
+                        )
+
+                        Box(
+                            modifier = Modifier
+                                .width(1.dp)
+                                .fillMaxHeight()
+                                .background(SwissInk)
+                        )
+
+                        // 1-Tap "Next Pinned Model" Cycle Button right next to active model
+                        SwissIconCell(
+                            icon = Icons.Outlined.Autorenew,
+                            contentDescription = "Cycle next pinned model",
+                            onClick = viewModel::cyclePinnedModel,
+                            bordered = false,
+                            accent = state.pinnedModelIds.size >= 2,
+                            cellSize = if (effectiveMiniMode) 40.dp else 44.dp,
+                            modifier = Modifier
+                                .fillMaxHeight()
+                                .testTag("cycle_pinned_model_button")
                         )
 
                         // Compact Live 429/503 Provider Cooldown Timer Pill directly in Header Model Bar
@@ -1161,9 +1388,10 @@ fun ChatScreen(
                                 .fillMaxWidth()
                                 .background(SwissSubtleFill)
                                 .border(0.dp, SwissSubtleFill)
-                                .clickable { showPersonaQuickBar = !showPersonaQuickBar }
-                                .padding(horizontal = 12.dp, vertical = 5.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
+                                .clickable { showCommandPalette = true }
+                                .padding(horizontal = 12.dp, vertical = 5.dp)
+                                .testTag("cmd_bar_palette_trigger"),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             val persona = state.activePersona
@@ -1171,24 +1399,54 @@ fun ChatScreen(
                                 text = if (persona != null) {
                                     String.format(
                                         Locale.US,
-                                        "PERSONA // @%s · T:%.1f · MAX:%d",
+                                        "PERSONA // @%s · T:%.1f",
                                         persona.handle.uppercase(),
-                                        persona.temperature,
-                                        persona.maxTokens
+                                        persona.temperature
                                     )
                                 } else {
-                                    "CMD // / COMMANDS · @ PERSONAS · SWIPE MSG TO QUOTE"
+                                    "CMD // CTRL+K"
                                 },
                                 style = MaterialTheme.typography.labelSmall,
                                 color = if (persona != null) SwissSignalRed else SwissMuted,
                                 maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f)
+                                overflow = TextOverflow.Ellipsis
                             )
                             Row(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .horizontalScroll(rememberScrollState()),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
+                                // 1-Tap Context Profile Switcher (STUDY / WORK / PERSONAL / ALL)
+                                Text(
+                                    text = "PROFILE // ${state.activeMemoryProfile.label}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (state.activeMemoryProfile == MemoryProfile.ALL) SwissInk else SwissWhite,
+                                    modifier = Modifier
+                                        .background(if (state.activeMemoryProfile == MemoryProfile.ALL) SwissPaper else SwissInk)
+                                        .border(1.dp, SwissInk, RectangleShape)
+                                        .clickable { viewModel.cycleMemoryProfile() }
+                                        .padding(horizontal = 6.dp, vertical = 1.dp)
+                                        .testTag("cmd_bar_profile_toggle")
+                                )
+                                // 1-Tap Output Format Lock Cycler ([ FMT: AUTO | STEPS | TABLE | CODE ])
+                                Text(
+                                    text = "[ FMT: ${state.outputFormatMode.chipLabel} ]",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (state.outputFormatMode == OutputFormatMode.AUTO) SwissInk else SwissSignalRed,
+                                    modifier = Modifier
+                                        .clickable { viewModel.cycleOutputFormatMode() }
+                                        .testTag("cmd_bar_format_toggle")
+                                )
+                                Text(
+                                    text = if (state.memoryInjectionEnabled) "[ MEM: ON ]" else "[ MEM: OFF ]",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (state.memoryInjectionEnabled) SwissVerifiedInk else SwissSignalRed,
+                                    modifier = Modifier
+                                        .clickable { viewModel.toggleSessionMemory() }
+                                        .testTag("cmd_bar_memory_toggle")
+                                )
                                 if (state.agentsMd.isNotBlank()) {
                                     Text(
                                         text = "[ AGENTS.MD ]",
@@ -1478,30 +1736,32 @@ fun ChatScreen(
                     )
                 }
 
-            // Status Notice Banner (Slash command confirmations)
+            // Status Notice Banner (ACTION // Call banners & slash command confirmations)
             AnimatedVisibility(visible = state.statusNotice != null) {
                 state.statusNotice?.let { notice ->
+                    val isActionBanner = notice.startsWith("ACTION //")
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 12.dp, vertical = 6.dp)
-                            .background(SwissVerifiedTint, RectangleShape)
-                            .border(1.dp, SwissVerifiedInk, RectangleShape)
+                            .background(if (isActionBanner) SwissSignalRed else SwissVerifiedTint, RectangleShape)
+                            .border(1.dp, if (isActionBanner) SwissInk else SwissVerifiedInk, RectangleShape)
                             .clickable { viewModel.clearNotices() }
-                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                            .padding(horizontal = 10.dp, vertical = 8.dp)
+                            .testTag("chat_top_status_banner"),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
                             text = notice,
                             style = MaterialTheme.typography.labelSmall,
-                            color = SwissVerifiedInk,
+                            color = if (isActionBanner) SwissWhite else SwissVerifiedInk,
                             modifier = Modifier.weight(1f)
                         )
                         Icon(
                             imageVector = Icons.Filled.Close,
                             contentDescription = "Dismiss notice",
-                            tint = SwissVerifiedInk,
+                            tint = if (isActionBanner) SwissWhite else SwissVerifiedInk,
                             modifier = Modifier.size(16.dp)
                         )
                     }
@@ -2004,30 +2264,44 @@ fun ChatScreen(
                         .background(SwissInk)
                 )
 
-                // 1-Tap Device Action Confirmation Card (Calls, WhatsApp, YouTube, Alarms, Timers, App Launch)
-                AnimatedVisibility(visible = state.pendingDeviceAction != null) {
-                    state.pendingDeviceAction?.let { devAction ->
-                        DeviceActionConfirmCard(
-                            action = devAction,
-                            quickContacts = state.quickContacts,
-                            onUpdateAction = viewModel::setPendingDeviceAction,
-                            onSaveQuickContact = { name, phone -> viewModel.saveQuickContact(name, phone) },
-                            onExecute = {
+                // Sequential Multi-Action Confirmation Stack (Calls, WhatsApp Voice/Video/Message, YouTube, Alarms, Timers, Apps)
+                AnimatedVisibility(visible = state.queuedDeviceActions.isNotEmpty()) {
+                    DeviceActionQueueStack(
+                        actions = state.queuedDeviceActions,
+                        quickContacts = state.quickContacts,
+                        autoDialWebhookUrl = state.autoDialWebhookUrl,
+                        onDialLaunched = { dialAction, usedBridge ->
+                            viewModel.showNotice(dialAction.displayBanner)
+                            launchingCallViaBridge = usedBridge
+                            launchingCallAction = dialAction
+                        },
+                        onUpdateActive = viewModel::setPendingDeviceAction,
+                        onRemoveQueuedAt = viewModel::removeQueuedDeviceAction,
+                        onClearAll = viewModel::clearAllDeviceActions,
+                        onSaveQuickContact = { name, phone -> viewModel.saveQuickContact(name, phone) },
+                        onExecuteActive = { devAction ->
+                            if (devAction is DeviceAction.DialPhone) {
+                                launchDialAction(devAction)
+                                if (state.queuedDeviceActions.size > 1) {
+                                    viewModel.advanceDeviceActionQueue()
+                                }
+                            } else {
                                 DeviceActionEngine.execute(context, devAction)
                                     .onSuccess { msg ->
-                                        if (devAction !is DeviceAction.DialPhone) {
-                                            viewModel.dismissDeviceAction()
+                                        val hasMore = state.queuedDeviceActions.size > 1
+                                        viewModel.advanceDeviceActionQueue()
+                                        if (!hasMore) {
+                                            viewModel.showNotice("ACTION // $msg")
                                         }
-                                        viewModel.showNotice("ACTION // $msg")
                                     }
                                     .onFailure { err ->
                                         viewModel.showToast(err.message ?: "Unable to execute device action.")
                                     }
-                            },
-                            onDismiss = viewModel::dismissDeviceAction,
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                        )
-                    }
+                            }
+                        },
+                        onDismissActive = viewModel::dismissDeviceAction,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                    )
                 }
 
                 // "Paste & Ask" Smart Clipboard Detector Floating Pill
@@ -2779,6 +3053,73 @@ fun ChatScreen(
                     )
                 }
 
+                // Local Token-Saving Paste Minifier Pill (auto-triggers on long pastes >= 1,500 chars)
+                val minifyPreview = remember(inputText) {
+                    if (PromptPasteMinifier.shouldOfferMinify(inputText)) {
+                        PromptPasteMinifier.minify(inputText)
+                    } else null
+                }
+                if ((minifyPreview != null && minifyPreview.savedPercent >= 3) || preMinifyInputBackup != null) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(SwissSubtleFill)
+                            .padding(horizontal = 10.dp, vertical = 6.dp)
+                            .testTag("composer_paste_minifier_bar"),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (minifyPreview != null && minifyPreview.savedPercent >= 3) {
+                            Text(
+                                text = "PASTE // ${inputText.length} CHARS",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissMuted
+                            )
+                            Text(
+                                text = "[ MINIFY PASTE · -${minifyPreview.savedPercent}% (~${minifyPreview.estimatedTokensSaved} TOK) ]",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissWhite,
+                                modifier = Modifier
+                                    .background(SwissInk)
+                                    .clickable {
+                                        preMinifyInputBackup = inputText
+                                        inputText = minifyPreview.minifiedText
+                                        viewModel.showNotice(
+                                            "MINIFY // Trimmed ${minifyPreview.savedPercent}% (~${minifyPreview.estimatedTokensSaved} tokens saved)."
+                                        )
+                                    }
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                                    .testTag("composer_minify_paste_button")
+                            )
+                        } else if (preMinifyInputBackup != null) {
+                            Text(
+                                text = "MINIFIED // COMPACTED TO ${inputText.length} CHARS",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissVerifiedInk
+                            )
+                            Text(
+                                text = "[ UNDO ]",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissSignalRed,
+                                modifier = Modifier
+                                    .border(1.dp, SwissSignalRed, RectangleShape)
+                                    .clickable {
+                                        preMinifyInputBackup?.let { inputText = it }
+                                        preMinifyInputBackup = null
+                                    }
+                                    .padding(horizontal = 8.dp, vertical = 3.dp)
+                                    .testTag("composer_undo_minify_button")
+                            )
+                        }
+                    }
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(1.dp)
+                            .background(SwissConcrete)
+                    )
+                }
+
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -2798,7 +3139,10 @@ fun ChatScreen(
 
                     OutlinedTextField(
                         value = inputText,
-                        onValueChange = { inputText = it },
+                        onValueChange = {
+                            inputText = it
+                            if (it.isBlank()) preMinifyInputBackup = null
+                        },
                         placeholder = {
                             Text(
                                 if (state.isEnhancingPrompt) {
@@ -2934,6 +3278,98 @@ fun ChatScreen(
                 }
             }
         }
+
+            // Subtle Non-Intrusive "MEMORY // UPDATED" Toast Pill
+            AnimatedVisibility(
+                visible = state.memoryUpdatedToast != null,
+                enter = fadeIn(),
+                exit = fadeOut(),
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 60.dp)
+            ) {
+                state.memoryUpdatedToast?.let { pillText ->
+                    Row(
+                        modifier = Modifier
+                            .background(SwissInk, RectangleShape)
+                            .border(1.dp, SwissSignalRed, RectangleShape)
+                            .clickable {
+                                viewModel.dismissMemoryUpdatedToast()
+                                showMemoryBank = true
+                            }
+                            .padding(horizontal = 12.dp, vertical = 6.dp)
+                            .testTag("memory_updated_toast_pill"),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(6.dp)
+                                .background(SwissSignalRed)
+                        )
+                        Text(
+                            text = pillText,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SwissWhite
+                        )
+                    }
+                }
+            }
+
+            // Mobile Thumb-Gesture Navigation: Swipe Left from Right Edge -> Active Tools & Context Drawer
+            Box(
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .fillMaxHeight()
+                    .width(22.dp)
+                    .pointerInput(Unit) {
+                        var dragSum = 0f
+                        detectHorizontalDragGestures(
+                            onDragStart = { dragSum = 0f },
+                            onHorizontalDrag = { _, dragAmount ->
+                                dragSum += dragAmount
+                                if (dragSum < -42f) {
+                                    dragSum = 0f
+                                    showActiveToolsDrawer = true
+                                }
+                            }
+                        )
+                    }
+                    .testTag("right_edge_tools_swipe_zone")
+            )
+
+            val pinnedModelsList = remember(state.availableModels, state.pinnedModelIds) {
+                state.pinnedModelIds.mapNotNull { id ->
+                    state.availableModels.firstOrNull { it.model.id == id }
+                }
+            }
+            ActiveToolsDrawerSheet(
+                visible = showActiveToolsDrawer,
+                selectedModel = state.selectedModel,
+                pinnedModels = pinnedModelsList,
+                modelLatencyMs = state.modelLatencyMs,
+                memoryInjectionEnabled = state.memoryInjectionEnabled,
+                memoryCount = state.memories.count { it.isEnabled },
+                pinnedMemoryCount = state.memories.count { it.isEnabled && it.isPinned },
+                webSearchEnabled = state.webSearchEnabled,
+                toolsEnabled = state.toolsEnabled,
+                tokenDietEnabled = state.tokenDietEnabled,
+                ghostModeEnabled = state.ghostModeEnabled,
+                reasoningEffort = state.reasoningEffort,
+                onSelectModel = viewModel::selectModel,
+                onToggleMemoryInjection = viewModel::toggleSessionMemory,
+                onToggleWebSearch = viewModel::toggleWebSearch,
+                onToggleTools = viewModel::toggleTools,
+                onToggleTokenDiet = viewModel::toggleTokenDiet,
+                onToggleGhostMode = viewModel::toggleGhostMode,
+                onSelectReasoningEffort = viewModel::setReasoningEffort,
+                onOpenCommandPalette = { showCommandPalette = true },
+                onOpenMemoryBank = { showMemoryBank = true },
+                onOpenLiveLens = { onOpenLiveLens(false) },
+                onOpenKnowledge = onOpenKnowledge,
+                onOpenSettings = onOpenSettings,
+                onDismiss = { showActiveToolsDrawer = false }
+            )
         }
     }
 
@@ -3492,12 +3928,39 @@ fun ChatScreen(
         MemoryBankDialog(
             memories = state.memories,
             autoExtractEnabled = state.autoExtractMemories,
+            activeProfile = state.activeMemoryProfile,
+            semanticAutoAttachEnabled = state.semanticAutoAttach,
+            onSelectProfile = viewModel::setMemoryProfile,
+            onToggleSemanticAutoAttach = viewModel::setSemanticAutoAttach,
             onToggleAutoExtract = viewModel::setAutoExtractMemories,
-            onAddMemory = viewModel::addMemory,
+            onAddMemory = { fact, cat, prof -> viewModel.addMemory(fact, cat, prof) },
             onUpdateMemory = viewModel::updateMemory,
             onToggleMemory = viewModel::toggleMemory,
+            onTogglePinMemory = viewModel::setMemoryPinned,
             onDeleteMemory = viewModel::deleteMemory,
+            onClearAllMemories = viewModel::clearAllMemories,
             onDismiss = { showMemoryBank = false }
+        )
+    }
+
+    if (showCommandPalette) {
+        CommandPaletteDialog(
+            availableModels = state.availableModels,
+            pinnedModelIds = state.pinnedModelIds,
+            modelLatencyMs = state.modelLatencyMs,
+            activeModelId = state.selectedModel?.model?.id,
+            conversations = state.conversations,
+            memoryCount = state.memories.count { it.isEnabled },
+            onSelectModel = viewModel::selectModel,
+            onSelectConversation = viewModel::selectConversation,
+            onNewChat = viewModel::createNewChat,
+            onOpenLiveLens = onOpenLiveLens,
+            onOpenMemory = { showMemoryBank = true },
+            onOpenSettings = onOpenSettings,
+            onOpenArena = onOpenArena,
+            onOpenKnowledge = onOpenKnowledge,
+            onOpenSummarize = onOpenSummarize,
+            onDismiss = { showCommandPalette = false }
         )
     }
 
@@ -3832,6 +4295,15 @@ fun ChatScreen(
             },
             onDismiss = { cliBuilderQuery = null },
             onNotify = { viewModel.showNotice(it) }
+        )
+    }
+
+    launchingCallAction?.let { activeCall ->
+        CallingLaunchOverlay(
+            action = activeCall,
+            usedAutoDialBridge = launchingCallViaBridge,
+            onLaunchDialerNow = { launchDialAction(activeCall) },
+            onDismiss = { launchingCallAction = null }
         )
     }
 }

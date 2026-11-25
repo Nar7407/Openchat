@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
+import android.view.KeyEvent
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -73,7 +74,9 @@ import com.example.AllChatApplication
 import com.example.domain.model.ModelCapability
 import com.example.domain.model.NegativeConstraint
 import com.example.domain.model.QuickContact
+import com.example.ui.components.CallingLaunchOverlay
 import com.example.ui.components.DeviceActionConfirmCard
+import com.example.ui.components.DeviceActionQueueStack
 import com.example.ui.components.NegativeConstraintPillBar
 import com.example.ui.components.swissTextFieldColors
 import com.example.ui.theme.AllChatTheme
@@ -87,7 +90,14 @@ import com.example.ui.theme.SwissVerifiedInk
 import com.example.ui.theme.SwissWhite
 import com.example.util.DeviceAction
 import com.example.util.DeviceActionEngine
+import com.example.util.EarbudChimePlayer
+import com.example.util.EarbudCommand
+import com.example.util.EarbudKeyBus
+import com.example.util.MediaButtonBridge
+import com.example.util.ReadAloudController
 import com.example.util.VoiceInputController
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 
@@ -102,8 +112,16 @@ class WidgetPromptActivity : ComponentActivity() {
     companion object {
         const val EXTRA_MODE = "widget_prompt_mode"
         const val EXTRA_RETRY_QUESTION = "widget_retry_question"
+        const val EXTRA_OPEN_PENDING_ACTION = "widget_open_pending_action"
         const val MODE_TEXT = "text"
         const val MODE_VOICE = "voice"
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (EarbudKeyBus.handleHardwareKeyEvent(event)) {
+            return true
+        }
+        return super.dispatchKeyEvent(event)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -123,8 +141,11 @@ class WidgetPromptActivity : ComponentActivity() {
             return
         }
 
+        val openPending = intent?.getBooleanExtra(EXTRA_OPEN_PENDING_ACTION, false) == true
+        val initialPendingActions = if (openPending) WidgetPendingActionStore.consumeAll() else emptyList()
+
         val initialMode = intent?.getStringExtra(EXTRA_MODE) ?: MODE_TEXT
-        if (initialMode == MODE_VOICE) {
+        if (initialMode == MODE_VOICE || initialPendingActions.isNotEmpty()) {
             window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN)
         } else {
             window.setSoftInputMode(
@@ -136,7 +157,8 @@ class WidgetPromptActivity : ComponentActivity() {
         setContent {
             AllChatTheme {
                 WidgetFloatingPromptOverlay(
-                    startInVoiceMode = initialMode == MODE_VOICE,
+                    startInVoiceMode = initialMode == MODE_VOICE && initialPendingActions.isEmpty(),
+                    initialPendingActions = initialPendingActions,
                     onSubmitAndDismiss = { question ->
                         WidgetQuickAskRunner.submitQuestion(applicationContext, question)
                         finishNoAnim()
@@ -157,6 +179,7 @@ class WidgetPromptActivity : ComponentActivity() {
 @Composable
 private fun WidgetFloatingPromptOverlay(
     startInVoiceMode: Boolean,
+    initialPendingActions: List<DeviceAction> = emptyList(),
     onSubmitAndDismiss: (String) -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -176,6 +199,9 @@ private fun WidgetFloatingPromptOverlay(
     val availableModels by remember(repository) {
         repository?.observeModelsForCapability(ModelCapability.TEXT_CHAT) ?: flowOf(emptyList())
     }.collectAsStateWithLifecycle(initialValue = emptyList())
+    val autoDialWebhookUrl by remember(repository) {
+        repository?.autoDialWebhookUrlFlow ?: flowOf("")
+    }.collectAsStateWithLifecycle(initialValue = "")
 
     val scope = rememberCoroutineScope()
     var promptText by remember { mutableStateOf("") }
@@ -183,18 +209,96 @@ private fun WidgetFloatingPromptOverlay(
     var isEnhancing by remember { mutableStateOf(false) }
     var isVoiceMode by remember { mutableStateOf(startInVoiceMode) }
     var isListening by remember { mutableStateOf(false) }
+    var isTtsSpeaking by remember { mutableStateOf(false) }
     var voiceStatus by remember { mutableStateOf("MIC // SPEAK YOUR QUESTION OR COMMAND…") }
-    var pendingDeviceAction by remember { mutableStateOf<DeviceAction?>(null) }
-    var statusNotice by remember { mutableStateOf<String?>(null) }
+    var actionQueue by remember { mutableStateOf<List<DeviceAction>>(initialPendingActions) }
+    var launchingCallAction by remember { mutableStateOf<DeviceAction.DialPhone?>(null) }
+    var launchingCallViaBridge by remember { mutableStateOf(false) }
+
+    val ttsController = remember(context) {
+        ReadAloudController(
+            context = context,
+            onSpeakingIdChanged = { id -> isTtsSpeaking = (id != null) }
+        )
+    }
+
+    fun noticeForWidgetAction(action: DeviceAction?, totalSteps: Int = 1): String? {
+        if (action == null) return null
+        val disambig = DeviceActionEngine.buildDisambiguationSpeech(action)
+        val prefix = if (totalSteps > 1) "CHAIN ($totalSteps STEPS) // " else ""
+        if (disambig != null) return "${prefix}$disambig"
+        return when (action) {
+            is DeviceAction.DialPhone -> if (action.phoneNumber.isNotBlank()) {
+                action.displayBanner
+            } else {
+                "${prefix}PHONE // Tap a matching contact pill or enter a number below."
+            }
+            is DeviceAction.WhatsAppCall -> if (action.phoneNumber.isNotBlank()) {
+                action.displayBanner
+            } else {
+                "${prefix}WHATSAPP CALL // Tap a matching contact pill or enter a number below."
+            }
+            is DeviceAction.SendWhatsApp -> if (action.phoneNumber.isNotBlank()) {
+                "${prefix}WHATSAPP // Ready for ${action.contactLabel ?: action.phoneNumber} — auto-opening in 3s."
+            } else {
+                "${prefix}WHATSAPP // Tap a matching contact pill or enter a number below."
+            }
+            else -> "${prefix}${action.badge} // Tap confirmation button below."
+        }
+    }
+
+    var statusNotice by remember {
+        mutableStateOf(noticeForWidgetAction(initialPendingActions.firstOrNull(), initialPendingActions.size))
+    }
     var widgetError by remember { mutableStateOf<String?>(null) }
     val focusRequester = remember { FocusRequester() }
+
+    fun launchDialAction(dial: DeviceAction.DialPhone) {
+        val enriched = if (dial.contactLabel.isNullOrBlank() && dial.phoneNumber.isNotBlank()) {
+            val matched = DeviceActionEngine.resolveContactByPhone(dial.phoneNumber, quickContacts)
+            if (matched != null) dial.copy(contactLabel = matched.name) else dial
+        } else {
+            dial
+        }
+        statusNotice = enriched.displayBanner
+        launchingCallViaBridge = autoDialWebhookUrl.trim().startsWith("http")
+        launchingCallAction = enriched
+        scope.launch {
+            DeviceActionEngine.executeDialWithBridge(context, enriched, autoDialWebhookUrl)
+                .onSuccess { res ->
+                    launchingCallViaBridge = res.usedAutoDialBridge
+                    statusNotice = "ACTION // ${res.message}"
+                }
+                .onFailure { err ->
+                    launchingCallAction = null
+                    widgetError = err.message ?: "Dialer launch failed."
+                }
+        }
+    }
 
     fun resetWidgetState() {
         widgetError = null
         statusNotice = null
-        pendingDeviceAction = null
+        actionQueue = emptyList()
+        launchingCallAction = null
         promptText = ""
         isEnhancing = false
+    }
+
+    fun advanceWidgetActionQueue(completedMsg: String? = null, dismissWhenEmpty: Boolean = true) {
+        val remaining = actionQueue.drop(1)
+        actionQueue = remaining
+        val next = remaining.firstOrNull()
+        if (next != null) {
+            statusNotice = noticeForWidgetAction(next, remaining.size)
+            ttsController.speak(
+                System.currentTimeMillis(),
+                DeviceActionEngine.buildSpokenConfirmationPrompt(next, stepIndex = 1, totalSteps = remaining.size + 1)
+            )
+        } else {
+            if (completedMsg != null) statusNotice = "OK // $completedMsg"
+            if (dismissWhenEmpty) onDismiss()
+        }
     }
 
     fun submitWithConstraints(raw: String) {
@@ -203,44 +307,76 @@ private fun WidgetFloatingPromptOverlay(
         widgetError = null
         statusNotice = null
 
-        // 1. Intercept Calls, WhatsApp, SMS, Maps, YouTube, Alarms, Timers, Apps right inside the Floating Widget!
-        val parsedAction = runCatching {
-            DeviceActionEngine.parseFromPrompt(clean, quickContacts, customApps)
-        }.onFailure { err ->
-            widgetError = err.message ?: "Failed to parse device action."
-        }.getOrNull()
-
-        if (parsedAction != null) {
-            pendingDeviceAction = parsedAction
-            isVoiceMode = false
-            promptText = ""
-            statusNotice = when (parsedAction) {
-                is DeviceAction.DialPhone -> if (parsedAction.phoneNumber.isNotBlank()) {
-                    parsedAction.displayBanner
-                } else {
-                    "PHONE // Tap a matching contact chip or enter a number below."
+        scope.launch {
+            // 0. Check Voice/Text Disambiguation Reply ("first", "second", "Rahul Verma") if active action has duplicate contacts
+            val headPending = actionQueue.firstOrNull()
+            if (headPending != null && DeviceActionEngine.ambiguousMatchesOf(headPending).size >= 2) {
+                val resolvedDisambig = DeviceActionEngine.resolveDisambiguationVoiceReply(clean, headPending)
+                if (resolvedDisambig != null) {
+                    val updatedQueue = listOf(resolvedDisambig) + actionQueue.drop(1)
+                    actionQueue = updatedQueue
+                    isVoiceMode = false
+                    promptText = ""
+                    statusNotice = noticeForWidgetAction(resolvedDisambig, updatedQueue.size)
+                    ttsController.speak(
+                        System.currentTimeMillis(),
+                        DeviceActionEngine.buildSpokenConfirmationPrompt(resolvedDisambig, 0, updatedQueue.size)
+                    )
+                    return@launch
                 }
-                is DeviceAction.SendWhatsApp -> if (parsedAction.phoneNumber.isNotBlank()) {
-                    "WHATSAPP // Ready — auto-opening in 3s (tap Cancel to stop)."
-                } else {
-                    "WHATSAPP // Tap a matching contact chip or enter a number below."
-                }
-                else -> "${parsedAction.badge} // Tap confirmation button below."
             }
-            return
-        }
 
-        // 2. Otherwise dispatch question to Home Screen Widget Q&A runner
-        val finalPayload = if (activeConstraints.isEmpty() || clean.startsWith("/")) {
-            clean
-        } else {
-            val rules = activeConstraints.joinToString("; ") { it.instruction }
-            "$clean\n\n[Formatting constraints: $rules]"
-        }
-        runCatching {
-            onSubmitAndDismiss(finalPayload)
-        }.onFailure { err ->
-            widgetError = err.message ?: "Unable to submit question from widget."
+            // Ensure fresh contacts & custom apps are loaded even on cold widget start
+            val contacts = if (quickContacts.isNotEmpty()) {
+                quickContacts
+            } else {
+                runCatching { repository?.quickContactsFlow?.first() }.getOrNull().orEmpty()
+            }
+            val apps = if (customApps.isNotEmpty()) {
+                customApps
+            } else {
+                runCatching { repository?.customAppsFlow?.first() }.getOrNull().orEmpty()
+            }
+
+            val preprocessed = DeviceActionEngine.preprocessVoiceCommand(clean, contacts)
+
+            // 1. Intercept Sequential Multi-Action Chains, WhatsApp Voice/Video/Message, Calls, Alarms, Timers, Maps, YouTube, Apps
+            val parsedChain = runCatching {
+                DeviceActionEngine.parseActionChainFromPrompt(clean, contacts, apps)
+            }.onFailure { err ->
+                widgetError = err.message ?: "Failed to parse device action."
+            }.getOrDefault(emptyList())
+
+            if (parsedChain.isNotEmpty()) {
+                actionQueue = parsedChain
+                isVoiceMode = false
+                promptText = ""
+                val first = parsedChain.first()
+                statusNotice = noticeForWidgetAction(first, parsedChain.size)
+                val disambigSpeech = DeviceActionEngine.buildDisambiguationSpeech(first)
+                if (disambigSpeech != null) {
+                    ttsController.speak(System.currentTimeMillis(), disambigSpeech)
+                } else if (parsedChain.size > 1) {
+                    ttsController.speak(
+                        System.currentTimeMillis(),
+                        DeviceActionEngine.buildSpokenConfirmationPrompt(first, 0, parsedChain.size)
+                    )
+                }
+                return@launch
+            }
+
+            // 2. Otherwise dispatch preprocessed question to Home Screen Widget Q&A runner (which ALSO runs DeviceAction tools!)
+            val finalPayload = if (activeConstraints.isEmpty() || preprocessed.startsWith("/")) {
+                preprocessed
+            } else {
+                val rules = activeConstraints.joinToString("; ") { it.instruction }
+                "$preprocessed\n\n[Formatting constraints: $rules]"
+            }
+            runCatching {
+                onSubmitAndDismiss(finalPayload)
+            }.onFailure { err ->
+                widgetError = err.message ?: "Unable to submit question from widget."
+            }
         }
     }
 
@@ -295,12 +431,105 @@ private fun WidgetFloatingPromptOverlay(
         }
     }
 
-    DisposableEffect(voiceController) {
-        onDispose { voiceController.release() }
+    DisposableEffect(voiceController, ttsController) {
+        onDispose {
+            voiceController.release()
+            ttsController.release()
+        }
     }
 
-    LaunchedEffect(isVoiceMode, pendingDeviceAction) {
-        if (pendingDeviceAction != null) return@LaunchedEffect
+    // Speak & listen automatically when an ambiguous duplicate-name action arrives in the widget
+    val widgetActiveAction = actionQueue.firstOrNull()
+    val widgetNeedsDisambig = widgetActiveAction != null &&
+        DeviceActionEngine.ambiguousMatchesOf(widgetActiveAction).size >= 2
+    LaunchedEffect(widgetActiveAction, widgetNeedsDisambig) {
+        if (widgetNeedsDisambig && widgetActiveAction != null) {
+            DeviceActionEngine.buildDisambiguationSpeech(widgetActiveAction)?.let { speech ->
+                ttsController.speak(System.currentTimeMillis(), speech)
+            }
+            delay(450L)
+            var waited = 0L
+            while (isTtsSpeaking && waited < 6000L) {
+                delay(200L)
+                waited += 200L
+            }
+            if (!isListening && actionQueue.firstOrNull() == widgetActiveAction) {
+                startVoiceCapture()
+            }
+        }
+    }
+
+    fun isWidgetActionReadyForEarbud(action: DeviceAction?): Boolean {
+        if (action == null) return false
+        if (DeviceActionEngine.ambiguousMatchesOf(action).size >= 2) return false
+        return when (action) {
+            is DeviceAction.DialPhone -> action.phoneNumber.isNotBlank()
+            is DeviceAction.WhatsAppCall -> action.phoneNumber.isNotBlank()
+            is DeviceAction.SendWhatsApp -> action.phoneNumber.isNotBlank()
+            is DeviceAction.SendSms -> action.phoneNumber.isNotBlank()
+            is DeviceAction.SendEmail -> action.emailAddress.isNotBlank()
+            is DeviceAction.UpiPay -> action.upiId.isNotBlank() && action.upiId.contains("@")
+            else -> true
+        }
+    }
+
+    // Earbud 1x Tap = Confirm Active Step (Call/WhatsApp/Chain Step) or Re-Dial; 2x Tap = Cancel/Skip Step
+    fun handleWidgetEarbudSingleTap() {
+        launchingCallAction?.let { activeCall ->
+            EarbudChimePlayer.playConfirmChime()
+            launchDialAction(activeCall)
+            return
+        }
+        val current = actionQueue.firstOrNull() ?: return
+        if (!isWidgetActionReadyForEarbud(current)) return
+        EarbudChimePlayer.playConfirmChime()
+        if (current is DeviceAction.DialPhone) {
+            launchDialAction(current)
+            if (actionQueue.size > 1) {
+                advanceWidgetActionQueue(dismissWhenEmpty = false)
+            }
+        } else {
+            DeviceActionEngine.execute(context, current)
+                .onSuccess { msg ->
+                    advanceWidgetActionQueue(completedMsg = msg, dismissWhenEmpty = true)
+                }
+                .onFailure { err -> widgetError = err.message ?: "Action execution failed." }
+        }
+    }
+
+    fun handleWidgetEarbudCancelTap() {
+        if (launchingCallAction != null) {
+            EarbudChimePlayer.playCancelChime()
+            launchingCallAction = null
+        } else if (actionQueue.isNotEmpty()) {
+            EarbudChimePlayer.playCancelChime()
+            advanceWidgetActionQueue(completedMsg = "EARBUD // Cancelled.", dismissWhenEmpty = false)
+        }
+    }
+
+    DisposableEffect(context, actionQueue.isNotEmpty(), launchingCallAction != null) {
+        val bridge = if (actionQueue.isNotEmpty() || launchingCallAction != null) {
+            MediaButtonBridge(
+                context = context,
+                onEarbudTriggerAsk = { handleWidgetEarbudSingleTap() },
+                onEarbudNextAction = { handleWidgetEarbudCancelTap() },
+                enableSilentKeepAlive = true
+            ).also { it.start(context) }
+        } else null
+        onDispose { bridge?.stop() }
+    }
+
+    LaunchedEffect(Unit) {
+        EarbudKeyBus.events.collect { cmd ->
+            when (cmd) {
+                EarbudCommand.SINGLE_TAP -> handleWidgetEarbudSingleTap()
+                EarbudCommand.DOUBLE_TAP_OR_NEXT -> handleWidgetEarbudCancelTap()
+            }
+        }
+    }
+
+    LaunchedEffect(isVoiceMode, actionQueue.isNotEmpty()) {
+        if (actionQueue.isNotEmpty()) return@LaunchedEffect
         if (isVoiceMode) {
             if (!isListening && promptText.isBlank()) {
                 startVoiceCapture()
@@ -404,6 +633,24 @@ private fun WidgetFloatingPromptOverlay(
                     )
                 }
 
+                // Top ACTION // Banner (keeps confirmed Contact Name like "Manisha ❤️✨" visible at top)
+                AnimatedVisibility(visible = statusNotice?.startsWith("ACTION //") == true) {
+                    statusNotice?.let { topActionBanner ->
+                        Text(
+                            text = topActionBanner,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SwissWhite,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(SwissSignalRed)
+                                .padding(horizontal = 10.dp, vertical = 6.dp)
+                                .testTag("widget_top_action_banner")
+                        )
+                    }
+                }
+
                 // Resilient Error Fallback Panel (shows readable error + Reset button instead of a blank box)
                 if (repository == null || widgetError != null) {
                     Column(
@@ -448,51 +695,63 @@ private fun WidgetFloatingPromptOverlay(
                     }
                 }
 
-                // Interactive Device Action Confirmation Card (Calls, WhatsApp 3s Auto-Launch, Multi-Match Contact Chips)
-                AnimatedVisibility(visible = pendingDeviceAction != null) {
-                    pendingDeviceAction?.let { action ->
-                        DeviceActionConfirmCard(
-                            action = action,
-                            quickContacts = quickContacts,
-                            onUpdateAction = { updated ->
-                                pendingDeviceAction = updated
-                                if (updated is DeviceAction.DialPhone && updated.phoneNumber.isNotBlank()) {
-                                    statusNotice = updated.displayBanner
+                // Interactive Sequential Multi-Action Stack (Calls, WhatsApp Voice/Video/Message, Numbered Disambiguation Pills)
+                AnimatedVisibility(visible = actionQueue.isNotEmpty()) {
+                    DeviceActionQueueStack(
+                        actions = actionQueue,
+                        quickContacts = quickContacts,
+                        autoDialWebhookUrl = autoDialWebhookUrl,
+                        onDialLaunched = { dialAction, usedBridge ->
+                            statusNotice = dialAction.displayBanner
+                            launchingCallViaBridge = usedBridge
+                            launchingCallAction = dialAction
+                        },
+                        onUpdateActive = { updated ->
+                            val nextQueue = listOf(updated) + actionQueue.drop(1)
+                            actionQueue = nextQueue
+                            statusNotice = noticeForWidgetAction(updated, nextQueue.size)
+                        },
+                        onRemoveQueuedAt = { idx ->
+                            if (idx in actionQueue.indices) {
+                                actionQueue = actionQueue.filterIndexed { i, _ -> i != idx }
+                            }
+                        },
+                        onClearAll = { actionQueue = emptyList() },
+                        onSaveQuickContact = { name, phone ->
+                            val repo = repository ?: return@DeviceActionQueueStack
+                            scope.launch {
+                                runCatching {
+                                    repo.saveQuickContact(QuickContact(name = name, phoneNumber = phone))
+                                }.onSuccess {
+                                    statusNotice = "OK // Saved $name ($phone) to Quick Contacts."
+                                }.onFailure { err ->
+                                    widgetError = err.message ?: "Could not save contact."
                                 }
-                            },
-                            onSaveQuickContact = { name, phone ->
-                                val repo = repository ?: return@DeviceActionConfirmCard
-                                scope.launch {
-                                    runCatching {
-                                        repo.saveQuickContact(QuickContact(name = name, phoneNumber = phone))
-                                    }.onSuccess {
-                                        statusNotice = "OK // Saved $name ($phone) to Quick Contacts."
-                                    }.onFailure { err ->
-                                        widgetError = err.message ?: "Could not save contact."
-                                    }
+                            }
+                        },
+                        onExecuteActive = { action ->
+                            if (action is DeviceAction.DialPhone) {
+                                launchDialAction(action)
+                                if (actionQueue.size > 1) {
+                                    advanceWidgetActionQueue(dismissWhenEmpty = false)
                                 }
-                            },
-                            onExecute = {
+                            } else {
                                 DeviceActionEngine.execute(context, action)
                                     .onSuccess { msg ->
-                                        statusNotice = if (action is DeviceAction.DialPhone) "ACTION // $msg" else "OK // $msg"
-                                        if (action !is DeviceAction.DialPhone) {
-                                            pendingDeviceAction = null
-                                            onDismiss()
-                                        }
+                                        advanceWidgetActionQueue(completedMsg = msg, dismissWhenEmpty = true)
                                     }
                                     .onFailure { err ->
                                         widgetError = err.message ?: "Action execution failed."
                                     }
-                            },
-                            onDismiss = { pendingDeviceAction = null },
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
-                        )
-                    }
+                            }
+                        },
+                        onDismissActive = { advanceWidgetActionQueue(dismissWhenEmpty = false) },
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
+                    )
                 }
 
-                // Inline Status Notice
-                AnimatedVisibility(visible = statusNotice != null) {
+                // Inline Status Notice (non-ACTION notices; ACTION // banners are pinned at the top)
+                AnimatedVisibility(visible = statusNotice != null && statusNotice?.startsWith("ACTION //") != true) {
                     statusNotice?.let { notice ->
                         Text(
                             text = notice,
@@ -773,5 +1032,14 @@ private fun WidgetFloatingPromptOverlay(
                 }
             }
         }
+    }
+
+    launchingCallAction?.let { activeCall ->
+        CallingLaunchOverlay(
+            action = activeCall,
+            usedAutoDialBridge = launchingCallViaBridge,
+            onLaunchDialerNow = { launchDialAction(activeCall) },
+            onDismiss = { launchingCallAction = null }
+        )
     }
 }

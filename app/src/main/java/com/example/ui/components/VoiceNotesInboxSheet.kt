@@ -70,7 +70,12 @@ import com.example.ui.theme.SwissPaper
 import com.example.ui.theme.SwissSignalRed
 import com.example.ui.theme.SwissSubtleFill
 import com.example.ui.theme.SwissWhite
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.material.icons.outlined.GraphicEq
+import com.example.util.VoiceDspAudioChain
+import com.example.util.VoiceDspTelemetry
 import com.example.util.VoiceInputController
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -85,13 +90,19 @@ fun VoiceNotesInboxSheet(
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var searchQuery by remember { mutableStateOf("") }
     var draftMemo by remember { mutableStateOf("") }
     var isDictating by remember { mutableStateOf(false) }
+    var dspEnabled by remember { mutableStateOf(true) }
+    var isRecordingCleanWav by remember { mutableStateOf(false) }
+    var dspTelemetry by remember { mutableStateOf(VoiceDspTelemetry()) }
     var feedbackBanner by remember { mutableStateOf<String?>(null) }
     var editingNote by remember { mutableStateOf<VoiceNoteInfo?>(null) }
     var editTitle by remember { mutableStateOf("") }
     var editMarkdown by remember { mutableStateOf("") }
+
+    val dspChain = remember { VoiceDspAudioChain(sampleRateHz = 16_000, highPassCutoffHz = 120.0) }
 
     val voiceController = remember(context) {
         VoiceInputController(
@@ -104,16 +115,45 @@ fun VoiceNotesInboxSheet(
             onFailure = { err -> feedbackBanner = err }
         )
     }
-    DisposableEffect(voiceController) {
-        onDispose { voiceController.release() }
+    DisposableEffect(voiceController, dspChain) {
+        onDispose {
+            dspChain.stopCapture()
+            voiceController.release()
+        }
+    }
+
+    var pendingStartCleanRecord by remember { mutableStateOf(false) }
+    fun startCleanDspRecording() {
+        val started = dspChain.startCapture(
+            scope = scope,
+            enableDsp = dspEnabled,
+            recordToBuffer = true,
+            onTelemetry = { t -> dspTelemetry = t }
+        )
+        if (started) {
+            isRecordingCleanWav = true
+            feedbackBanner = if (dspEnabled) {
+                "DSP ACTIVE // 120Hz High-Pass + 4:1 Dynamics Compressor recording…"
+            } else {
+                "Recording raw mic audio…"
+            }
+        } else {
+            feedbackBanner = "AudioRecord unavailable on this device."
+        }
     }
 
     val micPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (granted) {
-            voiceController.start()
+            if (pendingStartCleanRecord) {
+                pendingStartCleanRecord = false
+                startCleanDspRecording()
+            } else {
+                voiceController.start()
+            }
         } else {
+            pendingStartCleanRecord = false
             feedbackBanner = "Microphone permission denied."
         }
     }
@@ -286,6 +326,117 @@ fun VoiceNotesInboxSheet(
                                         color = SwissWhite
                                     )
                                 }
+                            }
+                        }
+                    }
+
+                    // Hardware + Pure-Kotlin DSP Audio Input Chain Bar (120Hz High-Pass + Dynamics Compressor)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(SwissPaper)
+                            .border(1.dp, SwissInk, RectangleShape)
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .clickable { dspEnabled = !dspEnabled }
+                                .testTag("voice_dsp_filter_toggle")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.GraphicEq,
+                                contentDescription = "Toggle 120Hz HPF and Compressor DSP",
+                                tint = if (dspEnabled) SwissSignalRed else SwissMuted,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Text(
+                                text = if (dspEnabled) "DSP // 120Hz HPF + COMP: ON" else "DSP // BYPASSED",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontFamily = JetBrainsMonoFamily,
+                                    fontWeight = FontWeight.Bold
+                                ),
+                                color = if (dspEnabled) SwissInk else SwissMuted
+                            )
+                        }
+                        Text(
+                            text = if (isRecordingCleanWav) "[ STOP WAV ]" else "[ REC CLEAN WAV ]",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontFamily = JetBrainsMonoFamily,
+                                fontWeight = FontWeight.Bold
+                            ),
+                            color = if (isRecordingCleanWav) SwissWhite else SwissSignalRed,
+                            modifier = Modifier
+                                .background(if (isRecordingCleanWav) SwissSignalRed else SwissWhite, RectangleShape)
+                                .border(1.dp, SwissSignalRed, RectangleShape)
+                                .clickable {
+                                    if (isRecordingCleanWav) {
+                                        val dir = File(context.filesDir, "voice_notes_wav").apply { mkdirs() }
+                                        val outFile = File(dir, "clean_note_${System.currentTimeMillis()}.wav")
+                                        val saved = dspChain.stopCapture(saveWavTo = outFile)
+                                        isRecordingCleanWav = false
+                                        dspTelemetry = VoiceDspTelemetry()
+                                        feedbackBanner = if (saved != null) {
+                                            "Saved denoised 16kHz WAV (${saved.length() / 1024} KB)"
+                                        } else {
+                                            "Recording stopped."
+                                        }
+                                    } else {
+                                        val granted = ContextCompat.checkSelfPermission(
+                                            context,
+                                            Manifest.permission.RECORD_AUDIO
+                                        ) == PackageManager.PERMISSION_GRANTED
+                                        if (granted) {
+                                            startCleanDspRecording()
+                                        } else {
+                                            pendingStartCleanRecord = true
+                                            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                        }
+                                    }
+                                }
+                                .padding(horizontal = 7.dp, vertical = 3.dp)
+                                .testTag("voice_note_dsp_record_button")
+                        )
+                    }
+
+                    if (isRecordingCleanWav) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(SwissInk)
+                                .padding(horizontal = 10.dp, vertical = 6.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = "MIC LEVEL · HPF ${dspTelemetry.highPassCutoffHz}Hz · ${if (dspTelemetry.hardwareNsAttached) "HW-NS" else "SW-DSP"}",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                                    color = SwissWhite
+                                )
+                                Text(
+                                    text = "-${String.format(Locale.US, "%.1f", dspTelemetry.noiseReductionDb)}dB RUMBLE",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                                    color = SwissSignalRed
+                                )
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(5.dp)
+                                    .background(SwissGridLine)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth(dspTelemetry.levelNormalized.coerceIn(0.05f, 1f))
+                                        .height(5.dp)
+                                        .background(SwissSignalRed)
+                                )
                             }
                         }
                     }

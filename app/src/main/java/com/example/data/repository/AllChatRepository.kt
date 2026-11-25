@@ -63,9 +63,11 @@ import com.example.domain.model.LiveLensMode
 import com.example.domain.model.LocalRagEngine
 import com.example.domain.model.McpCheckResult
 import com.example.domain.model.McpServerConfig
+import com.example.domain.model.MemoryProfile
 import com.example.domain.model.MindMapNode
 import com.example.domain.model.ModelCapability
 import com.example.domain.model.ModelInfo
+import com.example.domain.model.OutputFormatMode
 import com.example.domain.model.PersonaInfo
 import com.example.domain.model.ProviderConfig
 import com.example.domain.model.ProviderType
@@ -95,6 +97,7 @@ import com.example.domain.model.SummaryLength
 import com.example.domain.model.ThreadCheckpoint
 import com.example.domain.model.TopicCluster
 import com.example.domain.model.VoiceFormTemplate
+import com.example.domain.model.LiveLensOverlayRegion
 import com.example.domain.model.UserMemoryInfo
 import com.example.domain.model.VoiceNoteInfo
 import com.example.domain.model.WatchlistItemInfo
@@ -108,6 +111,8 @@ import java.util.concurrent.ConcurrentHashMap
 import com.example.domain.model.YouTubeStudyResult
 import com.example.util.DocumentExtractor
 import com.example.util.ImageEncoder
+import com.example.util.LiveLensHistoryStore
+import com.example.util.SemanticEmbeddingEngine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -226,6 +231,7 @@ class AllChatRepository(
     val localWorkspaceUriFlow: Flow<String?> = apiKeyVault.localWorkspaceUriFlow
     val wakePhraseEnabledFlow: Flow<Boolean> = apiKeyVault.wakePhraseEnabledFlow
     val ambientWhisperEnabledFlow: Flow<Boolean> = apiKeyVault.ambientWhisperEnabledFlow
+    val autoDialWebhookUrlFlow: Flow<String> = apiKeyVault.autoDialWebhookUrlFlow
     val smartZonesFlow: Flow<List<SmartZone>> = apiKeyVault.smartZonesFlow
 
     suspend fun setTimeProfilesEnabled(enabled: Boolean) = apiKeyVault.setTimeProfilesEnabled(enabled)
@@ -234,6 +240,7 @@ class AllChatRepository(
     suspend fun setLocalWorkspaceUri(uri: String?) = apiKeyVault.setLocalWorkspaceUri(uri)
     suspend fun setWakePhraseEnabled(enabled: Boolean) = apiKeyVault.setWakePhraseEnabled(enabled)
     suspend fun setAmbientWhisperEnabled(enabled: Boolean) = apiKeyVault.setAmbientWhisperEnabled(enabled)
+    suspend fun setAutoDialWebhookUrl(url: String) = apiKeyVault.setAutoDialWebhookUrl(url)
     suspend fun saveSmartZones(zones: List<SmartZone>) = apiKeyVault.saveSmartZones(zones)
     val customSlashCommandsFlow: Flow<List<CustomSlashCommand>> = apiKeyVault.customSlashCommandsFlow
     val autoRouterConfigFlow: Flow<AutoRouterConfig> = apiKeyVault.autoRouterConfigFlow
@@ -248,8 +255,58 @@ class AllChatRepository(
     val knowledgeDocsFlow: Flow<List<KnowledgeDocInfo>> = knowledgeDocDao.observeDocs().map { list ->
         list.map { it.toDomain() }
     }
-    val memoriesFlow: Flow<List<UserMemoryInfo>> = userMemoryDao.observeAll().map { list ->
-        list.map { it.toDomain() }
+    val pinnedModelIdsFlow: Flow<List<Long>> = apiKeyVault.pinnedModelIdsFlow
+    val modelLatencyMsFlow: Flow<Map<Long, Long>> = apiKeyVault.modelLatencyMsFlow
+    val fastUtilityModelIdFlow: Flow<Long?> = apiKeyVault.fastUtilityModelIdFlow
+    val activeMemoryProfileFlow: Flow<MemoryProfile> = apiKeyVault.activeMemoryProfileFlow
+    val semanticAutoAttachFlow: Flow<Boolean> = apiKeyVault.semanticAutoAttachFlow
+
+    val memoriesFlow: Flow<List<UserMemoryInfo>> = combine(
+        userMemoryDao.observeAll(),
+        apiKeyVault.pinnedMemoryIdsFlow,
+        apiKeyVault.memoryProfileMapFlow
+    ) { list, pinnedIds, profileMap ->
+        list.map { entity ->
+            entity.toDomain().copy(
+                isPinned = entity.id in pinnedIds,
+                profile = profileMap[entity.id] ?: "ALL"
+            )
+        }.sortedWith(
+            compareByDescending<UserMemoryInfo> { it.isPinned }
+                .thenByDescending { it.createdAt }
+        )
+    }
+
+    suspend fun togglePinnedModelId(modelDbId: Long, maxPins: Int = 4): Pair<Boolean, Boolean> =
+        apiKeyVault.togglePinnedModelId(modelDbId, maxPins)
+
+    suspend fun recordModelLatency(modelDbId: Long, latencyMs: Long) =
+        apiKeyVault.recordModelLatency(modelDbId, latencyMs)
+
+    suspend fun setFastUtilityModelId(modelDbId: Long?) =
+        apiKeyVault.setFastUtilityModelId(modelDbId)
+
+    suspend fun setActiveMemoryProfile(profile: MemoryProfile) =
+        apiKeyVault.setActiveMemoryProfile(profile)
+
+    suspend fun setMemoryProfile(memoryId: Long, profile: String) =
+        apiKeyVault.setMemoryProfile(memoryId, profile)
+
+    suspend fun setSemanticAutoAttach(enabled: Boolean) =
+        apiKeyVault.setSemanticAutoAttach(enabled)
+
+    /**
+     * Resolves the user's designated Fast Utility Model (Dual-Lane Cloud Routing)
+     * for lightweight background tasks (auto-titling, memory extraction, Live Lens tagging,
+     * quick clipboard summaries), falling back to [fallback] if none is assigned.
+     */
+    suspend fun resolveFastUtilityModel(fallback: SelectableModel?): SelectableModel? {
+        val fastId = apiKeyVault.fastUtilityModelIdFlow.first()
+        if (fastId != null && fastId > 0L) {
+            val available = observeModelsForCapability(ModelCapability.TEXT_CHAT).first()
+            available.firstOrNull { it.model.id == fastId }?.let { return it }
+        }
+        return fallback
     }
     val routinesFlow: Flow<List<AssistantRoutine>> = routineDao.observeAll().map { list ->
         list.map { it.toDomainRoutine() }
@@ -410,19 +467,124 @@ class AllChatRepository(
 
     // --- User Memory Bank (Persistent Auto-Extracted & Manual Facts) ---
 
-    suspend fun addMemory(fact: String, category: String = "Preference", source: String = "Manual"): Long {
+    private fun normalizeMemoryTokens(text: String): Set<String> =
+        text.lowercase()
+            .replace(Regex("[^a-z0-9\\s]"), " ")
+            .split(Regex("\\s+"))
+            .filter { it.length >= 3 }
+            .toSet()
+
+    private fun isDuplicateMemoryFact(candidate: String, existingFacts: List<String>): Boolean {
+        val normCandidate = candidate.lowercase().replace(Regex("[^a-z0-9]"), "")
+        if (normCandidate.length < 4) return true
+        val candidateTokens = normalizeMemoryTokens(candidate)
+        return existingFacts.any { existing ->
+            val normExisting = existing.lowercase().replace(Regex("[^a-z0-9]"), "")
+            if (normExisting == normCandidate) return@any true
+            if (normExisting.length >= 10 && normCandidate.length >= 10 &&
+                (normExisting.contains(normCandidate) || normCandidate.contains(normExisting))
+            ) {
+                return@any true
+            }
+            val existingTokens = normalizeMemoryTokens(existing)
+            if (candidateTokens.size >= 3 && existingTokens.size >= 3) {
+                val intersection = candidateTokens.intersect(existingTokens).size
+                val union = candidateTokens.union(existingTokens).size
+                if (union > 0 && (intersection.toFloat() / union.toFloat()) >= 0.72f) {
+                    return@any true
+                }
+            }
+            false
+        }
+    }
+
+    /**
+     * Detects when a newly extracted fact updates/contradicts an older memory on the same
+     * preference key or subject (e.g., switching stack, exam subject, editor, or output rule).
+     */
+    private fun findConflictingMemory(
+        candidate: String,
+        category: String,
+        existing: List<UserMemoryEntity>
+    ): UserMemoryEntity? {
+        val subjectKeys = listOf(
+            "preferred language", "favorite language", "primary language", "programming language",
+            "tech stack", "preferred stack", "framework", "default editor", "ide",
+            "output style", "formatting preference", "response style", "tone",
+            "currently studying", "studying", "exam", "course", "subject", "major",
+            "working on", "current project", "job", "role", "occupation",
+            "timezone", "location", "lives in", "based in", "name is", "operating system", "os "
+        )
+        val candLow = candidate.lowercase()
+        val matchedKeys = subjectKeys.filter { candLow.contains(it) }
+        val candTokens = normalizeMemoryTokens(candidate)
+
+        for (entry in existing) {
+            val exLow = entry.fact.lowercase()
+            if (matchedKeys.isNotEmpty() && matchedKeys.any { exLow.contains(it) }) {
+                return entry
+            }
+            // Also detect prefix/subject alignment ("User prefers ...", "Stack: ...", "Exam: ...")
+            val candPrefix = candLow.substringBefore(':').trim()
+            val exPrefix = exLow.substringBefore(':').trim()
+            if (candPrefix.length in 3..26 && candLow.contains(':') && exLow.contains(':') && candPrefix == exPrefix) {
+                return entry
+            }
+            // Same category with strong subject overlap (0.45..0.71 -> likely update/contradiction)
+            if (entry.category.equals(category, ignoreCase = true)) {
+                val exTokens = normalizeMemoryTokens(entry.fact)
+                if (candTokens.size >= 3 && exTokens.size >= 3) {
+                    val inter = candTokens.intersect(exTokens).size
+                    val union = candTokens.union(exTokens).size
+                    val ratio = if (union > 0) inter.toFloat() / union.toFloat() else 0f
+                    if (ratio >= 0.48f) return entry
+                }
+            }
+        }
+        return null
+    }
+
+    suspend fun addMemory(
+        fact: String,
+        category: String = "Preference",
+        source: String = "Manual",
+        profile: String? = null
+    ): Long {
         val clean = fact.trim()
         if (clean.isEmpty()) return -1L
+        val cleanCat = category.trim().ifBlank { "Preference" }
+        val targetProfile = (profile ?: apiKeyVault.activeMemoryProfileFlow.first().name).uppercase()
         val existing = userMemoryDao.getAll()
-        if (existing.any { it.fact.equals(clean, ignoreCase = true) }) return -1L
-        return userMemoryDao.insert(
+        if (isDuplicateMemoryFact(clean, existing.map { it.fact })) return -1L
+
+        // Automatic contradiction overwrite: update stale conflicting fact in-place instead of duplicating
+        val conflicting = findConflictingMemory(clean, cleanCat, existing)
+        if (conflicting != null) {
+            userMemoryDao.update(
+                conflicting.copy(
+                    fact = clean,
+                    category = cleanCat,
+                    isEnabled = true,
+                    source = "$source (Updated)",
+                    createdAt = System.currentTimeMillis()
+                )
+            )
+            apiKeyVault.setMemoryProfile(conflicting.id, targetProfile)
+            return conflicting.id
+        }
+
+        val insertedId = userMemoryDao.insert(
             UserMemoryEntity(
                 fact = clean,
-                category = category.trim().ifBlank { "Preference" },
+                category = cleanCat,
                 isEnabled = true,
                 source = source
             )
         )
+        if (insertedId > 0L) {
+            apiKeyVault.setMemoryProfile(insertedId, targetProfile)
+        }
+        return insertedId
     }
 
     suspend fun updateMemory(memory: UserMemoryInfo) {
@@ -438,14 +600,40 @@ class AllChatRepository(
                 createdAt = memory.createdAt
             )
         )
+        apiKeyVault.setMemoryProfile(memory.id, memory.profile)
     }
 
     suspend fun toggleMemory(id: Long, enabled: Boolean) {
         userMemoryDao.setEnabled(id, enabled)
     }
 
+    suspend fun setMemoryPinned(id: Long, pinned: Boolean) {
+        apiKeyVault.setMemoryPinned(id, pinned)
+        if (pinned) {
+            userMemoryDao.setEnabled(id, true)
+        }
+    }
+
     suspend fun deleteMemory(id: Long) {
         userMemoryDao.deleteById(id)
+        apiKeyVault.setMemoryPinned(id, false)
+    }
+
+    suspend fun clearAllMemories() {
+        userMemoryDao.deleteAll()
+        apiKeyVault.clearPinnedMemoryIds()
+        apiKeyVault.clearMemoryProfiles()
+    }
+
+    /**
+     * Token-saving payload trimmer: keeps only the latest 2 messages bounded strictly to 800 characters
+     * total so background utility API calls stay under ~250 tokens and avoid rate limits.
+     */
+    private fun trimLatestTwoMessagesTo800Chars(userMessage: String, assistantMessage: String): String {
+        val uClean = userMessage.trim().replace(Regex("\\s+"), " ").take(450)
+        val remaining = (800 - uClean.length - 16).coerceAtLeast(180)
+        val aClean = assistantMessage.trim().replace(Regex("\\s+"), " ").take(remaining)
+        return "U: $uClean\nA: $aClean".take(800)
     }
 
     suspend fun extractMemoriesFromTurn(
@@ -453,34 +641,119 @@ class AllChatRepository(
         assistantMessage: String,
         selectableModel: SelectableModel
     ): Int = withContext(Dispatchers.IO) {
-        if (userMessage.length < 18) return@withContext 0
-        val existing = userMemoryDao.getAll().map { it.fact }
-        val apiKey = apiKeyVault.getApiKey(selectableModel.provider.id)
-        val prompt = """
-            Extract 0 to 2 durable, reusable user facts or preferences from this exchange (e.g. programming languages, tech stack, role, communication style, location/timezone, ongoing projects).
-            Do NOT extract ephemeral one-off questions. Do NOT duplicate existing memories: ${existing.joinToString("; ")}.
-            Return strictly a JSON array of objects: [{"fact": "...", "category": "Preference|Tech|Profile|Workflow"}]. If nothing durable should be saved, return [].
+        if (userMessage.length < 16) return@withContext 0
+        // Route exclusively to Fast Utility Model when designated
+        val utilityModel = resolveFastUtilityModel(selectableModel) ?: selectableModel
+        val existingEntities = userMemoryDao.getAll()
+        val activeProfile = apiKeyVault.activeMemoryProfileFlow.first().name
+        val apiKey = apiKeyVault.getApiKey(utilityModel.provider.id)
 
-            User: ${userMessage.take(1200)}
-            Assistant: ${assistantMessage.take(800)}
+        val compactExisting = existingEntities.take(12).joinToString("; ") { "[${it.id}] ${it.fact.take(64)}" }
+        val trimmedExchange = trimLatestTwoMessagesTo800Chars(userMessage, assistantMessage)
+        val prompt = """
+            Extract 0-2 durable user facts/preferences. If a fact updates/contradicts an existing memory [id], set "replaces_id":id. No duplicates.
+            Existing: $compactExisting
+            Return JSON array only: [{"fact":"...","category":"Preference|Tech|Profile|Workflow","replaces_id":null}]
+            $trimmedExchange
         """.trimIndent()
+
         val raw = runCatching {
-            collectSingleCompletion(selectableModel, apiKey, prompt) {}
+            collectSingleCompletion(utilityModel, apiKey, prompt, maxTokens = 160) {}
         }.getOrDefault("")
         val cleaned = extractJsonArray(raw) ?: return@withContext 0
-        var added = 0
+        var savedOrUpdated = 0
         runCatching {
             val arr = JSONArray(cleaned)
             for (i in 0 until arr.length().coerceAtMost(2)) {
                 val obj = arr.optJSONObject(i) ?: continue
                 val fact = obj.optString("fact").trim()
-                val cat = obj.optString("category", "Preference").trim()
-                if (fact.length >= 6 && addMemory(fact, cat, source = "Auto") > 0L) {
-                    added++
+                val cat = obj.optString("category", "Preference").trim().ifBlank { "Preference" }
+                val replacesId = obj.optLong("replaces_id", -1L).takeIf { it > 0L }
+                if (fact.length < 6) continue
+
+                val replaceTarget = replacesId?.let { rid -> existingEntities.firstOrNull { it.id == rid } }
+                if (replaceTarget != null) {
+                    userMemoryDao.update(
+                        replaceTarget.copy(
+                            fact = fact,
+                            category = cat,
+                            isEnabled = true,
+                            source = "Auto (Updated)",
+                            createdAt = System.currentTimeMillis()
+                        )
+                    )
+                    apiKeyVault.setMemoryProfile(replaceTarget.id, activeProfile)
+                    savedOrUpdated++
+                } else if (addMemory(fact, cat, source = "Auto", profile = activeProfile) > 0L) {
+                    savedOrUpdated++
                 }
             }
         }
-        added
+        savedOrUpdated
+    }
+
+    /**
+     * Background Fast Utility Model session auto-titler using strictly the latest 2 messages (<= 800 chars).
+     */
+    suspend fun autoTitleConversationFast(
+        conversationId: Long,
+        userMessage: String,
+        assistantMessage: String,
+        fallbackModel: SelectableModel
+    ) = withContext(Dispatchers.IO) {
+        val conv = conversationDao.getById(conversationId) ?: return@withContext
+        val utilityModel = resolveFastUtilityModel(fallbackModel) ?: fallbackModel
+        val apiKey = apiKeyVault.getApiKey(utilityModel.provider.id)
+        val trimmed = trimLatestTwoMessagesTo800Chars(userMessage, assistantMessage)
+        val prompt = "Write a concise 3-5 word title for this chat (no quotes, no punctuation):\n$trimmed"
+        val generated = runCatching {
+            collectSingleCompletion(utilityModel, apiKey, prompt, maxTokens = 28) {}
+        }.getOrDefault("")
+            .replace(Regex("""["'`\n\r]"""), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            .take(44)
+        if (generated.length >= 3 && generated != conv.title) {
+            conversationDao.rename(conversationId, generated)
+        }
+    }
+
+    /**
+     * Lightweight Live Lens image tagging via Fast Utility Model (<= 800 chars input).
+     */
+    suspend fun tagLiveLensAnswerFast(
+        answerText: String,
+        fallbackModel: SelectableModel?
+    ): String? = withContext(Dispatchers.IO) {
+        val utilityModel = resolveFastUtilityModel(fallbackModel) ?: return@withContext null
+        val apiKey = apiKeyVault.getApiKey(utilityModel.provider.id)
+        val trimmed = answerText.trim().replace(Regex("\\s+"), " ").take(650)
+        if (trimmed.length < 20) return@withContext null
+        val prompt = "Return 1 short topic tag (2-3 words max, e.g. Calculus Integral, Circuit KVL, Kotlin Bug) for:\n$trimmed"
+        runCatching {
+            collectSingleCompletion(utilityModel, apiKey, prompt, maxTokens = 20) {}
+        }.getOrNull()
+            ?.replace(Regex("""["'`#\n\r]"""), "")
+            ?.trim()
+            ?.take(28)
+            ?.takeIf { it.length >= 2 }
+    }
+
+    /**
+     * Quick clipboard summary routed exclusively to the Fast Utility Model (<= 800 chars).
+     */
+    suspend fun summarizeClipboardFast(
+        clipboardText: String,
+        fallbackModel: SelectableModel?
+    ): String? = withContext(Dispatchers.IO) {
+        val utilityModel = resolveFastUtilityModel(fallbackModel) ?: return@withContext null
+        val apiKey = apiKeyVault.getApiKey(utilityModel.provider.id)
+        val trimmed = clipboardText.trim().take(800)
+        if (trimmed.length < 20) return@withContext null
+        val prompt = "Summarize this clipboard snippet in 2 crisp bullet points:\n$trimmed"
+        runCatching {
+            collectSingleCompletion(utilityModel, apiKey, prompt, maxTokens = 120) {}
+        }.getOrNull()?.trim()?.takeIf { it.isNotBlank() }
     }
 
     suspend fun saveCustomSlashCommand(command: CustomSlashCommand) {
@@ -1643,18 +1916,70 @@ class AllChatRepository(
             }
         }
 
-        // 0. Inject enabled User Memory Bank facts AND Saved Quick Contacts Directory into system prompt
-        val enabledMemories = userMemoryDao.getEnabled()
+        // 0. Smart Context Injection: Profile-Scoped Pinned + top relevant enabled User Memory Bank facts
+        val enabledMemoriesRaw = if (effectiveOptions.injectMemory) userMemoryDao.getEnabled() else emptyList()
+        val pinnedIds = if (enabledMemoriesRaw.isNotEmpty()) apiKeyVault.pinnedMemoryIdsFlow.first() else emptySet()
+        val profileMap = if (enabledMemoriesRaw.isNotEmpty()) apiKeyVault.memoryProfileMapFlow.first() else emptyMap()
+        val activeProfileName = effectiveOptions.activeMemoryProfile.name
+        val enabledMemories = if (activeProfileName == MemoryProfile.ALL.name) {
+            enabledMemoriesRaw
+        } else {
+            enabledMemoriesRaw.filter { m ->
+                val tag = profileMap[m.id] ?: "ALL"
+                tag.equals("ALL", ignoreCase = true) || tag.equals(activeProfileName, ignoreCase = true)
+            }
+        }
+        val selectedMemories = if (enabledMemories.isNotEmpty()) {
+            val queryTokens = normalizeMemoryTokens(latestUserText)
+            val pinned = enabledMemories.filter { it.id in pinnedIds }
+            val unpinnedRanked = enabledMemories
+                .filter { it.id !in pinnedIds }
+                .sortedWith(
+                    compareByDescending<UserMemoryEntity> { m ->
+                        val memTokens = normalizeMemoryTokens(m.fact + " " + m.category)
+                        if (queryTokens.isEmpty()) 0 else memTokens.intersect(queryTokens).size
+                    }.thenByDescending { it.createdAt }
+                )
+            (pinned + unpinnedRanked).take(12)
+        } else {
+            emptyList()
+        }
+
+        // Semantic Search Auto-Attach: attach top conceptual match across Docs, Live Lens scans, and Memory
+        if (effectiveOptions.semanticAutoAttach && latestUserText.length >= 4) {
+            val allMemInfo = enabledMemories.map { e ->
+                e.toDomain().copy(isPinned = e.id in pinnedIds, profile = profileMap[e.id] ?: "ALL")
+            }
+            val docs = knowledgeDocDao.getAll().map { it.toDomain() }
+            val lensHistory = LiveLensHistoryStore.loadAll(context)
+            val topHit = SemanticEmbeddingEngine.searchCorpus(
+                query = latestUserText,
+                memories = allMemInfo,
+                knowledgeDocs = docs,
+                lensHistory = lensHistory,
+                topK = 1,
+                minScore = 0.24f
+            ).firstOrNull()
+            if (topHit != null) {
+                extraContextBlocks += SemanticEmbeddingEngine.formatAutoAttachSnippet(topHit)
+                onGroundingStatus?.invoke("SEMANTIC // Auto-attached ${topHit.matchPercent}% match (${topHit.item.sourceType.badge}: ${topHit.item.title.take(28)})")
+            }
+        }
+
         val savedQuickContacts = quickContactsFlow.first()
         val contactsBlock = DeviceActionEngine.formatContactsForSystemPrompt(savedQuickContacts)
         val systemAddons = buildList {
             effectiveOptions.systemPrompt?.trim()?.takeIf { it.isNotEmpty() }?.let { add(it) }
-            if (enabledMemories.isNotEmpty()) {
+            if (effectiveOptions.outputFormatMode != OutputFormatMode.AUTO) {
+                add(effectiveOptions.outputFormatMode.directive)
+            }
+            if (selectedMemories.isNotEmpty()) {
                 add(
                     buildString {
-                        appendLine("### User Memory Bank (Persistent Preferences & Facts)")
-                        enabledMemories.forEach { m ->
-                            appendLine("- [${m.category}] ${m.fact}")
+                        appendLine("### User Memory Bank [PROFILE: $activeProfileName] (Respect Automatically)")
+                        selectedMemories.forEach { m ->
+                            val pinTag = if (m.id in pinnedIds) "[PINNED] " else ""
+                            appendLine("- $pinTag[${m.category}] ${m.fact}")
                         }
                     }.trim()
                 )
@@ -1721,6 +2046,8 @@ class AllChatRepository(
         var rawChunkCount = 0
         var thinkingStartMs: Long? = null
         var thinkingDurationSec: Int? = null
+        var latencyRecorded = false
+        val turnStartMs = System.currentTimeMillis()
 
         try {
             var toolRound = 0
@@ -1762,6 +2089,11 @@ class AllChatRepository(
                                 requestedToolCalls = event.calls
                             }
                             is StreamEvent.TextDelta -> {
+                                if (!latencyRecorded && event.text.isNotEmpty()) {
+                                    latencyRecorded = true
+                                    val ttftMs = (System.currentTimeMillis() - turnStartMs).coerceAtLeast(1L)
+                                    runCatching { apiKeyVault.recordModelLatency(activeModel.model.id, ttftMs) }
+                                }
                                 val prevText = buffer.toString()
                                 roundTextBuffer.append(event.text)
                                 buffer.append(event.text)
@@ -2282,6 +2614,7 @@ class AllChatRepository(
         selectableModel: SelectableModel,
         apiKey: String,
         prompt: String,
+        maxTokens: Int? = null,
         onPartial: suspend (String) -> Unit
     ): String {
         val sb = StringBuilder()
@@ -2289,7 +2622,8 @@ class AllChatRepository(
             provider = selectableModel.provider,
             apiKey = apiKey,
             modelId = selectableModel.model.modelId,
-            messages = listOf(ChatInputMessage(role = "USER", text = prompt))
+            messages = listOf(ChatInputMessage(role = "USER", text = prompt)),
+            options = ChatOptions(maxTokens = maxTokens, injectMemory = false)
         ).collect { ev ->
             if (ev is StreamEvent.TextDelta) {
                 sb.append(ev.text)
@@ -2714,23 +3048,36 @@ class AllChatRepository(
 
     // --- Direct Home Screen Widget Quick Ask (No Full App Launch) ---
 
+    data class WidgetQuickAskResult(
+        val modelLabel: String,
+        val answerText: String,
+        val deviceAction: DeviceAction? = null,
+        val deviceActions: List<DeviceAction> = listOfNotNull(deviceAction)
+    )
+
     suspend fun quickAskForWidget(
         prompt: String,
         history: List<Pair<String, String>> = emptyList(),
         onPartialUpdate: (modelLabel: String, partialText: String) -> Unit
-    ): Pair<String, String> = withContext(Dispatchers.IO) {
-        val trimmedPrompt = prompt.trim()
+    ): WidgetQuickAskResult = withContext(Dispatchers.IO) {
+        val rawTrimmed = prompt.trim()
+        val savedContacts = runCatching { quickContactsFlow.first() }.getOrDefault(emptyList())
+        val savedCustomApps = runCatching { customAppsFlow.first() }.getOrDefault(emptyList())
+        val trimmedPrompt = DeviceActionEngine.preprocessVoiceCommand(rawTrimmed, savedContacts)
 
         // 0a. Intercept /note <memo> from Home Screen Widget -> save structured Markdown note to Room
         if (trimmedPrompt.startsWith("/note ", ignoreCase = true) || trimmedPrompt.equals("/note", ignoreCase = true)) {
             val memoText = trimmedPrompt.removePrefix("/note").removePrefix("/NOTE").trim()
             if (memoText.isBlank()) {
-                return@withContext "NOTES" to "Type /note followed by your memo (e.g. /note Buy milk and send invoice tomorrow)."
+                return@withContext WidgetQuickAskResult(
+                    modelLabel = "NOTES",
+                    answerText = "Type /note followed by your memo (e.g. /note Buy milk and send invoice tomorrow)."
+                )
             }
             onPartialUpdate("NOTES", "Cleaning up note into structured Markdown…")
             val saved = saveVoiceQuickNote(memoText, resolvePreferredChatModel())
             val widgetReply = "SAVED NOTE: ${saved.title}\n\n${cleanWidgetAnswerText(saved.markdownContent)}"
-            return@withContext "VOICE NOTE" to widgetReply
+            return@withContext WidgetQuickAskResult("VOICE NOTE", widgetReply)
         }
 
         // 0b. Intercept custom Assistant Routine trigger phrases right from Home Screen Widget
@@ -2745,7 +3092,35 @@ class AllChatRepository(
             val cleanedSummary = cleanWidgetAnswerText(runResult.summaryText)
                 .ifBlank { "Routine \"${matchedRoutine.name}\" completed." }
             val actionSuffix = runResult.pendingDeviceAction?.let { "\n\nAction ready in AllChat: ${it.title}" } ?: ""
-            return@withContext runResult.modelLabel to (cleanedSummary + actionSuffix)
+            return@withContext WidgetQuickAskResult(
+                modelLabel = runResult.modelLabel,
+                answerText = cleanedSummary + actionSuffix,
+                deviceAction = runResult.pendingDeviceAction
+            )
+        }
+
+        // 0c. Direct Sequential Multi-Action Interception (Call, WhatsApp Voice/Video/Message, SMS, Alarm, Timer, Maps, YouTube, Apps)
+        val directChain = DeviceActionEngine.parseActionChainFromPrompt(trimmedPrompt, savedContacts, savedCustomApps)
+        if (directChain.isNotEmpty()) {
+            val firstAction = directChain.first()
+            val actionSummary = if (directChain.size > 1) {
+                "ACTION CHAIN (${directChain.size} STEPS) // " +
+                    directChain.mapIndexed { i, a -> "${i + 1}. ${a.title}" }.joinToString(" → ")
+            } else {
+                when (firstAction) {
+                    is DeviceAction.DialPhone -> firstAction.displayBanner
+                    is DeviceAction.WhatsAppCall -> firstAction.displayBanner
+                    is DeviceAction.SendWhatsApp -> "WHATSAPP // Ready for ${firstAction.contactLabel ?: firstAction.phoneNumber}" +
+                        if (firstAction.message.isNotBlank()) ": \"${firstAction.message}\"" else ""
+                    else -> "${firstAction.badge} // ${firstAction.title}"
+                }
+            }
+            return@withContext WidgetQuickAskResult(
+                modelLabel = if (directChain.size > 1) "CHAIN (${directChain.size})" else firstAction.badge,
+                answerText = actionSummary,
+                deviceAction = firstAction,
+                deviceActions = directChain
+            )
         }
 
         val available = observeModelsForCapability(ModelCapability.TEXT_CHAT).first()
@@ -2769,11 +3144,11 @@ class AllChatRepository(
             ?: available.first()
 
         val enabledMemories = userMemoryDao.getEnabled()
-        val savedContacts = quickContactsFlow.first()
         val contactsDirectory = DeviceActionEngine.formatContactsForSystemPrompt(savedContacts)
         val systemPrompt = buildString {
-            appendLine("You are AllChat running inside a compact Android Home Screen Widget.")
-            appendLine("Give a direct, accurate, concise answer in plain readable text (short paragraphs or brief bullets) so it fits cleanly on a widget.")
+            appendLine("You are AllChat running inside a compact Android Home Screen Widget with full Device Action tools.")
+            appendLine("When the user asks to call someone, message/WhatsApp someone, send an SMS or email, pay via UPI, navigate Maps, set an alarm/timer, play YouTube, or open an app, ALWAYS call the `execute_device_action` tool immediately using the Saved Contacts Directory below. NEVER reply with plain text like 'User wants to contact ...' without invoking `execute_device_action`.")
+            appendLine("For normal questions, give a direct, accurate, concise answer in plain readable text (short paragraphs or brief bullets) so it fits cleanly on a widget.")
             if (enabledMemories.isNotEmpty()) {
                 appendLine()
                 appendLine("User Memory Bank:")
@@ -2797,15 +3172,17 @@ class AllChatRepository(
                 .map { ChatInputMessage(role = it.role, text = it.content) }
         }
 
-        val fullInputMessages = buildList {
+        val inputMessages = mutableListOf<ChatInputMessage>().apply {
             addAll(priorMessages)
-            add(ChatInputMessage(role = "USER", text = prompt.trim()))
+            add(ChatInputMessage(role = "USER", text = trimmedPrompt))
         }
 
         val apiKey = getProviderApiKey(selectedModel.provider.id)
         val modelLabel = selectedModel.model.displayName
         val buffer = StringBuilder()
         var lastEmitMs = 0L
+        var triggeredDeviceAction: DeviceAction? = null
+        val triggeredDeviceActions = mutableListOf<DeviceAction>()
 
         var attempt = 0
         var lastNetworkError: Throwable? = null
@@ -2813,30 +3190,93 @@ class AllChatRepository(
             attempt++
             buffer.setLength(0)
             lastEmitMs = 0L
+            triggeredDeviceAction = null
+            triggeredDeviceActions.clear()
+            val workingMessages = inputMessages.toMutableList()
             try {
                 withTimeout(25_000L) {
-                    aiRouter.streamChat(
-                        provider = selectedModel.provider,
-                        apiKey = apiKey,
-                        modelId = selectedModel.model.modelId,
-                        messages = fullInputMessages,
-                        options = ChatOptions(
-                            systemPrompt = systemPrompt,
-                            maxTokens = 512,
-                            supportsVisionInput = selectedModel.model.supportsImageInput
-                        )
-                    ).collect { event ->
-                        if (event is StreamEvent.TextDelta) {
-                            buffer.append(event.text)
-                            val now = System.currentTimeMillis()
-                            if (now - lastEmitMs >= 350L) {
-                                lastEmitMs = now
-                                val cleaned = cleanWidgetAnswerText(buffer.toString())
-                                if (cleaned.isNotBlank()) {
-                                    onPartialUpdate(modelLabel, cleaned)
+                    var toolRound = 0
+                    val maxToolRounds = 2
+                    while (toolRound <= maxToolRounds) {
+                        val roundText = StringBuilder()
+                        var requestedTools: List<ToolCallInvocation> = emptyList()
+                        aiRouter.streamChat(
+                            provider = selectedModel.provider,
+                            apiKey = apiKey,
+                            modelId = selectedModel.model.modelId,
+                            messages = workingMessages.toList(),
+                            options = ChatOptions(
+                                systemPrompt = systemPrompt,
+                                maxTokens = 512,
+                                enableTools = true,
+                                supportsVisionInput = selectedModel.model.supportsImageInput
+                            )
+                        ).collect { event ->
+                            when (event) {
+                                is StreamEvent.TextDelta -> {
+                                    roundText.append(event.text)
+                                    buffer.append(event.text)
+                                    val now = System.currentTimeMillis()
+                                    if (now - lastEmitMs >= 350L) {
+                                        lastEmitMs = now
+                                        val cleaned = cleanWidgetAnswerText(buffer.toString())
+                                        if (cleaned.isNotBlank()) {
+                                            onPartialUpdate(modelLabel, cleaned)
+                                        }
+                                    }
                                 }
+                                is StreamEvent.ToolCallRequest -> {
+                                    requestedTools = event.calls
+                                }
+                                else -> Unit
                             }
                         }
+
+                        if (requestedTools.isEmpty() || toolRound >= maxToolRounds) {
+                            break
+                        }
+
+                        workingMessages += ChatInputMessage(
+                            role = "ASSISTANT",
+                            text = roundText.toString(),
+                            toolCalls = requestedTools
+                        )
+                        for (tc in requestedTools) {
+                            onPartialUpdate(modelLabel, "TOOL // Executing ${tc.name}…")
+                            val outcome = ClientToolEngine.executeTool(
+                                name = tc.name,
+                                argumentsJson = tc.argumentsJson,
+                                webSearchClient = webSearchClient,
+                                contacts = savedContacts,
+                                customApps = savedCustomApps
+                            )
+                            outcome.triggeredDeviceAction?.let { triggered ->
+                                val enriched = when (triggered) {
+                                    is DeviceAction.DialPhone -> if (triggered.contactLabel.isNullOrBlank() && triggered.phoneNumber.isNotBlank()) {
+                                        val byPhone = DeviceActionEngine.resolveContactByPhone(triggered.phoneNumber, savedContacts)
+                                        if (byPhone != null) triggered.copy(contactLabel = byPhone.name) else triggered
+                                    } else triggered
+                                    is DeviceAction.WhatsAppCall -> if (triggered.contactLabel.isNullOrBlank() && triggered.phoneNumber.isNotBlank()) {
+                                        val byPhone = DeviceActionEngine.resolveContactByPhone(triggered.phoneNumber, savedContacts)
+                                        if (byPhone != null) triggered.copy(contactLabel = byPhone.name) else triggered
+                                    } else triggered
+                                    else -> triggered
+                                }
+                                triggeredDeviceActions += enriched
+                                if (triggeredDeviceAction == null) triggeredDeviceAction = enriched
+                            }
+                            workingMessages += ChatInputMessage(
+                                role = "TOOL",
+                                text = outcome.resultJson,
+                                toolCallId = tc.id,
+                                toolName = tc.name
+                            )
+                        }
+                        if (triggeredDeviceActions.isNotEmpty()) {
+                            // Device action(s) resolved cleanly — no need to wait for another verbose LLM round
+                            break
+                        }
+                        toolRound++
                     }
                 }
                 lastNetworkError = null
@@ -2861,19 +3301,49 @@ class AllChatRepository(
             throw lastNetworkError
         }
 
-        val finalAnswer = cleanWidgetAnswerText(buffer.toString())
-            .ifBlank { "No response received from $modelLabel." }
+        // Fallback plain-text action interceptor if model replied with text instead of calling execute_device_action
+        if (triggeredDeviceActions.isEmpty() && buffer.isNotBlank()) {
+            DeviceActionEngine.parseFromAssistantReply(
+                userPrompt = trimmedPrompt,
+                assistantReply = buffer.toString(),
+                contacts = savedContacts,
+                customApps = savedCustomApps
+            )?.let { fallbackAction ->
+                triggeredDeviceActions += fallbackAction
+                triggeredDeviceAction = fallbackAction
+            }
+        }
+
+        val resolvedAction = triggeredDeviceActions.firstOrNull() ?: triggeredDeviceAction
+        val finalAnswer = when {
+            triggeredDeviceActions.size > 1 ->
+                "ACTION CHAIN (${triggeredDeviceActions.size} STEPS) // " +
+                    triggeredDeviceActions.mapIndexed { i, a -> "${i + 1}. ${a.title}" }.joinToString(" → ")
+            resolvedAction is DeviceAction.DialPhone -> resolvedAction.displayBanner
+            resolvedAction is DeviceAction.WhatsAppCall -> resolvedAction.displayBanner
+            resolvedAction is DeviceAction.SendWhatsApp ->
+                "WHATSAPP // Ready for ${resolvedAction.contactLabel ?: resolvedAction.phoneNumber}" +
+                    if (resolvedAction.message.isNotBlank()) ": \"${resolvedAction.message}\"" else ""
+            resolvedAction != null -> "${resolvedAction.badge} // ${resolvedAction.title}"
+            else -> cleanWidgetAnswerText(buffer.toString())
+                .ifBlank { "No response received from $modelLabel." }
+        }
 
         // Persist the widget Q&A turn into the shared active conversation in Room
         runCatching {
             appendInstantExchange(
                 conversationId = activeConvId,
-                userText = prompt.trim(),
+                userText = trimmedPrompt,
                 assistantText = finalAnswer,
-                modelLabel = modelLabel
+                modelLabel = resolvedAction?.badge ?: modelLabel
             )
         }
-        modelLabel to finalAnswer
+        WidgetQuickAskResult(
+            modelLabel = if (triggeredDeviceActions.size > 1) "CHAIN (${triggeredDeviceActions.size})" else resolvedAction?.badge ?: modelLabel,
+            answerText = finalAnswer,
+            deviceAction = resolvedAction,
+            deviceActions = triggeredDeviceActions.ifEmpty { listOfNotNull(resolvedAction) }
+        )
     }
 
     private fun cleanWidgetAnswerText(raw: String): String {
@@ -3178,6 +3648,8 @@ class AllChatRepository(
         mode: LiveLensMode,
         targetLanguage: String,
         preferredModel: SelectableModel?,
+        overlayTranslateMode: Boolean = false,
+        multiBoxCount: Int = 0,
         onModelFailover: ((String) -> Unit)? = null
     ): LiveLensAnalysisResult = withContext(Dispatchers.IO) {
         val available = observeModelsForCapability(ModelCapability.TEXT_CHAT).first()
@@ -3219,28 +3691,59 @@ class AllChatRepository(
         val (imgBase64, imgMime) = ImageEncoder.encodeFromStoredUri(context, savedUri)
             ?: throw IllegalStateException("Could not encode live camera frame.")
 
-        val systemInstruction = when (mode) {
-            LiveLensMode.AUTO_EXPLAIN ->
-                "Identify, explain, and summarize what is shown in this image clearly and concisely without waiting for further questions."
-            LiveLensMode.LIVE_TRANSLATOR ->
-                "Extract all visible text in this image and translate it cleanly into $targetLanguage, preserving layout context."
-            LiveLensMode.SOLVE_STEP_BY_STEP ->
-                "You are an expert STEM, mathematics, physics, and engineering tutor. Carefully read all equations, expressions, homework problems, or technical diagrams in this image. Solve them clearly step-by-step. Use standard LaTeX math formatting with inline \$...\$ and display \$\$...\$\$ equations, verify your arithmetic/algebra, and highlight the **Final Answer** clearly at the end."
-            LiveLensMode.WHITEBOARD_TO_CODE ->
-                "You are an expert UI Engineer and Systems Architect. Inspect this hand-drawn sketch, wireframe, flowchart, circuit diagram, or truth table. If it is a UI wireframe, generate a complete, self-contained single-file HTML+CSS responsive working UI wrapped in ```html ... ```. If it is a flowchart, block diagram, state machine, or table, convert it into clean Mermaid.js code wrapped in ```mermaid ... ``` AND a LaTeX tabular/equation block."
+        val multiBoxHint = if (multiBoxCount >= 2) {
+            "\nThis composite image contains $multiBoxCount cropped regions labeled [Q1]..[Q$multiBoxCount]. Address EVERY labeled region in order cleanly."
+        } else {
+            ""
         }
-        val userPrompt = when (mode) {
-            LiveLensMode.AUTO_EXPLAIN ->
+
+        val systemInstruction = when {
+            overlayTranslateMode ->
+                """You are an on-screen visual translator. Detect every distinct foreign-language text block, sign, label, or manual line in this image and translate it cleanly into $targetLanguage.
+Return ONLY a valid JSON array of objects using normalized coordinates (0.0 to 1.0 relative to image width/height):
+[{"original":"...", "translated":"...", "x":0.10, "y":0.18, "w":0.65, "h":0.10}]
+Keep translations crisp and natural. Limit to the 8 most prominent text blocks.""".trimIndent()
+            mode == LiveLensMode.AUTO_EXPLAIN ->
+                "Identify, explain, and summarize what is shown in this image clearly and concisely without waiting for further questions.$multiBoxHint"
+            mode == LiveLensMode.LIVE_TRANSLATOR ->
+                "Extract all visible text in this image and translate it cleanly into $targetLanguage, preserving layout context.$multiBoxHint"
+            mode == LiveLensMode.SOLVE_STEP_BY_STEP ->
+                """You are an expert STEM, mathematics, physics, circuit analysis, and code debugging tutor.$multiBoxHint
+Carefully read the equation, circuit derivation, or error shown in this image and solve it cleanly in structured steps.
+Format EVERY step strictly using these headings so the UI can render collapsible interactive cards:
+### STEP 01: <Short Step Title>
+<Clear working with standard LaTeX math formatting using inline ${'$'}...${'$'} or display ${'$'}${'$'}...${'$'}${'$'} where appropriate>
+WHY: <1-2 crisp sentences explaining the underlying formula, theorem, law, or debugging rule used in this step>
+
+### STEP 02: <Short Step Title>
+<Working>
+WHY: <1-2 crisp sentences explaining why this step is valid>
+
+### FINAL RESULT:
+<Verified final answer clearly highlighted>""".trimIndent()
+            else ->
+                "You are an expert UI Engineer and Systems Architect.$multiBoxHint Inspect this hand-drawn sketch, wireframe, flowchart, circuit diagram, or truth table. If it is a UI wireframe, generate a complete, self-contained single-file HTML+CSS responsive working UI wrapped in ```html ... ```. If it is a flowchart, block diagram, state machine, or table, convert it into clean Mermaid.js code wrapped in ```mermaid ... ``` AND a LaTeX tabular/equation block."
+        }
+        val userPrompt = when {
+            overlayTranslateMode ->
+                "Detect and translate all visible text blocks in this frame into $targetLanguage with normalized (x, y, w, h) coordinates."
+            multiBoxCount >= 2 && mode == LiveLensMode.SOLVE_STEP_BY_STEP ->
+                "Solve all $multiBoxCount labeled regions ([Q1]..[Q$multiBoxCount]) in this stitched composite image using structured STEP 01 / WHY / FINAL RESULT cards."
+            multiBoxCount >= 2 ->
+                "Analyze all $multiBoxCount labeled regions ([Q1]..[Q$multiBoxCount]) in this stitched composite image clearly in order."
+            mode == LiveLensMode.AUTO_EXPLAIN ->
                 "Analyze this live view right now."
-            LiveLensMode.LIVE_TRANSLATOR ->
+            mode == LiveLensMode.LIVE_TRANSLATOR ->
                 "Read all visible text in this image and translate it cleanly into $targetLanguage."
-            LiveLensMode.SOLVE_STEP_BY_STEP ->
-                "Solve the math equation, homework problem, or technical diagram shown in this image step-by-step using LaTeX math notation."
-            LiveLensMode.WHITEBOARD_TO_CODE ->
+            mode == LiveLensMode.SOLVE_STEP_BY_STEP ->
+                "Solve the math equation, physics/circuit derivation, or code error shown in this image using the structured STEP 01 / WHY / FINAL RESULT format."
+            else ->
                 "Digitize this hand-drawn wireframe, diagram, or whiteboard sketch into clean runnable HTML/CSS or Mermaid/LaTeX code."
         }
-        val maxLensTokens = when (mode) {
-            LiveLensMode.SOLVE_STEP_BY_STEP, LiveLensMode.WHITEBOARD_TO_CODE -> 1600
+        val maxLensTokens = when {
+            overlayTranslateMode -> 1000
+            multiBoxCount >= 2 -> 2000
+            mode == LiveLensMode.SOLVE_STEP_BY_STEP || mode == LiveLensMode.WHITEBOARD_TO_CODE -> 1600
             else -> 720
         }
 
@@ -3251,6 +3754,7 @@ class AllChatRepository(
             val candidate = attemptOrder[index]
             val apiKey = getProviderApiKey(candidate.provider.id)
             val buffer = StringBuilder()
+            val reqStart = System.currentTimeMillis()
             try {
                 withTimeout(35_000L) {
                     aiRouter.streamChat(
@@ -3265,14 +3769,43 @@ class AllChatRepository(
                                 imageMimeType = imgMime
                             )
                         ),
-                        options = ChatOptions(systemPrompt = systemInstruction, maxTokens = maxLensTokens)
+                        options = ChatOptions(
+                            systemPrompt = systemInstruction,
+                            maxTokens = maxLensTokens,
+                            injectMemory = false
+                        )
                     ).collect { event ->
                         if (event is StreamEvent.TextDelta) {
                             buffer.append(event.text)
                         }
                     }
                 }
+                val elapsed = (System.currentTimeMillis() - reqStart).coerceAtLeast(1L)
+                runCatching { apiKeyVault.recordModelLatency(candidate.model.id, elapsed) }
+
                 val rawOut = buffer.toString()
+                if (overlayTranslateMode) {
+                    val regions = parseLiveLensOverlayRegions(rawOut)
+                    val summaryText = if (regions.isNotEmpty()) {
+                        regions.joinToString("\n") { r ->
+                            if (r.original.isNotBlank() && !r.original.equals(r.translated, ignoreCase = true)) {
+                                "${r.translated}  (${r.original})"
+                            } else {
+                                r.translated
+                            }
+                        }
+                    } else {
+                        cleanWidgetAnswerText(rawOut)
+                            .ifBlank { "No readable text detected in this frame." }
+                    }
+                    return@withContext LiveLensAnalysisResult(
+                        modelLabel = "${candidate.model.displayName} · ${candidate.provider.name}",
+                        answer = summaryText,
+                        failoverNotice = lastFailoverNotice,
+                        overlayRegions = regions
+                    )
+                }
+
                 val resultText = if (mode == LiveLensMode.SOLVE_STEP_BY_STEP) {
                     stripReasoningTagsOnly(rawOut)
                         .ifBlank { "Could not read equations or diagram details. Hold steady and try again." }
@@ -3298,7 +3831,6 @@ class AllChatRepository(
                 if (t is kotlinx.coroutines.CancellationException) throw t
                 lastError = t
                 if (isRateLimitError(t)) {
-                    // Put rate-limited model on 60-second cooldown and auto-switch immediately!
                     markModelRateLimited(candidate.model.id)
                     if (index + 1 < attemptOrder.size) {
                         val next = attemptOrder[index + 1]
@@ -3314,6 +3846,68 @@ class AllChatRepository(
         }
 
         throw lastError ?: IllegalStateException("All configured vision models are currently rate-limited. Wait 60s or add another provider in Settings.")
+    }
+
+    private fun parseLiveLensOverlayRegions(rawOut: String): List<LiveLensOverlayRegion> {
+        val cleaned = stripReasoningTagsOnly(rawOut).trim()
+        val jsonArrStr = extractJsonArray(cleaned)
+        if (jsonArrStr != null) {
+            val parsed = runCatching {
+                val arr = JSONArray(jsonArrStr)
+                buildList {
+                    for (i in 0 until arr.length().coerceAtMost(10)) {
+                        val obj = arr.optJSONObject(i) ?: continue
+                        val translated = obj.optString("translated").trim()
+                        if (translated.isBlank()) continue
+                        val original = obj.optString("original").trim()
+                        val x = obj.optDouble("x", 0.08).toFloat().coerceIn(0.02f, 0.85f)
+                        val y = obj.optDouble("y", (0.14 + i * 0.11).coerceAtMost(0.84)).toFloat().coerceIn(0.04f, 0.86f)
+                        val w = obj.optDouble("w", 0.72).toFloat().coerceIn(0.15f, 0.94f)
+                        val h = obj.optDouble("h", 0.09).toFloat().coerceIn(0.05f, 0.35f)
+                        add(LiveLensOverlayRegion(original, translated, x, y, w, h))
+                    }
+                }
+            }.getOrDefault(emptyList())
+            if (parsed.isNotEmpty()) return parsed
+        }
+        // Clean fallback: stack non-empty translated lines neatly across the frame
+        val lines = cleanWidgetAnswerText(rawOut)
+            .lines()
+            .map { it.trim().trimStart('-', '*', '•', ' ') }
+            .filter { it.isNotBlank() }
+            .take(6)
+        return lines.mapIndexed { idx, line ->
+            LiveLensOverlayRegion(
+                original = "",
+                translated = line,
+                x = 0.07f,
+                y = (0.16f + idx * 0.115f).coerceAtMost(0.82f),
+                w = 0.86f,
+                h = 0.09f
+            )
+        }
+    }
+
+    suspend fun explainSolverStepWhy(
+        stepTitle: String,
+        stepBody: String,
+        problemSummary: String,
+        preferredModel: SelectableModel?
+    ): String = withContext(Dispatchers.IO) {
+        val model = preferredModel ?: resolvePreferredChatModel()
+            ?: return@withContext "Configure a model in Settings to expand step formulas."
+        val apiKey = getProviderApiKey(model.provider.id)
+        val prompt = """
+            In 2 short, crystal-clear sentences, explain the underlying mathematical formula, physics/circuit law, or programming rule used in this step:
+            Step: $stepTitle
+            Work: ${stepBody.take(500)}
+            Context: ${problemSummary.take(400)}
+        """.trimIndent()
+        val raw = runCatching {
+            collectSingleCompletion(model, apiKey, prompt) {}
+        }.getOrDefault("")
+        stripReasoningTagsOnly(raw).trim()
+            .ifBlank { "This step applies the standard transformation rule to simplify the expression toward the final result." }
     }
 
     suspend fun resolvePreferredChatModel(): SelectableModel? = withContext(Dispatchers.IO) {

@@ -14,8 +14,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material.icons.outlined.PushPin
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -34,9 +37,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import androidx.compose.material.icons.outlined.Search
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.example.domain.model.MemoryProfile
 import com.example.domain.model.UserMemoryInfo
+import com.example.util.SemanticEmbeddingEngine
 import com.example.ui.theme.SwissCanvas
 import com.example.ui.theme.SwissInk
 import com.example.ui.theme.SwissMuted
@@ -49,17 +57,52 @@ import com.example.ui.theme.SwissWhite
 fun MemoryBankDialog(
     memories: List<UserMemoryInfo>,
     autoExtractEnabled: Boolean,
+    activeProfile: MemoryProfile = MemoryProfile.ALL,
+    semanticAutoAttachEnabled: Boolean = false,
+    onSelectProfile: (MemoryProfile) -> Unit = {},
+    onToggleSemanticAutoAttach: (Boolean) -> Unit = {},
     onToggleAutoExtract: (Boolean) -> Unit,
-    onAddMemory: (fact: String, category: String) -> Unit,
+    onAddMemory: (fact: String, category: String, profile: String) -> Unit,
     onUpdateMemory: (UserMemoryInfo) -> Unit,
     onToggleMemory: (Long, Boolean) -> Unit,
+    onTogglePinMemory: (Long, Boolean) -> Unit = { _, _ -> },
     onDeleteMemory: (Long) -> Unit,
+    onClearAllMemories: () -> Unit = {},
     onDismiss: () -> Unit
 ) {
     var factInput by remember { mutableStateOf("") }
     var selectedCategory by remember { mutableStateOf("Preference") }
+    var selectedFactProfile by remember(activeProfile) { mutableStateOf(activeProfile.name) }
     var editingMemory by remember { mutableStateOf<UserMemoryInfo?>(null) }
+    var showClearConfirm by remember { mutableStateOf(false) }
+    var searchQuery by remember { mutableStateOf("") }
+    var semanticMode by remember { mutableStateOf(true) }
+    var semanticRanked by remember { mutableStateOf<List<Pair<UserMemoryInfo, Int>>>(emptyList()) }
     val categories = listOf("Preference", "Tech", "Profile", "Workflow")
+    val profileScopedMemories = remember(memories, activeProfile) {
+        if (activeProfile == MemoryProfile.ALL) memories
+        else memories.filter {
+            it.profile.equals("ALL", ignoreCase = true) ||
+                it.profile.equals(activeProfile.name, ignoreCase = true)
+        }
+    }
+
+    LaunchedEffect(searchQuery, semanticMode, profileScopedMemories) {
+        val q = searchQuery.trim()
+        if (q.isEmpty()) {
+            semanticRanked = profileScopedMemories.map { it to 100 }
+        } else if (semanticMode) {
+            semanticRanked = SemanticEmbeddingEngine.rankMemories(q, profileScopedMemories)
+        } else {
+            semanticRanked = profileScopedMemories
+                .filter {
+                    it.fact.contains(q, ignoreCase = true) ||
+                        it.category.contains(q, ignoreCase = true) ||
+                        it.profile.contains(q, ignoreCase = true)
+                }
+                .map { it to 100 }
+        }
+    }
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -131,6 +174,91 @@ fun MemoryBankDialog(
                     )
                 }
 
+                // Profile Filter Bar (STUDY / WORK / PERSONAL / ALL) + Semantic Search Controls
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(SwissPaper)
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("PROFILE:", style = MaterialTheme.typography.labelSmall, color = SwissMuted)
+                        MemoryProfile.entries.forEach { prof ->
+                            val isSelected = activeProfile == prof
+                            Text(
+                                text = prof.label,
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                color = if (isSelected) SwissWhite else SwissInk,
+                                modifier = Modifier
+                                    .background(if (isSelected) SwissSignalRed else SwissSubtleFill, RectangleShape)
+                                    .border(1.dp, SwissInk, RectangleShape)
+                                    .clickable { onSelectProfile(prof) }
+                                    .padding(horizontal = 7.dp, vertical = 4.dp)
+                                    .testTag("memory_profile_tab_${prof.name.lowercase()}")
+                            )
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedTextField(
+                            value = searchQuery,
+                            onValueChange = { searchQuery = it },
+                            placeholder = {
+                                Text(
+                                    if (semanticMode) "Semantic concept search…" else "Keyword search…",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            },
+                            leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null) },
+                            singleLine = true,
+                            shape = RectangleShape,
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("memory_semantic_search_input")
+                        )
+                        Text(
+                            text = if (semanticMode) "SEMANTIC" else "KEYWORD",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                            color = if (semanticMode) SwissWhite else SwissInk,
+                            modifier = Modifier
+                                .background(if (semanticMode) SwissInk else SwissPaper, RectangleShape)
+                                .border(1.dp, SwissInk, RectangleShape)
+                                .clickable { semanticMode = !semanticMode }
+                                .padding(horizontal = 8.dp, vertical = 14.dp)
+                                .testTag("memory_semantic_mode_toggle")
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onToggleSemanticAutoAttach(!semanticAutoAttachEnabled) }
+                            .testTag("memory_semantic_auto_attach_toggle"),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "SEMANTIC AUTO-ATTACH TOP MATCH ON SEND",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (semanticAutoAttachEnabled) SwissSignalRed else SwissMuted
+                        )
+                        Text(
+                            text = if (semanticAutoAttachEnabled) "[ ON ]" else "[ OFF ]",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                            color = if (semanticAutoAttachEnabled) SwissSignalRed else SwissInk
+                        )
+                    }
+                }
+
                 // Add / Edit Composer
                 Column(
                     modifier = Modifier
@@ -161,7 +289,7 @@ fun MemoryBankDialog(
                         OutlinedTextField(
                             value = factInput,
                             onValueChange = { factInput = it },
-                            placeholder = { Text("e.g. I code in Kotlin/Compose and prefer concise bullet answers") },
+                            placeholder = { Text("Add fact to [$selectedFactProfile] profile (contradictions auto-overwrite)") },
                             shape = RectangleShape,
                             singleLine = false,
                             maxLines = 2,
@@ -177,10 +305,10 @@ fun MemoryBankDialog(
                                     if (clean.isNotEmpty()) {
                                         val editTarget = editingMemory
                                         if (editTarget != null) {
-                                            onUpdateMemory(editTarget.copy(fact = clean, category = selectedCategory))
+                                            onUpdateMemory(editTarget.copy(fact = clean, category = selectedCategory, profile = selectedFactProfile))
                                             editingMemory = null
                                         } else {
-                                            onAddMemory(clean, selectedCategory)
+                                            onAddMemory(clean, selectedCategory, selectedFactProfile)
                                         }
                                         factInput = ""
                                     }
@@ -205,43 +333,84 @@ fun MemoryBankDialog(
                         .padding(12.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    if (memories.isEmpty()) {
+                    if (semanticRanked.isEmpty()) {
                         item {
                             Text(
-                                text = "NO MEMORIES SAVED YET // Type /remember <fact> in Chat or add a preference above.",
+                                text = if (memories.isEmpty()) {
+                                    "NO MEMORIES SAVED YET // Type /remember <fact> in Chat or add a preference above."
+                                } else {
+                                    "NO MATCHES IN [${activeProfile.label}] PROFILE // Try switching profile to ALL or adjusting query."
+                                },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = SwissMuted,
                                 modifier = Modifier.padding(12.dp)
                             )
                         }
                     } else {
-                        items(memories, key = { it.id }) { mem ->
+                        items(semanticRanked, key = { it.first.id }) { (mem, matchPct) ->
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .background(if (mem.isEnabled) SwissPaper else SwissSubtleFill)
-                                    .border(1.dp, SwissInk, RectangleShape)
+                                    .border(
+                                        width = if (mem.isPinned) 1.5.dp else 1.dp,
+                                        color = if (mem.isPinned) SwissSignalRed else SwissInk,
+                                        shape = RectangleShape
+                                    )
                                     .padding(horizontal = 10.dp, vertical = 8.dp),
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
                                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        if (mem.isPinned) {
+                                            Text(
+                                                text = "PINNED",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = SwissWhite,
+                                                modifier = Modifier
+                                                    .background(SwissSignalRed, RectangleShape)
+                                                    .padding(horizontal = 4.dp, vertical = 1.dp)
+                                            )
+                                        }
+                                        Text(
+                                            text = "[${mem.profile}]",
+                                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                            color = SwissInk
+                                        )
                                         Text(
                                             text = "[${mem.category.uppercase()}]",
                                             style = MaterialTheme.typography.labelSmall,
                                             color = SwissSignalRed
                                         )
-                                        Text(
-                                            text = mem.source.uppercase(),
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = SwissMuted
-                                        )
+                                        if (searchQuery.isNotBlank() && semanticMode) {
+                                            Text(
+                                                text = "${matchPct}% MATCH",
+                                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                                color = SwissSignalRed
+                                            )
+                                        } else {
+                                            Text(
+                                                text = mem.source.uppercase(),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = SwissMuted
+                                            )
+                                        }
                                     }
                                     Text(
                                         text = mem.fact,
                                         style = MaterialTheme.typography.bodyMedium,
                                         color = if (mem.isEnabled) SwissInk else SwissMuted
+                                    )
+                                }
+                                IconButton(
+                                    onClick = { onTogglePinMemory(mem.id, !mem.isPinned) },
+                                    modifier = Modifier.testTag("memory_dialog_pin_${mem.id}")
+                                ) {
+                                    Icon(
+                                        imageVector = if (mem.isPinned) Icons.Filled.PushPin else Icons.Outlined.PushPin,
+                                        contentDescription = if (mem.isPinned) "Unpin memory" else "Pin memory",
+                                        tint = if (mem.isPinned) SwissSignalRed else SwissInk
                                     )
                                 }
                                 Switch(
@@ -266,7 +435,71 @@ fun MemoryBankDialog(
                         }
                     }
                 }
+
+                if (memories.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(SwissPaper)
+                            .border(1.dp, SwissInk, RectangleShape)
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "${memories.count { it.isPinned }} pinned · always included",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SwissMuted
+                        )
+                        Text(
+                            text = "[ CLEAR ALL MEMORY ]",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SwissSignalRed,
+                            modifier = Modifier
+                                .clickable { showClearConfirm = true }
+                                .padding(horizontal = 6.dp, vertical = 4.dp)
+                                .testTag("memory_dialog_clear_all")
+                        )
+                    }
+                }
             }
         }
+    }
+
+    if (showClearConfirm) {
+        AlertDialog(
+            onDismissRequest = { showClearConfirm = false },
+            containerColor = SwissCanvas,
+            shape = RectangleShape,
+            title = {
+                Text("CLEAR ALL MEMORY?", style = MaterialTheme.typography.titleMedium, color = SwissInk)
+            },
+            text = {
+                Text(
+                    "Remove all ${memories.size} saved user facts and pinned preferences?",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = SwissMuted
+                )
+            },
+            confirmButton = {
+                SwissButton(
+                    text = "Clear All",
+                    variant = SwissButtonVariant.PRIMARY,
+                    minHeight = 40.dp,
+                    onClick = {
+                        showClearConfirm = false
+                        onClearAllMemories()
+                    }
+                )
+            },
+            dismissButton = {
+                SwissButton(
+                    text = "Cancel",
+                    variant = SwissButtonVariant.OUTLINE,
+                    minHeight = 40.dp,
+                    onClick = { showClearConfirm = false }
+                )
+            }
+        )
     }
 }

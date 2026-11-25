@@ -21,7 +21,9 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.outlined.Image
+import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -69,7 +71,10 @@ fun ModelPickerButton(
     openTrigger: Int = 0,
     supportsAutoRoute: Boolean = false,
     isAutoRouteEnabled: Boolean = false,
-    onSelectAutoRoute: (() -> Unit)? = null
+    onSelectAutoRoute: (() -> Unit)? = null,
+    pinnedModelIds: List<Long> = emptyList(),
+    modelLatencyMs: Map<Long, Long> = emptyMap(),
+    onTogglePinModel: ((Long) -> Unit)? = null
 ) {
     var showSheet by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf("") }
@@ -382,73 +387,74 @@ fun ModelPickerButton(
                                         }
                                     }
                                 }
-                                items(filteredModels, key = { it.model.id }) { item ->
-                                    val isSelected = !isAutoRouteEnabled && item.model.id == selectedModel?.model?.id
-                                    val rowBg = if (isSelected) SwissInk else SwissPaper
-                                    val rowFg = if (isSelected) SwissWhite else SwissInk
-                                    val rowSub = if (isSelected) SwissConcrete else SwissMuted
+                                val pinnedModelsOrdered = pinnedModelIds.mapNotNull { pid ->
+                                    filteredModels.firstOrNull { it.model.id == pid }
+                                }
+                                val pinnedIdSet = pinnedModelsOrdered.map { it.model.id }.toSet()
+                                val unpinnedModels = filteredModels.filter { it.model.id !in pinnedIdSet }
 
-                                    Column(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .background(rowBg)
-                                            .clickable {
-                                                onSelectModel(item)
-                                                showSheet = false
-                                            }
-                                            .testTag("model_option_${item.model.modelId}")
-                                    ) {
+                                if (pinnedModelsOrdered.isNotEmpty()) {
+                                    item(key = "pinned_models_header") {
                                         Row(
                                             modifier = Modifier
                                                 .fillMaxWidth()
-                                                .padding(horizontal = 14.dp, vertical = 12.dp),
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.SpaceBetween
-                                        ) {
-                                            Column(modifier = Modifier.weight(1f)) {
-                                                Text(
-                                                    text = item.model.displayName,
-                                                    style = MaterialTheme.typography.titleSmall,
-                                                    color = rowFg,
-                                                    maxLines = 1,
-                                                    overflow = TextOverflow.Ellipsis
-                                                )
-                                                Text(
-                                                    text = "${item.provider.name.uppercase()} / ${item.model.modelId}",
-                                                    style = MaterialTheme.typography.labelSmall,
-                                                    color = rowSub,
-                                                    maxLines = 1,
-                                                    overflow = TextOverflow.Ellipsis
-                                                )
-                                            }
-                                            Row(
-                                                verticalAlignment = Alignment.CenterVertically,
-                                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                            ) {
-                                                if (item.model.supportsImageInput) {
-                                                    SwissBadge(
-                                                        text = "VIS",
-                                                        containerColor = if (isSelected) SwissPaper else SwissConcrete,
-                                                        contentColor = SwissInk
-                                                    )
-                                                }
-                                                if (isSelected) {
-                                                    SwissBadge(
-                                                        text = "ACTIVE",
-                                                        containerColor = SwissSignalRed,
-                                                        contentColor = SwissWhite,
-                                                        borderColor = SwissSignalRed
-                                                    )
-                                                }
-                                            }
-                                        }
-                                        Box(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .height(1.dp)
                                                 .background(SwissInk)
+                                                .padding(horizontal = 14.dp, vertical = 6.dp),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Text(
+                                                text = "PINNED FAVORITES (${pinnedModelIds.size}/4) // LOCKED AT TOP",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = SwissSignalRed
+                                            )
+                                            Text(
+                                                text = "LIVE LATENCY",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = SwissConcrete
+                                            )
+                                        }
+                                    }
+                                    items(pinnedModelsOrdered, key = { "pinned_${it.model.id}" }) { item ->
+                                        ModelPickerRowItem(
+                                            item = item,
+                                            isSelected = !isAutoRouteEnabled && item.model.id == selectedModel?.model?.id,
+                                            isPinned = true,
+                                            latencyMs = modelLatencyMs[item.model.id],
+                                            onSelect = {
+                                                onSelectModel(item)
+                                                showSheet = false
+                                            },
+                                            onTogglePin = onTogglePinModel?.let { cb -> { cb(item.model.id) } }
                                         )
                                     }
+                                    if (unpinnedModels.isNotEmpty()) {
+                                        item(key = "all_models_header") {
+                                            Text(
+                                                text = "ALL ${requiredCapability.label.uppercase()} MODELS (${unpinnedModels.size})",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = SwissMuted,
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .background(SwissCanvas)
+                                                    .padding(horizontal = 14.dp, vertical = 6.dp)
+                                            )
+                                        }
+                                    }
+                                }
+
+                                items(unpinnedModels, key = { it.model.id }) { item ->
+                                    ModelPickerRowItem(
+                                        item = item,
+                                        isSelected = !isAutoRouteEnabled && item.model.id == selectedModel?.model?.id,
+                                        isPinned = false,
+                                        latencyMs = modelLatencyMs[item.model.id],
+                                        onSelect = {
+                                            onSelectModel(item)
+                                            showSheet = false
+                                        },
+                                        onTogglePin = onTogglePinModel?.let { cb -> { cb(item.model.id) } }
+                                    )
                                 }
                             }
                         }
@@ -457,5 +463,100 @@ fun ModelPickerButton(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun ModelPickerRowItem(
+    item: SelectableModel,
+    isSelected: Boolean,
+    isPinned: Boolean,
+    latencyMs: Long?,
+    onSelect: () -> Unit,
+    onTogglePin: (() -> Unit)?
+) {
+    val rowBg = if (isSelected) SwissInk else SwissPaper
+    val rowFg = if (isSelected) SwissWhite else SwissInk
+    val rowSub = if (isSelected) SwissConcrete else SwissMuted
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(rowBg)
+            .clickable(onClick = onSelect)
+            .testTag("model_option_${item.model.modelId}")
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = item.model.displayName,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = rowFg,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = "${item.provider.name.uppercase()} / ${item.model.modelId}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = rowSub,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                if (latencyMs != null && latencyMs > 0L) {
+                    SwissBadge(
+                        text = "${latencyMs}ms",
+                        containerColor = if (isSelected) SwissPaper else SwissCanvas,
+                        contentColor = if (latencyMs <= 900L) SwissSignalRed else SwissInk
+                    )
+                }
+                if (item.model.supportsImageInput) {
+                    SwissBadge(
+                        text = "VIS",
+                        containerColor = if (isSelected) SwissPaper else SwissConcrete,
+                        contentColor = SwissInk
+                    )
+                }
+                if (isSelected) {
+                    SwissBadge(
+                        text = "ACTIVE",
+                        containerColor = SwissSignalRed,
+                        contentColor = SwissWhite,
+                        borderColor = SwissSignalRed
+                    )
+                }
+                if (onTogglePin != null) {
+                    IconButton(
+                        onClick = onTogglePin,
+                        modifier = Modifier
+                            .size(36.dp)
+                            .testTag("pin_model_${item.model.modelId}")
+                    ) {
+                        Icon(
+                            imageVector = if (isPinned) Icons.Filled.PushPin else Icons.Outlined.PushPin,
+                            contentDescription = if (isPinned) "Unpin favorite model" else "Pin favorite model",
+                            tint = if (isPinned) SwissSignalRed else rowSub,
+                            modifier = Modifier.size(17.dp)
+                        )
+                    }
+                }
+            }
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(1.dp)
+                .background(SwissInk)
+        )
     }
 }

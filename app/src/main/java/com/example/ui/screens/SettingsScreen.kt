@@ -91,6 +91,7 @@ import com.example.domain.model.WebSearchProvider
 import com.example.ui.components.CustomAppsSettingsPanel
 import com.example.ui.components.DailyBudgetGuardPanel
 import com.example.ui.components.EarbudLaunchSetupPanel
+import com.example.ui.components.FastUtilityModelSettingsPanel
 import com.example.ui.components.ModelPickerButton
 import com.example.ui.components.ModelPricingDialog
 import com.example.ui.components.PasswordPromptDialog
@@ -98,6 +99,7 @@ import com.example.ui.components.PasteCurlImporterBox
 import com.example.ui.components.ProviderCatalogSheet
 import com.example.ui.components.QuickContactsSettingsPanel
 import com.example.ui.components.RoutinesSettingsPanel
+import com.example.ui.components.SavedMemorySettingsPanel
 import com.example.ui.components.SmartTriggersSettingsPanel
 import com.example.ui.components.SwissBadge
 import com.example.ui.components.SwissButton
@@ -263,6 +265,30 @@ fun SettingsScreen(
                     }
                 }
 
+                // Dual-Lane Cloud Model Assignment (Fast Utility Model vs Primary Model)
+                item {
+                    FastUtilityModelSettingsPanel(
+                        availableModels = state.textChatModels,
+                        fastUtilityModelId = state.fastUtilityModelId,
+                        onSelectFastUtilityModel = viewModel::setFastUtilityModelId
+                    )
+                }
+
+                // Saved Memory Manager Drawer / Panel (Edit, Pin Always Include, Delete, Clear All)
+                item {
+                    SavedMemorySettingsPanel(
+                        memories = state.memories,
+                        autoExtractEnabled = state.autoExtractMemories,
+                        onToggleAutoExtract = viewModel::setAutoExtractMemories,
+                        onAddMemory = viewModel::addMemory,
+                        onUpdateMemory = viewModel::updateMemory,
+                        onTogglePin = viewModel::setMemoryPinned,
+                        onToggleEnabled = viewModel::toggleMemoryEnabled,
+                        onDeleteMemory = viewModel::deleteMemory,
+                        onClearAllMemories = viewModel::clearAllMemories
+                    )
+                }
+
                 // Vault Security (PIN Lock + Auto-Lock), Currency & Encrypted .allchat Backup/Restore
                 item {
                     VaultSecurityAndBackupPanel(
@@ -329,9 +355,11 @@ fun SettingsScreen(
                     }
                 }
 
-                // Hands-Free Bluetooth Earbud Launch Setup Guide (Deep Links + Key Mapper / MacroDroid)
+                // Hands-Free Bluetooth Earbud Launch Setup Guide (Deep Links + Key Mapper / MacroDroid + Auto-Dial Webhook)
                 item {
                     EarbudLaunchSetupPanel(
+                        autoDialWebhookUrl = state.autoDialWebhookUrl,
+                        onSaveAutoDialWebhookUrl = viewModel::saveAutoDialWebhookUrl,
                         onTestLiveMic = { onTestAssistantOverlay?.invoke() },
                         onCopiedNotice = { msg -> viewModel.showStatusMessage(msg) }
                     )

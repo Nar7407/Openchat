@@ -1,7 +1,9 @@
 package com.example.widget
 
 import android.content.Context
+import android.content.Intent
 import com.example.AllChatApplication
+import com.example.util.DeviceAction
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
@@ -9,6 +11,19 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicReference
+
+object WidgetPendingActionStore {
+    private val pending = AtomicReference<List<DeviceAction>>(emptyList())
+    fun put(action: DeviceAction) {
+        pending.set(listOf(action))
+    }
+    fun putAll(actions: List<DeviceAction>) {
+        pending.set(actions)
+    }
+    fun consume(): DeviceAction? = pending.getAndSet(emptyList()).firstOrNull()
+    fun consumeAll(): List<DeviceAction> = pending.getAndSet(emptyList())
+}
 
 data class WidgetTurn(
     val role: String, // "USER" or "ASSISTANT"
@@ -236,7 +251,7 @@ object WidgetQuickAskRunner {
 
         val startedAt = System.currentTimeMillis()
         try {
-            val (modelLabel, finalAnswer) = withTimeout(HARD_TIMEOUT_MS) {
+            val result = withTimeout(HARD_TIMEOUT_MS) {
                 app.repository.quickAskForWidget(
                     prompt = question,
                     history = apiHistory,
@@ -263,14 +278,27 @@ object WidgetQuickAskRunner {
                     appContext,
                     WidgetQaState(
                         question = question,
-                        answer = finalAnswer,
-                        turns = turnsWithUser + WidgetTurn("ASSISTANT", finalAnswer),
-                        modelLabel = modelLabel,
+                        answer = result.answerText,
+                        turns = turnsWithUser + WidgetTurn("ASSISTANT", result.answerText),
+                        modelLabel = result.modelLabel,
                         isLoading = false,
                         isError = false,
                         loadingStartedAtMs = 0L
                     )
                 )
+                val resolvedActions = result.deviceActions.ifEmpty { listOfNotNull(result.deviceAction) }
+                if (resolvedActions.isNotEmpty()) {
+                    WidgetPendingActionStore.putAll(resolvedActions)
+                    val launchIntent = Intent(appContext, WidgetPromptActivity::class.java).apply {
+                        action = "com.example.widget.OPEN_PENDING_ACTION"
+                        putExtra(WidgetPromptActivity.EXTRA_OPEN_PENDING_ACTION, true)
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_ACTIVITY_CLEAR_TASK or
+                            Intent.FLAG_ACTIVITY_NO_ANIMATION or
+                            Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
+                    }
+                    runCatching { appContext.startActivity(launchIntent) }
+                }
             }
         } catch (tce: TimeoutCancellationException) {
             if (activeRequestToken == requestToken) {

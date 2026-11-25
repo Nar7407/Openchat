@@ -54,6 +54,7 @@ import com.example.ui.theme.SwissSubtleFill
 import com.example.ui.theme.SwissWhite
 import com.example.util.MarkdownBlock
 import com.example.util.MarkdownParser
+import com.example.util.OverleafLatexExporter
 import kotlinx.coroutines.delay
 
 private sealed interface MarkdownSegment {
@@ -106,6 +107,16 @@ fun MarkdownText(
     thinkingDurationSec: Int? = null
 ) {
     val segments = remember(markdown) { splitThinkingSegments(markdown) }
+    val hasMathOrDerivation = remember(markdown) { OverleafLatexExporter.containsMathOrDerivation(markdown) }
+    val clipboard = LocalClipboardManager.current
+    var copiedTex by remember { mutableStateOf(false) }
+
+    LaunchedEffect(copiedTex) {
+        if (copiedTex) {
+            delay(2000L)
+            copiedTex = false
+        }
+    }
 
     Column(
         modifier = modifier,
@@ -233,6 +244,35 @@ fun MarkdownText(
                 }
             }
         }
+
+        if (hasMathOrDerivation) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(SwissSubtleFill)
+                    .border(1.dp, SwissInk, RectangleShape)
+                    .clickable {
+                        val texDoc = OverleafLatexExporter.buildOverleafDocument(markdown)
+                        clipboard.setText(AnnotatedString(texDoc))
+                        copiedTex = true
+                    }
+                    .padding(horizontal = 10.dp, vertical = 7.dp)
+                    .testTag("copy_overleaf_tex_button"),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "LATEX // OVERLEAF EXPORT TEMPLATE",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = SwissMuted
+                )
+                Text(
+                    text = if (copiedTex) "[ COPIED .TEX ]" else "[ COPY OVERLEAF .TEX ]",
+                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                    color = if (copiedTex) SwissSignalRed else SwissInk
+                )
+            }
+        }
     }
 }
 
@@ -355,7 +395,8 @@ private fun CodeBlockCard(
 ) {
     val clipboard = LocalClipboardManager.current
     var copied by remember { mutableStateOf(false) }
-    var showPreview by remember { mutableStateOf(false) }
+    var showFullscreenPreview by remember { mutableStateOf(false) }
+    var showInlinePreview by remember { mutableStateOf(false) }
     var showRunner by remember { mutableStateOf(false) }
     var showChart by remember { mutableStateOf(false) }
     val canPreview = remember(language, code) { ArtifactDetector.isPreviewable(language, code) }
@@ -369,11 +410,11 @@ private fun CodeBlockCard(
         }
     }
 
-    if (showPreview) {
+    if (showFullscreenPreview) {
         HtmlArtifactPreviewDialog(
             language = language,
             code = code,
-            onDismiss = { showPreview = false }
+            onDismiss = { showFullscreenPreview = false }
         )
     }
     if (showRunner) {
@@ -399,7 +440,7 @@ private fun CodeBlockCard(
         modifier = Modifier.fillMaxWidth()
     ) {
         Column {
-            // Stark obsidian header bar with instant-invert run / chart / preview & copy cells
+            // Stark obsidian header bar with instant-invert run / chart / inline preview & copy cells
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -430,6 +471,20 @@ private fun CodeBlockCard(
                                 color = SwissWhite
                             )
                         }
+                    } else if (canPreview) {
+                        Box(
+                            modifier = Modifier
+                                .background(if (showInlinePreview) SwissPaper else SwissSignalRed)
+                                .clickable { showInlinePreview = !showInlinePreview }
+                                .padding(horizontal = 10.dp, vertical = 6.dp)
+                                .testTag("preview_code_button")
+                        ) {
+                            Text(
+                                text = if (showInlinePreview) "[ HIDE PREVIEW ]" else "[ ▶ PREVIEW ]",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (showInlinePreview) SwissInk else SwissWhite
+                            )
+                        }
                     } else if (canRun) {
                         Box(
                             modifier = Modifier
@@ -440,20 +495,6 @@ private fun CodeBlockCard(
                         ) {
                             Text(
                                 text = "[ RUN ]",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = SwissWhite
-                            )
-                        }
-                    } else if (canPreview) {
-                        Box(
-                            modifier = Modifier
-                                .background(SwissSignalRed)
-                                .clickable { showPreview = true }
-                                .padding(horizontal = 10.dp, vertical = 6.dp)
-                                .testTag("preview_code_button")
-                        ) {
-                            Text(
-                                text = "[ PREVIEW ]",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = SwissWhite
                             )
@@ -494,6 +535,20 @@ private fun CodeBlockCard(
                     .horizontalScroll(rememberScrollState())
                     .padding(12.dp)
             )
+            if (canPreview && showInlinePreview) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(1.dp)
+                        .background(SwissInk)
+                )
+                InlineSandboxPreviewPanel(
+                    language = language,
+                    code = code,
+                    onExpandFullscreen = { showFullscreenPreview = true },
+                    modifier = Modifier.padding(8.dp)
+                )
+            }
         }
     }
 }
