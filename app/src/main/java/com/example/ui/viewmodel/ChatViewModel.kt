@@ -1699,11 +1699,48 @@ class ChatViewModel(
         }
     }
 
-    fun addMemory(fact: String, category: String = "Preference", profile: String? = null) {
+    fun addMemory(
+        fact: String,
+        category: String = "Preference",
+        profile: String? = null,
+        temporary7Days: Boolean = false
+    ) {
         viewModelScope.launch {
-            val id = repository.addMemory(fact, category, source = "Manual", profile = profile)
+            val id = repository.addMemory(
+                fact = fact,
+                category = category,
+                source = "Manual",
+                profile = profile,
+                temporary7Days = temporary7Days
+            )
             if (id > 0L) {
-                statusNotice.value = "MEMORY // Saved to Memory Bank."
+                statusNotice.value = if (temporary7Days) {
+                    "MEMORY // Saved to Memory Bank (7-day TTL)."
+                } else {
+                    "MEMORY // Saved to Memory Bank."
+                }
+            }
+        }
+    }
+
+    fun setMemoryTtl7Days(id: Long, temporary7Days: Boolean) {
+        viewModelScope.launch {
+            repository.setMemoryTtl7Days(id, temporary7Days)
+            statusNotice.value = if (temporary7Days) {
+                "MEMORY // Marked temporary (auto-expires in 7 days)."
+            } else {
+                "MEMORY // Converted to permanent memory."
+            }
+        }
+    }
+
+    fun consolidateMemories() {
+        viewModelScope.launch {
+            val (before, after) = repository.consolidateMemoriesFast(uiState.value.selectedModel)
+            statusNotice.value = if (after < before) {
+                "MEMORY // Consolidated $before entries down to $after clean facts."
+            } else {
+                "MEMORY // Memory Bank is already compact ($before entries)."
             }
         }
     }
@@ -1987,6 +2024,19 @@ class ChatViewModel(
                 statusNotice.value = "DOC // Loaded \"$title\" (${text.length} chars). Ask anything about it."
             }.onFailure { err ->
                 errorToast.value = err.message ?: "Could not read shared document."
+            }
+        }
+    }
+
+    fun loadLaunchedFileIntoActiveWorkspace(uri: Uri) {
+        viewModelScope.launch {
+            runCatching {
+                repository.extractTextFromFile(uri)
+            }.onSuccess { (title, text) ->
+                pendingDocumentContext.value = title to text.take(28_000)
+                statusNotice.value = "WORKSPACE // Loaded \"$title\" (${text.length} chars) into active chat."
+            }.onFailure { err ->
+                errorToast.value = err.message ?: "Could not load file into workspace."
             }
         }
     }

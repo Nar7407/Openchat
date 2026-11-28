@@ -917,11 +917,43 @@ class SettingsViewModel(
         }
     }
 
-    fun addMemory(fact: String, category: String = "Preference") {
+    fun addMemory(fact: String, category: String = "Preference", temporary7Days: Boolean = false) {
         viewModelScope.launch {
-            val id = repository.addMemory(fact, category, source = "Manual")
+            val id = repository.addMemory(
+                fact = fact,
+                category = category,
+                source = "Manual",
+                temporary7Days = temporary7Days
+            )
             if (id > 0L) {
-                vaultStatusMessage.value = "MEMORY // Saved to Memory Bank."
+                vaultStatusMessage.value = if (temporary7Days) {
+                    "MEMORY // Saved to Memory Bank (7-day TTL)."
+                } else {
+                    "MEMORY // Saved to Memory Bank."
+                }
+            }
+        }
+    }
+
+    fun setMemoryTtl7Days(id: Long, temporary7Days: Boolean) {
+        viewModelScope.launch {
+            repository.setMemoryTtl7Days(id, temporary7Days)
+            vaultStatusMessage.value = if (temporary7Days) {
+                "MEMORY // Marked temporary (auto-expires in 7 days)."
+            } else {
+                "MEMORY // Converted to permanent memory."
+            }
+        }
+    }
+
+    fun consolidateMemories() {
+        viewModelScope.launch {
+            val fallback = uiState.value.textChatModels.firstOrNull()
+            val (before, after) = repository.consolidateMemoriesFast(fallback)
+            vaultStatusMessage.value = if (after < before) {
+                "MEMORY // Consolidated $before entries down to $after clean facts."
+            } else {
+                "MEMORY // Memory Bank is already compact ($before entries)."
             }
         }
     }

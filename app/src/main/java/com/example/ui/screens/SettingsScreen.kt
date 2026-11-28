@@ -339,6 +339,8 @@ fun SettingsScreen(
                         onUpdateMemory = viewModel::updateMemory,
                         onTogglePin = viewModel::setMemoryPinned,
                         onToggleEnabled = viewModel::toggleMemoryEnabled,
+                        onToggleTtl7Days = viewModel::setMemoryTtl7Days,
+                        onConsolidateMemories = viewModel::consolidateMemories,
                         onDeleteMemory = viewModel::deleteMemory,
                         onClearAllMemories = viewModel::clearAllMemories
                     )

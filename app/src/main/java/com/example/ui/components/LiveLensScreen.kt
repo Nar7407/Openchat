@@ -90,6 +90,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
@@ -300,8 +301,8 @@ fun LiveLensScreen(
         }
         if (frames.isEmpty()) return null
         return withContext(Dispatchers.Default) {
-            val (bestBitmap, bestIndex, _) = LiveLensScanProcessor.selectSharpestFrame(frames)
-            if (bestBitmap != null) bestBitmap to (bestIndex + 1) else null
+            val (bestBitmap, bestIndex) = LiveLensScanProcessor.selectSharpestFrame(frames)
+            bestBitmap to (bestIndex + 1)
         }
     }
 

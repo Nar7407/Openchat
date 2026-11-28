@@ -4237,10 +4237,12 @@ fun ChatScreen(
             onSelectProfile = viewModel::setMemoryProfile,
             onToggleSemanticAutoAttach = viewModel::setSemanticAutoAttach,
             onToggleAutoExtract = viewModel::setAutoExtractMemories,
-            onAddMemory = { fact, cat, prof -> viewModel.addMemory(fact, cat, prof) },
+            onAddMemory = { fact, cat, prof, temp7d -> viewModel.addMemory(fact, cat, prof, temp7d) },
             onUpdateMemory = viewModel::updateMemory,
             onToggleMemory = viewModel::toggleMemory,
             onTogglePinMemory = viewModel::setMemoryPinned,
+            onToggleMemoryTtl7Days = viewModel::setMemoryTtl7Days,
+            onConsolidateMemories = viewModel::consolidateMemories,
             onDeleteMemory = viewModel::deleteMemory,
             onClearAllMemories = viewModel::clearAllMemories,
             onDismiss = { showMemoryBank = false }

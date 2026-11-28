@@ -1520,11 +1520,13 @@ class AllChatRepository(
         }
         val draftProvider = ProviderConfig(
             id = existingProviderId ?: 0L,
-            name = name.trim().ifBlank { type.displayName },
+            name = name.trim().ifBlank { type.label },
             type = type,
             baseUrl = baseUrl.trim(),
             proxyUrl = proxyUrl?.trim()?.takeIf { it.isNotEmpty() },
-            hasApiKey = resolvedKey.isNotEmpty()
+            hasApiKey = resolvedKey.isNotEmpty(),
+            models = emptyList(),
+            createdAt = System.currentTimeMillis()
         )
         return aiRouter.fetchModels(draftProvider, resolvedKey)
     }
@@ -1537,13 +1539,13 @@ class AllChatRepository(
         val rawFetched: List<FetchedModel> = aiRouter.fetchModels(provider, apiKey)
         val useOnlyFree = onlyFreeOverride ?: provider.onlyFreeModels
         val filterResult = FreeModelFilterUtility.applyFilter(
-            allModels = rawFetched,
-            onlyFree = useOnlyFree,
+            allFetched = rawFetched,
+            onlyFreeModels = useOnlyFree,
             providerName = provider.name,
             baseUrl = provider.baseUrl,
-            type = provider.type
+            providerType = provider.type
         )
-        val fetched = filterResult.filteredModels
+        val fetched = filterResult.visibleModels
         val existing = modelDao.getByProviderId(provider.id).associateBy { it.modelId }
 
         val toInsert = fetched.map { item ->
