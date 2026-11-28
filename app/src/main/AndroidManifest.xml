@@ -157,6 +157,15 @@
                 <data android:mimeType="application/octet-stream" />
             </intent-filter>
 
+            <!-- Share Target: JSON & LaTeX (.tex) Files -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/json" />
+                <data android:mimeType="application/x-tex" />
+                <data android:mimeType="text/x-tex" />
+            </intent-filter>
+
             <!-- Share Target: Images from Gallery/Photos -> Chat Vision -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
@@ -164,7 +173,7 @@
                 <data android:mimeType="image/*" />
             </intent-filter>
 
-            <!-- OS-Level "Open With AllChat" File Associations (.md, .txt, .csv, .json, .pdf, .png, .jpg) -->
+            <!-- OS-Level "Open With AllChat" File Handlers (.md, .txt, .csv, .json, .tex, .pdf, images) -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
@@ -172,9 +181,30 @@
                 <data android:scheme="content" />
                 <data android:scheme="file" />
                 <data android:mimeType="text/*" />
-                <data android:mimeType="application/pdf" />
+                <data android:mimeType="text/markdown" />
+                <data android:mimeType="text/plain" />
+                <data android:mimeType="text/csv" />
+                <data android:mimeType="text/x-tex" />
+                <data android:mimeType="application/x-tex" />
                 <data android:mimeType="application/json" />
+                <data android:mimeType="application/pdf" />
                 <data android:mimeType="image/*" />
+            </intent-filter>
+
+            <!-- Extension-based File Launch Handlers when file managers send generic MIME types -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:host="*" />
+                <data android:mimeType="*/*" />
+                <data android:pathPattern=".*\\.md" />
+                <data android:pathPattern=".*\\.txt" />
+                <data android:pathPattern=".*\\.csv" />
+                <data android:pathPattern=".*\\.json" />
+                <data android:pathPattern=".*\\.tex" />
             </intent-filter>
 
             <!-- Custom Deep Links: allchat:// and web+allchat:// -->

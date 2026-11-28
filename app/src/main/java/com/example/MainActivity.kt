@@ -142,12 +142,24 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // 0b. OS-Level "Open With AllChat" File Association (ACTION_VIEW with content:// or file://)
+        // 0b. OS-Level "Open With AllChat" File Launch Handler (ACTION_VIEW with content:// or file://)
         if (intent.action == Intent.ACTION_VIEW && dataUri != null && (scheme == "content" || scheme == "file")) {
             val mime = (intent.type ?: contentResolver.getType(dataUri))?.lowercase().orEmpty()
+            val pathLower = (dataUri.lastPathSegment ?: dataUri.path).orEmpty().lowercase()
+            val isWorkspaceTextFile = mime.startsWith("text/") ||
+                mime == "application/json" ||
+                mime == "application/x-tex" ||
+                pathLower.endsWith(".md") ||
+                pathLower.endsWith(".txt") ||
+                pathLower.endsWith(".csv") ||
+                pathLower.endsWith(".json") ||
+                pathLower.endsWith(".tex")
             when {
                 mime.startsWith("image/") -> {
                     pendingSharePayload.value = IncomingSharePayload.ImageUri(dataUri.toString())
+                }
+                isWorkspaceTextFile -> {
+                    pendingSharePayload.value = IncomingSharePayload.WorkspaceFileLaunch(dataUri.toString())
                 }
                 else -> {
                     pendingSharePayload.value = IncomingSharePayload.DocumentUri(dataUri.toString())
@@ -193,6 +205,8 @@ class MainActivity : ComponentActivity() {
             streamUri != null && (
                 mime == "application/pdf" ||
                     mime.startsWith("text/") ||
+                    mime == "application/json" ||
+                    mime == "application/x-tex" ||
                     mime == "application/msword" ||
                     mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
                     mime == "application/octet-stream"

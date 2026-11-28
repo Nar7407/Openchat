@@ -224,6 +224,11 @@ fun AllChatApp(
                 pendingDocShareUri = incomingSharePayload.uriString
                 onSharedPayloadConsumed()
             }
+            is IncomingSharePayload.WorkspaceFileLaunch -> {
+                chatViewModel.loadLaunchedFileIntoActiveWorkspace(Uri.parse(incomingSharePayload.uriString))
+                navController.popBackStack(ChatRoute, inclusive = false)
+                onSharedPayloadConsumed()
+            }
             is IncomingSharePayload.ImageUri -> {
                 chatViewModel.attachSharedImageAndSelectVision(Uri.parse(incomingSharePayload.uriString))
                 navController.popBackStack(ChatRoute, inclusive = false)
@@ -491,7 +496,15 @@ fun AllChatApp(
                         initialTranslatorMode = route.startInTranslator,
                         initialMode = parsedMode,
                         onNavigateBack = { navController.popBackStack() },
-                        onOpenSettings = { navigateTo(SettingsRoute) }
+                        onOpenSettings = { navigateTo(SettingsRoute) },
+                        onPinResultToChat = { title, content ->
+                            chatViewModel.pinReference(
+                                title = title,
+                                content = content,
+                                sourceLabel = "LIVE LENS"
+                            )
+                            navController.popBackStack()
+                        }
                     )
                 }
                 composable<SettingsRoute> {

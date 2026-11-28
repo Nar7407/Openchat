@@ -32,6 +32,90 @@ object LiveLensScanProcessor {
         return ScanEnhanceResult(bitmap = enhanced, wasAutoCropped = didCrop)
     }
 
+    /**
+     * Computes lightweight Laplacian edge-contrast variance on a fast downsampled luma grid.
+     * Higher scores indicate crisper focus and less motion blur.
+     */
+    fun computeSharpnessScore(src: Bitmap): Float {
+        val w = src.width
+        val h = src.height
+        if (w < 24 || h < 24) return 0f
+        val gridW = 96
+        val gridH = ((h.toFloat() / w.toFloat()) * gridW).roundToInt().coerceIn(48, 96)
+        val luma = IntArray(gridW * gridH)
+        for (gy in 0 until gridH) {
+            val py = ((gy + 0.5f) * h / gridH).toInt().coerceIn(0, h - 1)
+            val rowOff = gy * gridW
+            for (gx in 0 until gridW) {
+                val px = ((gx + 0.5f) * w / gridW).toInt().coerceIn(0, w - 1)
+                val c = src.getPixel(px, py)
+                val r = (c shr 16) and 0xFF
+                val g = (c shr 8) and 0xFF
+                val b = c and 0xFF
+                luma[rowOff + gx] = (299 * r + 587 * g + 114 * b) / 1000
+            }
+        }
+        var sumSq = 0.0
+        var count = 0
+        for (y in 1 until (gridH - 1)) {
+            val row = y * gridW
+            for (x in 1 until (gridW - 1)) {
+                val center = luma[row + x]
+                val lap = (4 * center) -
+                    luma[row - gridW + x] -
+                    luma[row + gridW + x] -
+                    luma[row + x - 1] -
+                    luma[row + x + 1]
+                sumSq += (lap * lap).toDouble()
+                count++
+            }
+        }
+        return if (count > 0) (sumSq / count).toFloat() else 0f
+    }
+
+    /**
+     * Picks the sharpest frame from a 3-frame micro-burst and recycles non-winning copies.
+     * Returns (sharpestBitmap, 1-based winner index).
+     */
+    fun selectSharpestFrame(frames: List<Bitmap>): Pair<Bitmap, Int> {
+        require(frames.isNotEmpty())
+        if (frames.size == 1) return frames.first() to 1
+        var bestIdx = 0
+        var bestScore = -1f
+        frames.forEachIndexed { idx, bmp ->
+            val score = computeSharpnessScore(bmp)
+            if (score > bestScore) {
+                bestScore = score
+                bestIdx = idx
+            }
+        }
+        val winner = frames[bestIdx]
+        frames.forEachIndexed { idx, bmp ->
+            if (idx != bestIdx && bmp !== winner && !bmp.isRecycled) {
+                bmp.recycle()
+            }
+        }
+        return winner to (bestIdx + 1)
+    }
+
+    /**
+     * Strips Markdown chrome, code fences, and trailing topic tags to produce clean copy-ready
+     * extracted OCR / plain text for the 1-tap [COPY OCR] pill.
+     */
+    fun extractCleanOcrText(rawAnswer: String): String {
+        val withoutTag = rawAnswer.replace(Regex("""\n*TAG //[^\n]*$"""), "")
+        return withoutTag
+            .replace(Regex("""```[a-zA-Z0-9_+-]*\n?"""), "")
+            .replace("```", "")
+            .replace(Regex("""(?m)^#{1,6}\s+"""), "")
+            .replace(Regex("""\*\*(.+?)\*\*"""), "$1")
+            .replace(Regex("""__(.+?)__"""), "$1")
+            .replace(Regex("""(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)"""), "$1")
+            .replace(Regex("""`([^`]+)`"""), "$1")
+            .replace(Regex("""\n{3,}"""), "\n\n")
+            .trim()
+    }
+
     private fun downscaleIfNeeded(src: Bitmap, maxEdge: Int): Bitmap {
         val w = src.width
         val h = src.height

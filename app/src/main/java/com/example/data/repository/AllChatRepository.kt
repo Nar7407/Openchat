@@ -41,6 +41,8 @@ import com.example.data.remote.AiRouter
 import com.example.data.remote.ChatInputMessage
 import com.example.data.remote.ConnectionTestResult
 import com.example.data.remote.FetchedModel
+import com.example.data.remote.FreeModelFilterResult
+import com.example.data.remote.FreeModelFilterUtility
 import com.example.data.remote.StreamEvent
 import com.example.data.remote.ToolCallInvocation
 import com.example.data.remote.WebSearchClient
@@ -260,17 +262,26 @@ class AllChatRepository(
     val fastUtilityModelIdFlow: Flow<Long?> = apiKeyVault.fastUtilityModelIdFlow
     val activeMemoryProfileFlow: Flow<MemoryProfile> = apiKeyVault.activeMemoryProfileFlow
     val semanticAutoAttachFlow: Flow<Boolean> = apiKeyVault.semanticAutoAttachFlow
+    val smartClipboardPillEnabledFlow: Flow<Boolean> = apiKeyVault.smartClipboardPillEnabledFlow
 
     val memoriesFlow: Flow<List<UserMemoryInfo>> = combine(
         userMemoryDao.observeAll(),
         apiKeyVault.pinnedMemoryIdsFlow,
-        apiKeyVault.memoryProfileMapFlow
-    ) { list, pinnedIds, profileMap ->
-        list.map { entity ->
-            entity.toDomain().copy(
-                isPinned = entity.id in pinnedIds,
-                profile = profileMap[entity.id] ?: "ALL"
-            )
+        apiKeyVault.memoryProfileMapFlow,
+        apiKeyVault.memoryExpiryMapFlow
+    ) { list, pinnedIds, profileMap, expiryMap ->
+        val now = System.currentTimeMillis()
+        list.mapNotNull { entity ->
+            val exp = expiryMap[entity.id]
+            if (exp != null && exp <= now) {
+                null
+            } else {
+                entity.toDomain().copy(
+                    isPinned = entity.id in pinnedIds,
+                    profile = profileMap[entity.id] ?: "ALL",
+                    expiresAtMs = exp
+                )
+            }
         }.sortedWith(
             compareByDescending<UserMemoryInfo> { it.isPinned }
                 .thenByDescending { it.createdAt }
@@ -294,6 +305,9 @@ class AllChatRepository(
 
     suspend fun setSemanticAutoAttach(enabled: Boolean) =
         apiKeyVault.setSemanticAutoAttach(enabled)
+
+    suspend fun setSmartClipboardPillEnabled(enabled: Boolean) =
+        apiKeyVault.setSmartClipboardPillEnabled(enabled)
 
     /**
      * Resolves the user's designated Fast Utility Model (Dual-Lane Cloud Routing)
@@ -548,7 +562,8 @@ class AllChatRepository(
         fact: String,
         category: String = "Preference",
         source: String = "Manual",
-        profile: String? = null
+        profile: String? = null,
+        temporary7Days: Boolean = false
     ): Long {
         val clean = fact.trim()
         if (clean.isEmpty()) return -1L
@@ -556,6 +571,8 @@ class AllChatRepository(
         val targetProfile = (profile ?: apiKeyVault.activeMemoryProfileFlow.first().name).uppercase()
         val existing = userMemoryDao.getAll()
         if (isDuplicateMemoryFact(clean, existing.map { it.fact })) return -1L
+
+        val expiryMs = if (temporary7Days) System.currentTimeMillis() + 7L * 24L * 60L * 60L * 1000L else null
 
         // Automatic contradiction overwrite: update stale conflicting fact in-place instead of duplicating
         val conflicting = findConflictingMemory(clean, cleanCat, existing)
@@ -570,6 +587,7 @@ class AllChatRepository(
                 )
             )
             apiKeyVault.setMemoryProfile(conflicting.id, targetProfile)
+            apiKeyVault.setMemoryExpiry(conflicting.id, expiryMs)
             return conflicting.id
         }
 
@@ -583,9 +601,125 @@ class AllChatRepository(
         )
         if (insertedId > 0L) {
             apiKeyVault.setMemoryProfile(insertedId, targetProfile)
+            if (expiryMs != null) {
+                apiKeyVault.setMemoryExpiry(insertedId, expiryMs)
+            }
         }
         return insertedId
     }
+
+    suspend fun setMemoryTtl7Days(id: Long, temporary7Days: Boolean) {
+        val expiresAt = if (temporary7Days) {
+            System.currentTimeMillis() + 7L * 24L * 60L * 60L * 1000L
+        } else {
+            null
+        }
+        apiKeyVault.setMemoryExpiry(id, expiresAt)
+    }
+
+    suspend fun purgeExpiredMemories(): Int = withContext(Dispatchers.IO) {
+        val now = System.currentTimeMillis()
+        val expiryMap = apiKeyVault.memoryExpiryMapFlow.first()
+        if (expiryMap.isEmpty()) return@withContext 0
+        var removed = 0
+        expiryMap.forEach { (id, exp) ->
+            if (exp <= now) {
+                userMemoryDao.deleteById(id)
+                apiKeyVault.setMemoryPinned(id, false)
+                apiKeyVault.setMemoryExpiry(id, null)
+                removed++
+            }
+        }
+        removed
+    }
+
+    /**
+     * 1-Tap Memory Consolidator ([MERGE & CLEAN]):
+     * Routes all active memory items to the designated Fast Utility Model (or active fallback)
+     * to deduplicate, merge overlapping facts, and condense into crisp rules.
+     * Returns Pair(originalCount, consolidatedCount).
+     */
+    suspend fun consolidateMemoriesFast(fallbackModel: SelectableModel?): Pair<Int, Int> =
+        withContext(Dispatchers.IO) {
+            purgeExpiredMemories()
+            val all = memoriesFlow.first()
+            if (all.size < 2) return@withContext (all.size to all.size)
+
+            val utilityModel = resolveFastUtilityModel(fallbackModel)
+                ?: observeModelsForCapability(ModelCapability.TEXT_CHAT).first().firstOrNull()
+                ?: throw AiException(AiErrorCategory.UNKNOWN, "Connect a model in Settings before consolidating memory.")
+            val apiKey = apiKeyVault.getApiKey(utilityModel.provider.id)
+
+            val payload = all.take(40).joinToString("\n") { m ->
+                val pinTag = if (m.isPinned) "PINNED|" else ""
+                val ttlTag = if (m.isTemporary) "7D|" else "PERM|"
+                "[${m.id}|${m.profile}|${m.category}|$pinTag$ttlTag] ${m.fact}"
+            }.take(3200)
+
+            val prompt = """
+                You are a Memory Bank consolidator. Deduplicate, merge overlapping facts, and condense the list below into crisp, non-redundant rules.
+                Preserve all pinned rules (PINNED) and keep each rule's best category, profile (STUDY|CODING|PERSONAL|ALL), pinned flag, and temporary 7D flag when applicable.
+                Return ONLY a valid JSON array:
+                [{"fact":"concise rule","category":"Preference|Tech|Project|Study|Profile","profile":"ALL|STUDY|CODING|PERSONAL","pinned":false,"temporary7Days":false}]
+
+                Existing memories:
+                $payload
+            """.trimIndent()
+
+            val raw = collectSingleCompletion(utilityModel, apiKey, prompt, maxTokens = 900) {}
+            val cleaned = extractJsonArray(raw)
+                ?: throw AiException(AiErrorCategory.UNKNOWN, "Consolidator returned an unexpected format. Try again.")
+
+            val parsed = buildList {
+                val arr = JSONArray(cleaned)
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val fact = o.optString("fact").trim()
+                    if (fact.length < 4) continue
+                    val cat = o.optString("category", "Preference").trim().ifBlank { "Preference" }
+                    val prof = o.optString("profile", "ALL").trim().uppercase().ifBlank { "ALL" }
+                    val pinned = o.optBoolean("pinned", false)
+                    val temp7d = o.optBoolean("temporary7Days", false)
+                    add(listOf(fact, cat, prof, pinned.toString(), temp7d.toString()))
+                }
+            }
+            if (parsed.isEmpty()) return@withContext (all.size to all.size)
+
+            // Replace consolidated items cleanly while preserving any items beyond the 40-item window
+            val consolidatedSourceIds = all.take(40).map { it.id }
+            consolidatedSourceIds.forEach { oldId ->
+                userMemoryDao.deleteById(oldId)
+                apiKeyVault.setMemoryPinned(oldId, false)
+                apiKeyVault.setMemoryExpiry(oldId, null)
+            }
+
+            val now = System.currentTimeMillis()
+            val sevenDaysMs = 7L * 24L * 60L * 60L * 1000L
+            var inserted = 0
+            parsed.forEach { row ->
+                val fact = row[0]
+                val cat = row[1]
+                val prof = row[2]
+                val pinned = row[3].toBoolean()
+                val temp7d = row[4].toBoolean()
+                val newId = userMemoryDao.insert(
+                    UserMemoryEntity(
+                        fact = fact,
+                        category = cat,
+                        isEnabled = true,
+                        source = "Merged",
+                        createdAt = now
+                    )
+                )
+                if (newId > 0L) {
+                    apiKeyVault.setMemoryProfile(newId, prof)
+                    if (pinned) apiKeyVault.setMemoryPinned(newId, true)
+                    if (temp7d) apiKeyVault.setMemoryExpiry(newId, now + sevenDaysMs)
+                    inserted++
+                }
+            }
+            all.size to (inserted + (all.size - consolidatedSourceIds.size).coerceAtLeast(0))
+        }
 
     suspend fun updateMemory(memory: UserMemoryInfo) {
         val clean = memory.fact.trim()
@@ -601,6 +735,7 @@ class AllChatRepository(
             )
         )
         apiKeyVault.setMemoryProfile(memory.id, memory.profile)
+        apiKeyVault.setMemoryExpiry(memory.id, memory.expiresAtMs)
     }
 
     suspend fun toggleMemory(id: Long, enabled: Boolean) {
@@ -617,12 +752,14 @@ class AllChatRepository(
     suspend fun deleteMemory(id: Long) {
         userMemoryDao.deleteById(id)
         apiKeyVault.setMemoryPinned(id, false)
+        apiKeyVault.setMemoryExpiry(id, null)
     }
 
     suspend fun clearAllMemories() {
         userMemoryDao.deleteAll()
         apiKeyVault.clearPinnedMemoryIds()
         apiKeyVault.clearMemoryProfiles()
+        apiKeyVault.clearMemoryExpiries()
     }
 
     /**
@@ -690,6 +827,76 @@ class AllChatRepository(
             }
         }
         savedOrUpdated
+    }
+
+    /**
+     * One-Tap Session Takeaway Saver triggered on "+ NEW" for conversations with 8+ messages.
+     * Routes exclusively through the Fast Utility Model with a compact <= 800-char transcript digest
+     * and persists durable project/study facts into Memory Bank (with contradiction overwrite).
+     */
+    suspend fun extractSessionTakeawaysFast(
+        recentMessages: List<Pair<String, String>>,
+        fallbackModel: SelectableModel
+    ): Int = withContext(Dispatchers.IO) {
+        if (recentMessages.isEmpty()) return@withContext 0
+        val utilityModel = resolveFastUtilityModel(fallbackModel) ?: fallbackModel
+        val existingEntities = userMemoryDao.getAll()
+        val activeProfile = apiKeyVault.activeMemoryProfileFlow.first().name
+        val apiKey = apiKeyVault.getApiKey(utilityModel.provider.id)
+
+        val digest = buildString {
+            recentMessages.takeLast(8).forEach { (role, text) ->
+                val tag = if (role.equals("USER", ignoreCase = true)) "U" else "A"
+                val clean = text.trim().replace(Regex("\\s+"), " ").take(130)
+                if (clean.isNotBlank()) {
+                    append(tag).append(": ").append(clean).append('\n')
+                }
+            }
+        }.trim().take(800)
+
+        if (digest.length < 24) return@withContext 0
+
+        val compactExisting = existingEntities.take(10).joinToString("; ") { "[${it.id}] ${it.fact.take(56)}" }
+        val prompt = """
+            Extract 1-3 durable project, study, or preference takeaways from this session to remember long-term. If a takeaway updates an existing memory [id], set "replaces_id":id.
+            Existing: $compactExisting
+            Return JSON array only: [{"fact":"...","category":"Project|Study|Preference|Tech","replaces_id":null}]
+            $digest
+        """.trimIndent()
+
+        val raw = runCatching {
+            collectSingleCompletion(utilityModel, apiKey, prompt, maxTokens = 190) {}
+        }.getOrDefault("")
+        val cleaned = extractJsonArray(raw) ?: return@withContext 0
+        var savedCount = 0
+        runCatching {
+            val arr = JSONArray(cleaned)
+            for (i in 0 until arr.length().coerceAtMost(3)) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val fact = obj.optString("fact").trim()
+                val cat = obj.optString("category", "Project").trim().ifBlank { "Project" }
+                val replacesId = obj.optLong("replaces_id", -1L).takeIf { it > 0L }
+                if (fact.length < 6) continue
+
+                val replaceTarget = replacesId?.let { rid -> existingEntities.firstOrNull { it.id == rid } }
+                if (replaceTarget != null) {
+                    userMemoryDao.update(
+                        replaceTarget.copy(
+                            fact = fact,
+                            category = cat,
+                            isEnabled = true,
+                            source = "Session Takeaway",
+                            createdAt = System.currentTimeMillis()
+                        )
+                    )
+                    apiKeyVault.setMemoryProfile(replaceTarget.id, activeProfile)
+                    savedCount++
+                } else if (addMemory(fact, cat, source = "Session Takeaway", profile = activeProfile) > 0L) {
+                    savedCount++
+                }
+            }
+        }
+        savedCount
     }
 
     /**
@@ -1144,7 +1351,14 @@ class AllChatRepository(
 
     // --- Providers, Models & Personas ---
 
-    val providersFlow: Flow<List<ProviderConfig>> = providerConfigRepository.providersFlow
+    val providersFlow: Flow<List<ProviderConfig>> = combine(
+        providerConfigRepository.providersFlow,
+        apiKeyVault.providerOnlyFreeMapFlow
+    ) { providers, onlyFreeMap ->
+        providers.map { p ->
+            p.copy(onlyFreeModels = onlyFreeMap[p.id] ?: false)
+        }
+    }
 
     val personasFlow: Flow<List<PersonaInfo>> = personaDao.observePersonas().map { list ->
         list.map { it.toDomain() }
@@ -1272,17 +1486,64 @@ class AllChatRepository(
     suspend fun setProviderDefaultModel(providerId: Long, modelId: String?) =
         providerConfigRepository.setDefaultModel(providerId, modelId)
 
-    suspend fun deleteProvider(providerId: Long) =
+    suspend fun setProviderOnlyFreeModels(providerId: Long, onlyFree: Boolean) {
+        apiKeyVault.setProviderOnlyFreeModels(providerId, onlyFree)
+    }
+
+    suspend fun deleteProvider(providerId: Long) {
         providerConfigRepository.deleteProvider(providerId)
+        apiKeyVault.removeProviderOnlyFreeModels(providerId)
+    }
 
     suspend fun testProviderConnection(provider: ProviderConfig): ConnectionTestResult {
         val apiKey = apiKeyVault.getApiKey(provider.id)
         return aiRouter.testConnection(provider, apiKey)
     }
 
-    suspend fun fetchAndSyncModels(provider: ProviderConfig): List<ModelInfo> {
+    /**
+     * Fetches the raw model list directly from a draft or existing provider configuration
+     * (used inside the Add/Edit Provider modal before saving, so users can preview and filter
+     * free vs. paid models live without an extra API call).
+     */
+    suspend fun fetchModelsRawForDraft(
+        name: String,
+        type: ProviderType,
+        baseUrl: String,
+        proxyUrl: String?,
+        apiKeyInput: String?,
+        existingProviderId: Long?
+    ): List<FetchedModel> {
+        val resolvedKey = when {
+            !apiKeyInput.isNullOrBlank() -> apiKeyInput.trim()
+            existingProviderId != null && existingProviderId > 0L -> apiKeyVault.getApiKey(existingProviderId)
+            else -> ""
+        }
+        val draftProvider = ProviderConfig(
+            id = existingProviderId ?: 0L,
+            name = name.trim().ifBlank { type.displayName },
+            type = type,
+            baseUrl = baseUrl.trim(),
+            proxyUrl = proxyUrl?.trim()?.takeIf { it.isNotEmpty() },
+            hasApiKey = resolvedKey.isNotEmpty()
+        )
+        return aiRouter.fetchModels(draftProvider, resolvedKey)
+    }
+
+    suspend fun fetchAndSyncModelsWithFilter(
+        provider: ProviderConfig,
+        onlyFreeOverride: Boolean? = null
+    ): Pair<List<ModelInfo>, FreeModelFilterResult> {
         val apiKey = apiKeyVault.getApiKey(provider.id)
-        val fetched: List<FetchedModel> = aiRouter.fetchModels(provider, apiKey)
+        val rawFetched: List<FetchedModel> = aiRouter.fetchModels(provider, apiKey)
+        val useOnlyFree = onlyFreeOverride ?: provider.onlyFreeModels
+        val filterResult = FreeModelFilterUtility.applyFilter(
+            allModels = rawFetched,
+            onlyFree = useOnlyFree,
+            providerName = provider.name,
+            baseUrl = provider.baseUrl,
+            type = provider.type
+        )
+        val fetched = filterResult.filteredModels
         val existing = modelDao.getByProviderId(provider.id).associateBy { it.modelId }
 
         val toInsert = fetched.map { item ->
@@ -1304,11 +1565,16 @@ class AllChatRepository(
         }
         if (toInsert.isNotEmpty()) {
             val newIds = fetched.map { it.modelId }.toSet()
-            val manualToKeep = existing.values.filter { it.modelId !in newIds }
+            val manualToKeep = if (useOnlyFree) emptyList() else existing.values.filter { it.modelId !in newIds }
             modelDao.deleteByProviderId(provider.id)
             modelDao.insertAll(toInsert + manualToKeep)
         }
-        return modelDao.getByProviderId(provider.id).map { it.toDomain() }
+        val synced = modelDao.getByProviderId(provider.id).map { it.toDomain() }
+        return synced to filterResult
+    }
+
+    suspend fun fetchAndSyncModels(provider: ProviderConfig): List<ModelInfo> {
+        return fetchAndSyncModelsWithFilter(provider).first
     }
 
     suspend fun addManualModel(providerId: Long, modelId: String, displayName: String? = null) {

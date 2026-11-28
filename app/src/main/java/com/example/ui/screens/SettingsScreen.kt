@@ -55,6 +55,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -272,6 +274,59 @@ fun SettingsScreen(
                         fastUtilityModelId = state.fastUtilityModelId,
                         onSelectFastUtilityModel = viewModel::setFastUtilityModelId
                     )
+                }
+
+                // Opt-in Smart Clipboard Pill (Focus Detection)
+                item {
+                    SwissPanel(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("settings_smart_clipboard_panel")
+                    ) {
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            SwissPanelHeader(
+                                leftLabel = "CLIPBOARD // SMART CLIPBOARD PILL",
+                                rightLabel = if (state.smartClipboardPillEnabled) "OPT-IN: ON" else "OPT-IN: OFF",
+                                rightAccent = state.smartClipboardPillEnabled,
+                                backgroundColor = SwissSubtleFill
+                            )
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(
+                                    modifier = Modifier.weight(1f),
+                                    verticalArrangement = Arrangement.spacedBy(3.dp)
+                                ) {
+                                    Text(
+                                        text = "Focus-Triggered 6s Quick-Action Bar",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = SwissInk
+                                    )
+                                    Text(
+                                        text = "When AllChat becomes visible and new text is detected on the clipboard, show a dismissible 6-second pill above the composer with [PASTE], [EXPLAIN], and [FIX ERROR].",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = SwissMuted
+                                    )
+                                }
+                                Switch(
+                                    checked = state.smartClipboardPillEnabled,
+                                    onCheckedChange = viewModel::setSmartClipboardPillEnabled,
+                                    colors = SwitchDefaults.colors(
+                                        checkedThumbColor = SwissWhite,
+                                        checkedTrackColor = SwissSignalRed,
+                                        uncheckedThumbColor = SwissInk,
+                                        uncheckedTrackColor = SwissCanvas,
+                                        uncheckedBorderColor = SwissInk
+                                    ),
+                                    modifier = Modifier.testTag("settings_smart_clipboard_toggle")
+                                )
+                            }
+                        }
+                    }
                 }
 
                 // Saved Memory Manager Drawer / Panel (Edit, Pin Always Include, Delete, Clear All)

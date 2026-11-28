@@ -62,10 +62,13 @@ fun MemoryBankDialog(
     onSelectProfile: (MemoryProfile) -> Unit = {},
     onToggleSemanticAutoAttach: (Boolean) -> Unit = {},
     onToggleAutoExtract: (Boolean) -> Unit,
-    onAddMemory: (fact: String, category: String, profile: String) -> Unit,
+    onAddMemory: (fact: String, category: String, profile: String, temporary7Days: Boolean) -> Unit,
     onUpdateMemory: (UserMemoryInfo) -> Unit,
     onToggleMemory: (Long, Boolean) -> Unit,
     onTogglePinMemory: (Long, Boolean) -> Unit = { _, _ -> },
+    onToggleMemoryTtl7Days: (Long, Boolean) -> Unit = { _, _ -> },
+    onConsolidateMemories: () -> Unit = {},
+    isConsolidating: Boolean = false,
     onDeleteMemory: (Long) -> Unit,
     onClearAllMemories: () -> Unit = {},
     onDismiss: () -> Unit
@@ -73,6 +76,7 @@ fun MemoryBankDialog(
     var factInput by remember { mutableStateOf("") }
     var selectedCategory by remember { mutableStateOf("Preference") }
     var selectedFactProfile by remember(activeProfile) { mutableStateOf(activeProfile.name) }
+    var newFactTemporary7d by remember { mutableStateOf(false) }
     var editingMemory by remember { mutableStateOf<UserMemoryInfo?>(null) }
     var showClearConfirm by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf("") }
@@ -267,18 +271,38 @@ fun MemoryBankDialog(
                         .padding(12.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        categories.forEach { cat ->
-                            val active = selectedCategory == cat
-                            Box(
-                                modifier = Modifier
-                                    .background(if (active) SwissInk else SwissPaper)
-                                    .border(1.dp, SwissInk, RectangleShape)
-                                    .clickable { selectedCategory = cat }
-                                    .padding(horizontal = 8.dp, vertical = 4.dp)
-                            ) {
-                                Text(cat.uppercase(), style = MaterialTheme.typography.labelSmall, color = if (active) SwissWhite else SwissInk)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            categories.forEach { cat ->
+                                val active = selectedCategory == cat
+                                Box(
+                                    modifier = Modifier
+                                        .background(if (active) SwissInk else SwissPaper)
+                                        .border(1.dp, SwissInk, RectangleShape)
+                                        .clickable { selectedCategory = cat }
+                                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                                ) {
+                                    Text(cat.uppercase(), style = MaterialTheme.typography.labelSmall, color = if (active) SwissWhite else SwissInk)
+                                }
                             }
+                        }
+                        Box(
+                            modifier = Modifier
+                                .background(if (newFactTemporary7d) SwissSignalRed else SwissPaper)
+                                .border(1.dp, SwissInk, RectangleShape)
+                                .clickable { newFactTemporary7d = !newFactTemporary7d }
+                                .padding(horizontal = 7.dp, vertical = 4.dp)
+                                .testTag("memory_new_ttl_toggle")
+                        ) {
+                            Text(
+                                text = if (newFactTemporary7d) "TTL: 7-DAY" else "TTL: PERM",
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                color = if (newFactTemporary7d) SwissWhite else SwissInk
+                            )
                         }
                     }
                     Row(
@@ -305,10 +329,20 @@ fun MemoryBankDialog(
                                     if (clean.isNotEmpty()) {
                                         val editTarget = editingMemory
                                         if (editTarget != null) {
-                                            onUpdateMemory(editTarget.copy(fact = clean, category = selectedCategory, profile = selectedFactProfile))
+                                            val updatedExpiry = if (newFactTemporary7d) {
+                                                editTarget.expiresAtMs ?: (System.currentTimeMillis() + 7L * 24L * 60L * 60L * 1000L)
+                                            } else null
+                                            onUpdateMemory(
+                                                editTarget.copy(
+                                                    fact = clean,
+                                                    category = selectedCategory,
+                                                    profile = selectedFactProfile,
+                                                    expiresAtMs = updatedExpiry
+                                                )
+                                            )
                                             editingMemory = null
                                         } else {
-                                            onAddMemory(clean, selectedCategory, selectedFactProfile)
+                                            onAddMemory(clean, selectedCategory, selectedFactProfile, newFactTemporary7d)
                                         }
                                         factInput = ""
                                     }
@@ -383,6 +417,22 @@ fun MemoryBankDialog(
                                             style = MaterialTheme.typography.labelSmall,
                                             color = SwissSignalRed
                                         )
+                                        Text(
+                                            text = if (mem.isTemporary) {
+                                                val daysLeft = mem.remainingDays() ?: 1
+                                                "7D · ${daysLeft}d"
+                                            } else {
+                                                "PERM"
+                                            },
+                                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                            color = if (mem.isTemporary) SwissWhite else SwissInk,
+                                            modifier = Modifier
+                                                .background(if (mem.isTemporary) SwissInk else SwissSubtleFill, RectangleShape)
+                                                .border(1.dp, SwissInk, RectangleShape)
+                                                .clickable { onToggleMemoryTtl7Days(mem.id, !mem.isTemporary) }
+                                                .padding(horizontal = 5.dp, vertical = 1.dp)
+                                                .testTag("memory_ttl_toggle_${mem.id}")
+                                        )
                                         if (searchQuery.isNotBlank() && semanticMode) {
                                             Text(
                                                 text = "${matchPct}% MATCH",
@@ -425,6 +475,7 @@ fun MemoryBankDialog(
                                     editingMemory = mem
                                     factInput = mem.fact
                                     selectedCategory = mem.category
+                                    newFactTemporary7d = mem.isTemporary
                                 }) {
                                     Icon(Icons.Outlined.Edit, contentDescription = "Edit memory", tint = SwissInk)
                                 }
@@ -442,24 +493,41 @@ fun MemoryBankDialog(
                             .fillMaxWidth()
                             .background(SwissPaper)
                             .border(1.dp, SwissInk, RectangleShape)
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "${memories.count { it.isPinned }} pinned · always included",
+                            text = "${memories.count { it.isPinned }} pinned · ${memories.count { it.isTemporary }} temp",
                             style = MaterialTheme.typography.labelSmall,
                             color = SwissMuted
                         )
-                        Text(
-                            text = "[ CLEAR ALL MEMORY ]",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = SwissSignalRed,
-                            modifier = Modifier
-                                .clickable { showClearConfirm = true }
-                                .padding(horizontal = 6.dp, vertical = 4.dp)
-                                .testTag("memory_dialog_clear_all")
-                        )
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            if (memories.size >= 2) {
+                                Text(
+                                    text = if (isConsolidating) "[ MERGING… ]" else "[ MERGE & CLEAN ]",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                    color = SwissWhite,
+                                    modifier = Modifier
+                                        .background(if (isConsolidating) SwissMuted else SwissInk, RectangleShape)
+                                        .clickable(enabled = !isConsolidating, onClick = onConsolidateMemories)
+                                        .padding(horizontal = 8.dp, vertical = 5.dp)
+                                        .testTag("memory_merge_clean_button")
+                                )
+                            }
+                            Text(
+                                text = "[ CLEAR ALL ]",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissSignalRed,
+                                modifier = Modifier
+                                    .clickable { showClearConfirm = true }
+                                    .padding(horizontal = 6.dp, vertical = 4.dp)
+                                    .testTag("memory_dialog_clear_all")
+                            )
+                        }
                     }
                 }
             }

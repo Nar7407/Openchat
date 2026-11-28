@@ -102,6 +102,9 @@ class ApiKeyVault(private val context: Context) {
         val KEY_ACTIVE_MEMORY_PROFILE = stringPreferencesKey("active_memory_profile")
         val KEY_MEMORY_PROFILE_MAP = stringPreferencesKey("memory_profile_map_json")
         val KEY_SEMANTIC_AUTO_ATTACH = booleanPreferencesKey("semantic_auto_attach")
+        val KEY_SMART_CLIPBOARD_PILL_ENABLED = booleanPreferencesKey("smart_clipboard_pill_enabled")
+        val KEY_MEMORY_EXPIRY_MAP = stringPreferencesKey("memory_expiry_map_json")
+        val KEY_PROVIDER_ONLY_FREE_MAP = stringPreferencesKey("provider_only_free_map_json")
     }
 
     private val sessionPinKey = MutableStateFlow<SecretKey?>(null)
@@ -373,6 +376,90 @@ class ApiKeyVault(private val context: Context) {
     suspend fun setSemanticAutoAttach(enabled: Boolean) {
         context.keyVaultDataStore.edit { prefs ->
             prefs[KEY_SEMANTIC_AUTO_ATTACH] = enabled
+        }
+    }
+
+    val smartClipboardPillEnabledFlow: Flow<Boolean> = context.keyVaultDataStore.data.map { prefs ->
+        prefs[KEY_SMART_CLIPBOARD_PILL_ENABLED] ?: false
+    }
+
+    suspend fun setSmartClipboardPillEnabled(enabled: Boolean) {
+        context.keyVaultDataStore.edit { prefs ->
+            prefs[KEY_SMART_CLIPBOARD_PILL_ENABLED] = enabled
+        }
+    }
+
+    val memoryExpiryMapFlow: Flow<Map<Long, Long>> = context.keyVaultDataStore.data.map { prefs ->
+        val raw = prefs[KEY_MEMORY_EXPIRY_MAP].orEmpty()
+        if (raw.isBlank()) return@map emptyMap()
+        runCatching {
+            val obj = JSONObject(raw)
+            buildMap {
+                val keys = obj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val id = k.toLongOrNull() ?: continue
+                    val exp = obj.optLong(k, -1L)
+                    if (exp > 0L) put(id, exp)
+                }
+            }
+        }.getOrDefault(emptyMap())
+    }
+
+    suspend fun setMemoryExpiry(memoryId: Long, expiresAtMs: Long?) {
+        if (memoryId <= 0L) return
+        context.keyVaultDataStore.edit { prefs ->
+            val obj = runCatching {
+                JSONObject(prefs[KEY_MEMORY_EXPIRY_MAP].orEmpty().ifBlank { "{}" })
+            }.getOrDefault(JSONObject())
+            if (expiresAtMs == null || expiresAtMs <= 0L) {
+                obj.remove(memoryId.toString())
+            } else {
+                obj.put(memoryId.toString(), expiresAtMs)
+            }
+            prefs[KEY_MEMORY_EXPIRY_MAP] = obj.toString()
+        }
+    }
+
+    suspend fun clearMemoryExpiries() {
+        context.keyVaultDataStore.edit { it.remove(KEY_MEMORY_EXPIRY_MAP) }
+    }
+
+    val providerOnlyFreeMapFlow: Flow<Map<Long, Boolean>> = context.keyVaultDataStore.data.map { prefs ->
+        val raw = prefs[KEY_PROVIDER_ONLY_FREE_MAP].orEmpty()
+        if (raw.isBlank()) return@map emptyMap()
+        runCatching {
+            val obj = JSONObject(raw)
+            buildMap {
+                val keys = obj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val id = k.toLongOrNull() ?: continue
+                    put(id, obj.optBoolean(k, false))
+                }
+            }
+        }.getOrDefault(emptyMap())
+    }
+
+    suspend fun setProviderOnlyFreeModels(providerId: Long, onlyFree: Boolean) {
+        if (providerId <= 0L) return
+        context.keyVaultDataStore.edit { prefs ->
+            val obj = runCatching {
+                JSONObject(prefs[KEY_PROVIDER_ONLY_FREE_MAP].orEmpty().ifBlank { "{}" })
+            }.getOrDefault(JSONObject())
+            obj.put(providerId.toString(), onlyFree)
+            prefs[KEY_PROVIDER_ONLY_FREE_MAP] = obj.toString()
+        }
+    }
+
+    suspend fun removeProviderOnlyFreeModels(providerId: Long) {
+        if (providerId <= 0L) return
+        context.keyVaultDataStore.edit { prefs ->
+            val obj = runCatching {
+                JSONObject(prefs[KEY_PROVIDER_ONLY_FREE_MAP].orEmpty().ifBlank { "{}" })
+            }.getOrDefault(JSONObject())
+            obj.remove(providerId.toString())
+            prefs[KEY_PROVIDER_ONLY_FREE_MAP] = obj.toString()
         }
     }
 

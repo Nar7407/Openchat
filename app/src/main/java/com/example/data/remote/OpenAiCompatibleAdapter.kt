@@ -108,14 +108,25 @@ class OpenAiCompatibleAdapter(private val client: OkHttpClient) {
                             lower.contains("gemini") ||
                             lower.contains("llava") ||
                             lower.contains("qwen-vl")
+                        val pricingObj = obj.optJSONObject("pricing")
+                        val promptPrice = pricingObj?.opt("prompt")?.toString()?.toDoubleOrNull()
+                        val completionPrice = pricingObj?.opt("completion")?.toString()?.toDoubleOrNull()
+                        val hasPricing = pricingObj != null && (promptPrice != null || completionPrice != null)
+                        val explicitFree = obj.optBoolean("is_free", false) || obj.optBoolean("free", false)
+                        val displayName = obj.optString("name").takeIf { it.isNotBlank() && it != id } ?: id
+
                         list += FetchedModel(
                             modelId = id,
-                            displayName = id,
+                            displayName = displayName,
                             supportsTextChat = !isImageGen && !isVideoGen,
                             supportsImageInput = supportsVision && !isImageGen && !isVideoGen,
                             supportsImageGen = isImageGen,
                             supportsVideoGen = isVideoGen,
-                            supportsSummarization = !isImageGen && !isVideoGen
+                            supportsSummarization = !isImageGen && !isVideoGen,
+                            promptPriceUsd = promptPrice,
+                            completionPriceUsd = completionPrice,
+                            isExplicitFreeFlag = explicitFree,
+                            hasPricingMetadata = hasPricing
                         )
                     }
                     list.sortedBy { it.displayName }

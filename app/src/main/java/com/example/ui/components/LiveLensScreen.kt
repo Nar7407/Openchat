@@ -2,11 +2,13 @@ package com.example.ui.components
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.net.Uri
 import android.view.ViewGroup
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -17,6 +19,7 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -55,6 +58,7 @@ import androidx.compose.material.icons.outlined.Layers
 import androidx.compose.material.icons.outlined.NoteAdd
 import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.PlayArrow
+import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Translate
 import androidx.compose.material.icons.outlined.VolumeOff
@@ -79,6 +83,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
@@ -104,7 +109,10 @@ import com.example.ui.theme.SwissInk
 import com.example.ui.theme.SwissMuted
 import com.example.ui.theme.SwissPaper
 import com.example.ui.theme.SwissSignalRed
+import com.example.ui.theme.SwissVerifiedInk
 import com.example.ui.theme.SwissWhite
+import com.example.util.DetectedBarcode
+import com.example.util.LiveLensBarcodeDetector
 import com.example.util.LiveLensHistoryEntry
 import com.example.util.LiveLensHistoryStore
 import com.example.util.LiveLensScanProcessor
@@ -116,6 +124,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
@@ -126,7 +136,8 @@ fun LiveLensScreen(
     initialTranslatorMode: Boolean = false,
     initialMode: LiveLensMode? = null,
     onNavigateBack: () -> Unit,
-    onOpenSettings: () -> Unit
+    onOpenSettings: () -> Unit,
+    onPinResultToChat: (title: String, content: String) -> Unit = { _, _ -> }
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -182,6 +193,7 @@ fun LiveLensScreen(
     var htmlPreviewSource by remember { mutableStateOf<String?>(null) }
     var muteTts by remember { mutableStateOf(false) }
     var isAnalyzing by remember { mutableStateOf(false) }
+    var isCapturingBurst by remember { mutableStateOf(false) }
     var resultModelLabel by remember { mutableStateOf<String?>(null) }
     var resultText by remember { mutableStateOf<String?>(null) }
     var errorText by remember { mutableStateOf<String?>(null) }
@@ -190,6 +202,10 @@ fun LiveLensScreen(
     var steadyProgress by remember { mutableFloatStateOf(0f) }
     var frameMotionDelta by remember { mutableFloatStateOf(0f) }
     var isCameraShaking by remember { mutableStateOf(false) }
+    var showAlignmentGrid by remember { mutableStateOf(true) }
+    var horizonTiltDeg by remember { mutableFloatStateOf(0f) }
+    var detectedBarcode by remember { mutableStateOf<DetectedBarcode?>(null) }
+    var dismissedBarcodeValue by remember { mutableStateOf<String?>(null) }
     var lastAutoCaptureMs by remember { mutableLongStateOf(0L) }
     var speakingId by remember { mutableStateOf<Long?>(null) }
     var analyzeJob by remember { mutableStateOf<Job?>(null) }
@@ -271,6 +287,24 @@ fun LiveLensScreen(
         }
     }
 
+    /**
+     * 3-Frame Micro-Burst Sharpness Selector:
+     * Grabs 3 quick preview frames over ~350ms (0ms, 175ms, 350ms), scores each frame's
+     * Laplacian edge contrast on Dispatchers.Default, and selects the sharpest frame to eliminate motion blur.
+     */
+    suspend fun captureSharpestBurstFrame(): Pair<Bitmap, Int>? {
+        val frames = mutableListOf<Bitmap>()
+        repeat(3) { idx ->
+            runCatching { previewView.bitmap }.getOrNull()?.let { frames.add(it) }
+            if (idx < 2) delay(175L)
+        }
+        if (frames.isEmpty()) return null
+        return withContext(Dispatchers.Default) {
+            val (bestBitmap, bestIndex, _) = LiveLensScanProcessor.selectSharpestFrame(frames)
+            if (bestBitmap != null) bestBitmap to (bestIndex + 1) else null
+        }
+    }
+
     fun captureAndAnalyze(
         overrideFrame: Bitmap? = null,
         skipEnhance: Boolean = false,
@@ -278,13 +312,7 @@ fun LiveLensScreen(
         runOverlayTranslate: Boolean = translateOverlayEnabled,
         multiBoxCount: Int = 0
     ) {
-        if (isAnalyzing) return
-        val rawFrame = overrideFrame ?: runCatching { previewView.bitmap }.getOrNull()
-        if (rawFrame == null) {
-            errorText = "Camera frame not ready yet. Point at a subject and tap Scan."
-            return
-        }
-        lastClearFrame = rawFrame
+        if (isAnalyzing || isCapturingBurst) return
         isAnalyzing = true
         errorText = null
         selectedHistoryEntry = null
@@ -292,6 +320,23 @@ fun LiveLensScreen(
         analyzeJob?.cancel()
         analyzeJob = scope.launch {
             try {
+                val rawFrame: Bitmap = if (overrideFrame != null) {
+                    overrideFrame
+                } else {
+                    isCapturingBurst = true
+                    val burstResult = try {
+                        captureSharpestBurstFrame()
+                    } finally {
+                        isCapturingBurst = false
+                    }
+                    if (burstResult == null) {
+                        errorText = "Camera frame not ready yet. Point at a subject and tap Scan."
+                        return@launch
+                    }
+                    failoverNotice = "BURST // Sharpest frame ${burstResult.second}/3 selected"
+                    burstResult.first
+                }
+                lastClearFrame = rawFrame
                 var frameToSend = rawFrame
                 var didEnhance = false
                 var didAutoCrop = false
@@ -411,6 +456,51 @@ fun LiveLensScreen(
                 isCameraShaking = meanDelta > 0.045f
             }
             prevSample = sample
+        }
+    }
+
+    // Zero-Token On-Device QR & Barcode Detector on the live camera preview stream
+    LaunchedEffect(hasCameraPermission, isAnalyzing, frozenSelectFrame, dismissedBarcodeValue) {
+        if (!hasCameraPermission || isAnalyzing || frozenSelectFrame != null) return@LaunchedEffect
+        while (true) {
+            delay(550L)
+            val bmp = runCatching { previewView.bitmap }.getOrNull() ?: continue
+            val found = LiveLensBarcodeDetector.detect(bmp)
+            if (found != null && found.rawValue != dismissedBarcodeValue) {
+                detectedBarcode = found
+            }
+        }
+    }
+
+    // Real-time Hardware Horizon Tilt Level Sensor for Rule-of-Thirds & Straight Document Alignment
+    DisposableEffect(hasCameraPermission, showAlignmentGrid) {
+        if (!hasCameraPermission || !showAlignmentGrid) {
+            return@DisposableEffect onDispose {}
+        }
+        val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
+        val gravitySensor = sensorManager?.getDefaultSensor(Sensor.TYPE_GRAVITY)
+            ?: sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        if (sensorManager == null || gravitySensor == null) {
+            return@DisposableEffect onDispose {}
+        }
+        var filteredDeg = 0f
+        val tiltListener = object : SensorEventListener {
+            override fun onSensorChanged(event: SensorEvent) {
+                val gx = event.values[0].toDouble()
+                val gy = event.values[1].toDouble()
+                val rawDeg = Math.toDegrees(atan2(gx, gy)).toFloat()
+                // Normalize roll error relative to nearest 90° cardinal axis so portrait & landscape both level at 0°
+                var normalized = ((rawDeg + 45f) % 90f + 90f) % 90f - 45f
+                if (normalized.isNaN()) normalized = 0f
+                filteredDeg = filteredDeg * 0.78f + normalized * 0.22f
+                horizonTiltDeg = filteredDeg
+            }
+
+            override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+        }
+        sensorManager.registerListener(tiltListener, gravitySensor, SensorManager.SENSOR_DELAY_UI)
+        onDispose {
+            sensorManager.unregisterListener(tiltListener)
         }
     }
 
@@ -601,6 +691,67 @@ fun LiveLensScreen(
                     text = "Grant Camera Access",
                     variant = SwissButtonVariant.PRIMARY,
                     onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) }
+                )
+            }
+        }
+
+        // Viewfinder Rule-of-Thirds Alignment Grid & Hardware Horizon Tilt Level Overlay
+        if (hasCameraPermission && showAlignmentGrid) {
+            val isLevel = abs(horizonTiltDeg) <= 2.0f
+            val levelColor = if (isLevel) Color(0xFF22C55E) else SwissSignalRed
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .testTag("live_lens_alignment_grid_overlay")
+            ) {
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    val gridColor = Color.White.copy(alpha = 0.28f)
+                    val strokePx = 1.dp.toPx()
+                    val thirdW = size.width / 3f
+                    val thirdH = size.height / 3f
+                    // Vertical Rule-of-Thirds lines
+                    drawLine(gridColor, Offset(thirdW, 0f), Offset(thirdW, size.height), strokeWidth = strokePx)
+                    drawLine(gridColor, Offset(thirdW * 2f, 0f), Offset(thirdW * 2f, size.height), strokeWidth = strokePx)
+                    // Horizontal Rule-of-Thirds lines
+                    drawLine(gridColor, Offset(0f, thirdH), Offset(size.width, thirdH), strokeWidth = strokePx)
+                    drawLine(gridColor, Offset(0f, thirdH * 2f), Offset(size.width, thirdH * 2f), strokeWidth = strokePx)
+
+                    // Subtle center reference horizon ticks + rotating tilt bar
+                    val cx = size.width / 2f
+                    val cy = size.height / 2f
+                    val tickOuter = 54.dp.toPx()
+                    val tickInner = 34.dp.toPx()
+                    drawLine(
+                        color = Color.White.copy(alpha = 0.55f),
+                        start = Offset(cx - tickOuter, cy),
+                        end = Offset(cx - tickInner, cy),
+                        strokeWidth = 1.5.dp.toPx()
+                    )
+                    drawLine(
+                        color = Color.White.copy(alpha = 0.55f),
+                        start = Offset(cx + tickInner, cy),
+                        end = Offset(cx + tickOuter, cy),
+                        strokeWidth = 1.5.dp.toPx()
+                    )
+                    rotate(degrees = -horizonTiltDeg, pivot = Offset(cx, cy)) {
+                        drawLine(
+                            color = levelColor.copy(alpha = 0.92f),
+                            start = Offset(cx - 28.dp.toPx(), cy),
+                            end = Offset(cx + 28.dp.toPx(), cy),
+                            strokeWidth = 2.dp.toPx()
+                        )
+                    }
+                }
+                Text(
+                    text = if (isLevel) "LEVEL // 0.0°" else String.format(java.util.Locale.US, "TILT // %+.1f°", horizonTiltDeg),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (isLevel) Color(0xFF22C55E) else SwissWhite,
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .offset(y = 20.dp)
+                        .background(SwissInk.copy(alpha = 0.72f), RectangleShape)
+                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                        .testTag("live_lens_horizon_level_label")
                 )
             }
         }
@@ -878,6 +1029,17 @@ fun LiveLensScreen(
                         .testTag("lens_scan_enhance_toggle")
                 )
                 Text(
+                    text = if (showAlignmentGrid) "GRID+LEVEL: ON" else "GRID+LEVEL",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = SwissWhite,
+                    modifier = Modifier
+                        .background(if (showAlignmentGrid) SwissSignalRed else Color.Transparent, RectangleShape)
+                        .border(1.dp, if (showAlignmentGrid) SwissSignalRed else SwissWhite.copy(alpha = 0.5f), RectangleShape)
+                        .clickable { showAlignmentGrid = !showAlignmentGrid }
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                        .testTag("lens_alignment_grid_toggle")
+                )
+                Text(
                     text = if (palmGestureFreezeEnabled) "PALM: ON" else "PALM FREEZE",
                     style = MaterialTheme.typography.labelSmall,
                     color = SwissWhite,
@@ -1029,6 +1191,89 @@ fun LiveLensScreen(
                 }
             }
 
+            // Zero-Token Native QR & Barcode Instant Action Banner (No LLM call)
+            AnimatedVisibility(visible = detectedBarcode != null) {
+                detectedBarcode?.let { code ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 10.dp, vertical = 5.dp)
+                            .background(SwissInk, RectangleShape)
+                            .border(1.dp, SwissSignalRed, RectangleShape)
+                            .padding(horizontal = 10.dp, vertical = 8.dp)
+                            .testTag("live_lens_barcode_banner"),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "ZERO-TOKEN // ${code.formatLabel} DETECTED",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissSignalRed
+                            )
+                            Text(
+                                text = code.rawValue,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = SwissWhite,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        if (code.isUrl) {
+                            Text(
+                                text = "[ OPEN URL ]",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissWhite,
+                                modifier = Modifier
+                                    .background(SwissSignalRed, RectangleShape)
+                                    .clickable {
+                                        val targetUrl = if (code.rawValue.startsWith("http", ignoreCase = true)) {
+                                            code.rawValue
+                                        } else {
+                                            "https://${code.rawValue}"
+                                        }
+                                        runCatching {
+                                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(targetUrl)).apply {
+                                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                            }
+                                            context.startActivity(intent)
+                                        }.onFailure {
+                                            failoverNotice = "Unable to open URL."
+                                        }
+                                    }
+                                    .padding(horizontal = 8.dp, vertical = 5.dp)
+                                    .testTag("live_lens_barcode_open_url")
+                            )
+                        }
+                        Text(
+                            text = "[ COPY TEXT ]",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SwissInk,
+                            modifier = Modifier
+                                .background(SwissPaper, RectangleShape)
+                                .clickable {
+                                    clipboard.setText(AnnotatedString(code.rawValue))
+                                    failoverNotice = "COPIED // ${code.formatLabel} value copied."
+                                }
+                                .padding(horizontal = 8.dp, vertical = 5.dp)
+                                .testTag("live_lens_barcode_copy_text")
+                        )
+                        Icon(
+                            imageVector = Icons.Filled.Close,
+                            contentDescription = "Dismiss detected barcode",
+                            tint = SwissWhite,
+                            modifier = Modifier
+                                .size(18.dp)
+                                .clickable {
+                                    dismissedBarcodeValue = code.rawValue
+                                    detectedBarcode = null
+                                }
+                                .testTag("live_lens_barcode_dismiss")
+                        )
+                    }
+                }
+            }
+
             // Live Result Bottom Sheet Over Camera Preview
             AnimatedVisibility(visible = resultText != null) {
                 resultText?.let { answer ->
@@ -1112,12 +1357,44 @@ fun LiveLensScreen(
                                         .testTag("live_lens_save_note")
                                 )
                                 Icon(
+                                    imageVector = Icons.Outlined.PushPin,
+                                    contentDescription = "Pin result to Chat split pane",
+                                    tint = SwissSignalRed,
+                                    modifier = Modifier
+                                        .size(18.dp)
+                                        .clickable {
+                                            ttsController.stop()
+                                            onPinResultToChat(
+                                                "${lensMode.label} (${resultModelLabel ?: "VISION"})",
+                                                answer
+                                            )
+                                        }
+                                        .testTag("live_lens_pin_result_button")
+                                )
+                                Text(
+                                    text = "[ COPY OCR ]",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                    color = SwissWhite,
+                                    modifier = Modifier
+                                        .background(SwissSignalRed, RectangleShape)
+                                        .clickable {
+                                            val cleanOcr = LiveLensScanProcessor.extractCleanOcrText(answer)
+                                            clipboard.setText(AnnotatedString(cleanOcr))
+                                            failoverNotice = "OCR // Clean text copied (${cleanOcr.length} chars)"
+                                        }
+                                        .padding(horizontal = 7.dp, vertical = 3.dp)
+                                        .testTag("live_lens_copy_ocr_button")
+                                )
+                                Icon(
                                     imageVector = Icons.Outlined.ContentCopy,
-                                    contentDescription = "Copy result",
+                                    contentDescription = "Copy raw result",
                                     tint = SwissWhite,
                                     modifier = Modifier
                                         .size(18.dp)
-                                        .clickable { clipboard.setText(AnnotatedString(answer)) }
+                                        .clickable {
+                                            clipboard.setText(AnnotatedString(answer))
+                                            failoverNotice = "Copied full result"
+                                        }
                                 )
                                 Icon(
                                     imageVector = Icons.Filled.Close,
@@ -1260,9 +1537,10 @@ fun LiveLensScreen(
                     modifier = Modifier.testTag("live_lens_palette_btn")
                 )
 
-                // Primary Shutter: Freezes frame for Finger-Circle / Crop-Box selection (or runs Translate View directly)
+                // Primary Shutter: 3-Frame Micro-Burst Sharpness Selector -> Freeze-Frame Crop/Circle or Translate View
                 SwissButton(
                     text = when {
+                        isCapturingBurst -> "Burst 3×…"
                         isAnalyzing -> "Scanning…"
                         translateOverlayEnabled -> "Translate View"
                         lensMode == LiveLensMode.LIVE_TRANSLATOR -> "Freeze & Translate"
@@ -1271,16 +1549,24 @@ fun LiveLensScreen(
                         else -> "Freeze & Scan"
                     },
                     variant = SwissButtonVariant.PRIMARY,
-                    enabled = hasCameraPermission && !isAnalyzing,
+                    enabled = hasCameraPermission && !isAnalyzing && !isCapturingBurst,
                     onClick = {
                         if (translateOverlayEnabled) {
                             captureAndAnalyze(runOverlayTranslate = true)
                         } else {
-                            val snap = runCatching { previewView.bitmap }.getOrNull()
-                            if (snap != null) {
-                                frozenSelectFrame = snap
-                            } else {
-                                captureAndAnalyze()
+                            scope.launch {
+                                isCapturingBurst = true
+                                val burstResult = try {
+                                    captureSharpestBurstFrame()
+                                } finally {
+                                    isCapturingBurst = false
+                                }
+                                if (burstResult != null) {
+                                    failoverNotice = "BURST // Sharpest frame ${burstResult.second}/3 selected"
+                                    frozenSelectFrame = burstResult.first
+                                } else {
+                                    captureAndAnalyze()
+                                }
                             }
                         }
                     },

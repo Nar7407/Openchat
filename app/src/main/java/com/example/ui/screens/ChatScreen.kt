@@ -106,6 +106,9 @@ import androidx.compose.material.icons.outlined.BookmarkAdd
 import androidx.compose.material.icons.outlined.Brush
 import androidx.compose.material.icons.outlined.EditNote
 import androidx.compose.material.icons.outlined.FactCheck
+import androidx.compose.material.icons.filled.ArrowUpward
+import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material.icons.outlined.QrCode2
 import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material.icons.outlined.VolumeOff
@@ -146,6 +149,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
@@ -199,6 +203,7 @@ import com.example.ui.components.MindMapDialog
 import com.example.ui.components.ModelPickerButton
 import com.example.ui.components.PersonaCommandBar
 import com.example.ui.components.PersonaManagerSheet
+import com.example.ui.components.PinnedReferenceSplitPane
 import com.example.ui.components.PromptEditorDialog
 import com.example.ui.components.RawJsonInspectorDialog
 import com.example.ui.components.RegionSnipDialog
@@ -328,10 +333,22 @@ fun ChatScreen(
     var showCommandPalette by remember { mutableStateOf(false) }
     var showActiveToolsDrawer by remember { mutableStateOf(false) }
     var showVoiceNotesSheet by remember { mutableStateOf(false) }
+    var clipboardCountdownSec by remember { mutableIntStateOf(6) }
 
     LaunchedEffect(Unit) {
         CommandPaletteBus.openEvents.collect {
             showCommandPalette = true
+        }
+    }
+
+    LaunchedEffect(state.clipboardHint?.hash) {
+        if (state.clipboardHint != null) {
+            clipboardCountdownSec = 6
+            for (sec in 6 downTo 1) {
+                clipboardCountdownSec = sec
+                delay(1000L)
+            }
+            viewModel.dismissClipboardHint()
         }
     }
 
@@ -454,17 +471,38 @@ fun ChatScreen(
         viewModel.refreshSmartContext(context, ambientDb)
     }
 
+    // Focus-based Smart Clipboard Pill detection (reliable on Android 10+ where clipboard access waits for window focus)
+    val windowInfo = LocalWindowInfo.current
+    LaunchedEffect(windowInfo.isWindowFocused, state.smartClipboardPillEnabled) {
+        if (windowInfo.isWindowFocused && state.smartClipboardPillEnabled) {
+            delay(120L)
+            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            val clipText = runCatching {
+                cm?.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()
+            }.getOrNull()
+            viewModel.inspectClipboardOnResume(clipText)
+            if (!clipText.isNullOrBlank()) {
+                viewModel.recordClipboard(clipText)
+            }
+        }
+    }
+
     // Smart "Paste & Ask" Clipboard Detector + Smart Context Refresh when returning to AllChat
-    DisposableEffect(lifecycleOwner, context, state.ambientWhisperEnabled) {
+    DisposableEffect(lifecycleOwner, context, state.ambientWhisperEnabled, state.smartClipboardPillEnabled) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                val clipText = cm?.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()
-                viewModel.inspectClipboardOnResume(clipText)
-                if (!clipText.isNullOrBlank()) {
-                    viewModel.recordClipboard(clipText)
-                }
                 scope.launch {
+                    if (state.smartClipboardPillEnabled) {
+                        delay(150L)
+                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                        val clipText = runCatching {
+                            cm?.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()
+                        }.getOrNull()
+                        viewModel.inspectClipboardOnResume(clipText)
+                        if (!clipText.isNullOrBlank()) {
+                            viewModel.recordClipboard(clipText)
+                        }
+                    }
                     val ambientDb = if (state.ambientWhisperEnabled) {
                         runCatching { SmartContextEngine.sampleAmbientDecibels(context) }.getOrNull()
                     } else null
@@ -837,7 +875,7 @@ fun ChatScreen(
                             icon = Icons.Filled.Add,
                             contentDescription = "New Chat",
                             onClick = {
-                                viewModel.createNewChat()
+                                viewModel.requestNewChat()
                                 scope.launch { drawerState.close() }
                             },
                             accent = true,
@@ -1372,7 +1410,7 @@ fun ChatScreen(
                         SwissIconCell(
                             icon = Icons.Filled.Add,
                             contentDescription = "New Chat",
-                            onClick = viewModel::createNewChat,
+                            onClick = viewModel::requestNewChat,
                             bordered = false,
                             cellSize = if (effectiveMiniMode) 44.dp else 52.dp,
                             modifier = Modifier
@@ -1780,6 +1818,88 @@ fun ChatScreen(
                 }
             }
 
+            // One-Tap Session Takeaway Saver Toast Banner on "+ NEW" (8+ messages)
+            AnimatedVisibility(visible = state.pendingNewChatTakeawayCount != null) {
+                state.pendingNewChatTakeawayCount?.let { msgCount ->
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 6.dp)
+                            .background(SwissInk, RectangleShape)
+                            .border(1.dp, SwissSignalRed, RectangleShape)
+                            .padding(horizontal = 10.dp, vertical = 8.dp)
+                            .testTag("session_takeaway_saver_banner"),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "SESSION // $msgCount MSGS — SAVE KEY TAKEAWAYS TO MEMORY?",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissWhite,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Icon(
+                                imageVector = Icons.Filled.Close,
+                                contentDescription = "Cancel new chat reset",
+                                tint = SwissWhite,
+                                modifier = Modifier
+                                    .size(16.dp)
+                                    .clickable { viewModel.dismissNewChatTakeawayPrompt() }
+                            )
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = if (state.isExtractingSessionTakeaways) "[ EXTRACTING… ]" else "[ EXTRACT & SAVE FACTS ]",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissWhite,
+                                modifier = Modifier
+                                    .background(SwissSignalRed, RectangleShape)
+                                    .clickable(enabled = !state.isExtractingSessionTakeaways) {
+                                        viewModel.extractTakeawaysAndCreateNewChat()
+                                    }
+                                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                                    .testTag("session_takeaway_extract_button")
+                            )
+                            Text(
+                                text = "[ SKIP & NEW ]",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissInk,
+                                modifier = Modifier
+                                    .background(SwissPaper, RectangleShape)
+                                    .clickable(enabled = !state.isExtractingSessionTakeaways) {
+                                        viewModel.createNewChat()
+                                    }
+                                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                                    .testTag("session_takeaway_skip_button")
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Collapsible & Resizable Top "Pinned Reference" Split-Pane (AI Messages & Live Lens Cards)
+            AnimatedVisibility(visible = state.pinnedReference != null) {
+                state.pinnedReference?.let { pinned ->
+                    PinnedReferenceSplitPane(
+                        pinned = pinned,
+                        onCopy = {
+                            clipboard.setText(AnnotatedString(pinned.content))
+                            viewModel.showNotice("COPIED // Pinned reference copied to clipboard.")
+                        },
+                        onUnpin = viewModel::clearPinnedReference,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                    )
+                }
+            }
+
             // Live Camera Viewfinder Q&A Dock (Split-Screen Top Preview)
             AnimatedVisibility(visible = state.liveCamEnabled) {
                 LiveCameraViewfinderPanel(
@@ -1880,6 +2000,19 @@ fun ChatScreen(
                                     isSummarizingCheckpoint = state.summarizingCheckpointMsgId == msg.id,
                                     factClaims = state.factCheckByMessageId[msg.id].orEmpty(),
                                     isFactChecking = msg.id in state.checkingFactMessageIds,
+                                    isPinnedReference = state.pinnedReference?.id == "msg_${msg.id}",
+                                    onPinReference = {
+                                        if (state.pinnedReference?.id == "msg_${msg.id}") {
+                                            viewModel.clearPinnedReference()
+                                        } else {
+                                            viewModel.pinReference(
+                                                title = "#${index + 1} ${(msg.modelLabel ?: "ASSISTANT")}",
+                                                content = msg.content,
+                                                sourceLabel = "AI REPLY",
+                                                id = "msg_${msg.id}"
+                                            )
+                                        }
+                                    },
                                     onCopy = {
                                         clipboard.setText(AnnotatedString(msg.content))
                                         viewModel.showNotice("COPIED // Message copied to clipboard.")
@@ -2022,6 +2155,77 @@ fun ChatScreen(
                         },
                         modifier = Modifier.align(Alignment.CenterEnd)
                     )
+
+                    // Turn-by-Turn Quick-Jump Stepper (▲ / ▼) in conversations with 6+ messages
+                    val userTurnIndices = remember(displayedNodes) {
+                        displayedNodes.mapIndexedNotNull { idx, node ->
+                            if (node.message.role == "USER") idx else null
+                        }
+                    }
+                    if (displayedNodes.size >= 6 && userTurnIndices.size >= 2) {
+                        val currentFirst = listState.firstVisibleItemIndex
+                        val prevTurnIdx = userTurnIndices.lastOrNull { it < currentFirst }
+                        val nextTurnIdx = userTurnIndices.firstOrNull { it > currentFirst }
+                        val currentTurnPos = (userTurnIndices.indexOfLast { it <= currentFirst } + 1)
+                            .coerceIn(1, userTurnIndices.size)
+
+                        Column(
+                            modifier = Modifier
+                                .align(Alignment.BottomEnd)
+                                .padding(end = 30.dp, bottom = 12.dp)
+                                .background(SwissPaper, RectangleShape)
+                                .border(1.dp, SwissInk, RectangleShape)
+                                .testTag("turn_stepper_controls"),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(34.dp)
+                                    .background(if (prevTurnIdx != null) SwissInk else SwissSubtleFill)
+                                    .clickable(enabled = prevTurnIdx != null) {
+                                        prevTurnIdx?.let { target ->
+                                            autoScrollEnabled = false
+                                            scope.launch { listState.animateScrollToItem(target) }
+                                        }
+                                    }
+                                    .testTag("turn_stepper_prev_button"),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.ArrowUpward,
+                                    contentDescription = "Jump to previous user turn",
+                                    tint = if (prevTurnIdx != null) SwissWhite else SwissMuted,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                            Text(
+                                text = "$currentTurnPos/${userTurnIndices.size}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissInk,
+                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
+                            )
+                            Box(
+                                modifier = Modifier
+                                    .size(34.dp)
+                                    .background(if (nextTurnIdx != null) SwissInk else SwissSubtleFill)
+                                    .clickable(enabled = nextTurnIdx != null) {
+                                        nextTurnIdx?.let { target ->
+                                            autoScrollEnabled = target >= displayedNodes.lastIndex - 1
+                                            scope.launch { listState.animateScrollToItem(target) }
+                                        }
+                                    }
+                                    .testTag("turn_stepper_next_button"),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.ArrowDownward,
+                                    contentDescription = "Jump to next user turn",
+                                    tint = if (nextTurnIdx != null) SwissWhite else SwissMuted,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
+                    }
 
                     // Floating "↓ Jump to Latest" pill when scrolled up reading earlier messages
                     androidx.compose.animation.AnimatedVisibility(
@@ -2304,74 +2508,97 @@ fun ChatScreen(
                     )
                 }
 
-                // "Paste & Ask" Smart Clipboard Detector Floating Pill
+                // Opt-in 6-Second Smart Clipboard Quick-Action Bar ([PASTE], [EXPLAIN], [FIX ERROR])
                 AnimatedVisibility(visible = state.clipboardHint != null) {
                     state.clipboardHint?.let { hint ->
-                        Column {
-                            Row(
+                        Column(modifier = Modifier.testTag("smart_clipboard_pill_bar")) {
+                            Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .background(SwissInk)
                                     .padding(horizontal = 10.dp, vertical = 7.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = "CLIPBOARD // ${hint.kindLabel} DETECTED",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = SwissSignalRed
-                                    )
-                                    Text(
-                                        text = hint.preview,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = SwissWhite,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "CLIPBOARD // ${hint.kindLabel} · ${clipboardCountdownSec}s",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = SwissSignalRed
+                                        )
+                                        Text(
+                                            text = hint.preview,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = SwissWhite,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    Icon(
+                                        imageVector = Icons.Filled.Close,
+                                        contentDescription = "Dismiss clipboard prompt",
+                                        tint = SwissWhite,
+                                        modifier = Modifier
+                                            .size(20.dp)
+                                            .clickable { viewModel.dismissClipboardHint() }
+                                            .testTag("clipboard_pill_dismiss")
                                     )
                                 }
-                                Text(
-                                    text = "[ ASK ]",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = SwissWhite,
+                                Row(
                                     modifier = Modifier
-                                        .background(SwissSignalRed, RectangleShape)
-                                        .clickable {
-                                            val raw = hint.rawText
-                                            viewModel.dismissClipboardHint()
-                                            inputText = if (hint.kindLabel == "LINK") {
-                                                "@$raw Explain and summarize the key points."
-                                            } else if (hint.kindLabel == "ERROR TRACE") {
-                                                "Debug this error trace and provide the root cause + fix:\n\n$raw"
-                                            } else {
-                                                raw
+                                        .fillMaxWidth()
+                                        .horizontalScroll(rememberScrollState()),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = "[ PASTE ]",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = SwissInk,
+                                        modifier = Modifier
+                                            .background(SwissPaper, RectangleShape)
+                                            .clickable {
+                                                val raw = hint.rawText
+                                                viewModel.dismissClipboardHint()
+                                                inputText = if (inputText.isBlank()) raw else "$inputText\n$raw"
                                             }
-                                        }
-                                        .padding(horizontal = 8.dp, vertical = 5.dp)
-                                        .testTag("clipboard_paste_ask_button")
-                                )
-                                Text(
-                                    text = "[ SUM ]",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = SwissInk,
-                                    modifier = Modifier
-                                        .background(SwissPaper, RectangleShape)
-                                        .clickable {
-                                            val raw = hint.rawText
-                                            viewModel.dismissClipboardHint()
-                                            onSummarizeClipboardText(raw)
-                                        }
-                                        .padding(horizontal = 8.dp, vertical = 5.dp)
-                                        .testTag("clipboard_summarize_button")
-                                )
-                                Icon(
-                                    imageVector = Icons.Filled.Close,
-                                    contentDescription = "Dismiss clipboard prompt",
-                                    tint = SwissWhite,
-                                    modifier = Modifier
-                                        .size(20.dp)
-                                        .clickable { viewModel.dismissClipboardHint() }
-                                )
+                                            .padding(horizontal = 8.dp, vertical = 5.dp)
+                                            .testTag("clipboard_paste_button")
+                                    )
+                                    Text(
+                                        text = "[ EXPLAIN ]",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = SwissWhite,
+                                        modifier = Modifier
+                                            .background(SwissSignalRed, RectangleShape)
+                                            .clickable {
+                                                val raw = hint.rawText
+                                                viewModel.dismissClipboardHint()
+                                                viewModel.sendMessage("Explain this clearly and concisely:\n\n$raw")
+                                            }
+                                            .padding(horizontal = 8.dp, vertical = 5.dp)
+                                            .testTag("clipboard_explain_button")
+                                    )
+                                    Text(
+                                        text = "[ FIX ERROR ]",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = SwissWhite,
+                                        modifier = Modifier
+                                            .border(1.dp, SwissSignalRed, RectangleShape)
+                                            .background(SwissInk, RectangleShape)
+                                            .clickable {
+                                                val raw = hint.rawText
+                                                viewModel.dismissClipboardHint()
+                                                viewModel.sendMessage("Identify the root cause and fix this error or snippet:\n\n$raw")
+                                            }
+                                            .padding(horizontal = 8.dp, vertical = 5.dp)
+                                            .testTag("clipboard_fix_error_button")
+                                    )
+                                }
                             }
                             Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(SwissInk))
                         }
@@ -2668,6 +2895,83 @@ fun ChatScreen(
                                     }
                                     .padding(horizontal = 8.dp, vertical = 4.dp)
                             )
+                        }
+                    }
+                }
+
+                // Inline "@" Memory Bank Autocomplete Dropdown
+                val matchingMemories = remember(lastMentionWord, state.memories) {
+                    if (lastMentionWord == null || state.memories.isEmpty()) {
+                        emptyList()
+                    } else {
+                        val needle = lastMentionWord.removePrefix("@").trim()
+                        state.memories
+                            .filter { it.isEnabled }
+                            .filter { mem ->
+                                needle.isEmpty() ||
+                                    mem.fact.contains(needle, ignoreCase = true) ||
+                                    mem.category.contains(needle, ignoreCase = true) ||
+                                    mem.profile.contains(needle, ignoreCase = true)
+                            }
+                            .take(6)
+                    }
+                }
+
+                AnimatedVisibility(visible = !typingSlashCommand && !typingHashDoc && matchingMemories.isNotEmpty()) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(SwissPaper)
+                            .border(1.dp, SwissInk, RectangleShape)
+                            .padding(horizontal = 10.dp, vertical = 6.dp)
+                            .testTag("inline_memory_autocomplete_dropdown"),
+                        verticalArrangement = Arrangement.spacedBy(5.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "@MEMORY // TAP TO INSERT SAVED FACT",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissSignalRed
+                            )
+                            Text(
+                                text = "${matchingMemories.size} SAVED",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SwissMuted
+                            )
+                        }
+                        matchingMemories.forEach { mem ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(SwissCanvas, RectangleShape)
+                                    .border(1.dp, SwissGridLine, RectangleShape)
+                                    .clickable {
+                                        val prefixLen = (inputText.length - (lastMentionWord?.length ?: 0)).coerceAtLeast(0)
+                                        inputText = inputText.substring(0, prefixLen) + mem.fact + " "
+                                    }
+                                    .padding(horizontal = 8.dp, vertical = 6.dp)
+                                    .testTag("inline_memory_item_${mem.id}"),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "[${mem.profile}/${mem.category.uppercase()}]",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (mem.isPinned) SwissSignalRed else SwissInk
+                                )
+                                Text(
+                                    text = mem.fact,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = SwissInk,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
                         }
                     }
                 }
@@ -3953,7 +4257,7 @@ fun ChatScreen(
             memoryCount = state.memories.count { it.isEnabled },
             onSelectModel = viewModel::selectModel,
             onSelectConversation = viewModel::selectConversation,
-            onNewChat = viewModel::createNewChat,
+            onNewChat = viewModel::requestNewChat,
             onOpenLiveLens = onOpenLiveLens,
             onOpenMemory = { showMemoryBank = true },
             onOpenSettings = onOpenSettings,
@@ -4436,7 +4740,9 @@ private fun ChatMessageCell(
     onSwitchBranch: (Long) -> Unit,
     onInspectJson: () -> Unit,
     onOpenCitationUrl: (String) -> Unit,
-    onOpenProxySettings: () -> Unit
+    onOpenProxySettings: () -> Unit,
+    isPinnedReference: Boolean = false,
+    onPinReference: () -> Unit = {}
 ) {
     val message = node.message
     val isUser = message.role == "USER"
@@ -4680,6 +4986,14 @@ private fun ChatMessageCell(
                                     modifier = Modifier.horizontalScroll(rememberScrollState()),
                                     horizontalArrangement = Arrangement.spacedBy(5.dp)
                                 ) {
+                                    SwissIconCell(
+                                        icon = if (isPinnedReference) Icons.Filled.PushPin else Icons.Outlined.PushPin,
+                                        contentDescription = if (isPinnedReference) "Unpin reference card" else "Pin to top split-pane",
+                                        onClick = onPinReference,
+                                        accent = isPinnedReference,
+                                        cellSize = 36.dp,
+                                        modifier = Modifier.testTag("pin_message_${message.id}")
+                                    )
                                     if (canModify) {
                                         SwissIconCell(
                                             icon = Icons.Outlined.FactCheck,

@@ -91,7 +91,8 @@ data class SettingsUiState(
     val autoDialWebhookUrl: String = "",
     val memories: List<UserMemoryInfo> = emptyList(),
     val autoExtractMemories: Boolean = true,
-    val fastUtilityModelId: Long? = null
+    val fastUtilityModelId: Long? = null,
+    val smartClipboardPillEnabled: Boolean = false
 ) {
     val visionModels: List<SelectableModel>
         get() = textChatModels.filter { it.model.supportsImageInput }.ifEmpty { textChatModels }
@@ -239,16 +240,18 @@ class SettingsViewModel(
             repository.autoDialWebhookUrlFlow,
             repository.memoriesFlow,
             repository.autoExtractMemoriesFlow,
-            repository.fastUtilityModelIdFlow
-        ) { dialUrl, memories, autoMem, fastId ->
-            MemoryAndRoutingBundle(dialUrl, memories, autoMem, fastId)
+            repository.fastUtilityModelIdFlow,
+            repository.smartClipboardPillEnabledFlow
+        ) { dialUrl, memories, autoMem, fastId, clipPill ->
+            MemoryAndRoutingBundle(dialUrl, memories, autoMem, fastId, clipPill)
         }
     ) { state, mr ->
         state.copy(
             autoDialWebhookUrl = mr.autoDialWebhookUrl,
             memories = mr.memories,
             autoExtractMemories = mr.autoExtractMemories,
-            fastUtilityModelId = mr.fastUtilityModelId
+            fastUtilityModelId = mr.fastUtilityModelId,
+            smartClipboardPillEnabled = mr.smartClipboardPillEnabled
         )
     }.stateIn(
         scope = viewModelScope,
@@ -972,11 +975,23 @@ class SettingsViewModel(
         }
     }
 
+    fun setSmartClipboardPillEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            repository.setSmartClipboardPillEnabled(enabled)
+            vaultStatusMessage.value = if (enabled) {
+                "CLIPBOARD // Smart Clipboard Pill enabled (6s quick actions on focus)."
+            } else {
+                "CLIPBOARD // Smart Clipboard Pill disabled."
+            }
+        }
+    }
+
     private data class MemoryAndRoutingBundle(
         val autoDialWebhookUrl: String,
         val memories: List<UserMemoryInfo>,
         val autoExtractMemories: Boolean,
-        val fastUtilityModelId: Long?
+        val fastUtilityModelId: Long?,
+        val smartClipboardPillEnabled: Boolean
     )
 
     private data class BudgetAndLockBundle(

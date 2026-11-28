@@ -120,6 +120,7 @@ dependencies {
   implementation(libs.pdfbox.android)
   implementation(libs.androidx.media3.exoplayer)
   implementation(libs.androidx.media3.ui)
+  implementation(libs.zxing.core)
   // implementation(libs.play.services.location)
   // implementation(libs.retrofit)
   testImplementation(libs.androidx.compose.ui.test.junit4)

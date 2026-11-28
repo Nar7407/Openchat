@@ -4,6 +4,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
@@ -45,6 +46,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -74,7 +76,8 @@ fun ModelPickerButton(
     onSelectAutoRoute: (() -> Unit)? = null,
     pinnedModelIds: List<Long> = emptyList(),
     modelLatencyMs: Map<Long, Long> = emptyMap(),
-    onTogglePinModel: ((Long) -> Unit)? = null
+    onTogglePinModel: ((Long) -> Unit)? = null,
+    onSwipePinnedModel: ((forward: Boolean) -> Unit)? = null
 ) {
     var showSheet by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf("") }
@@ -96,6 +99,29 @@ fun ModelPickerButton(
             .minimumInteractiveComponentSize()
             .background(bg, RectangleShape)
             .then(if (bordered) Modifier.border(1.dp, SwissInk, RectangleShape) else Modifier)
+            .then(
+                if (onSwipePinnedModel != null) {
+                    Modifier.pointerInput(onSwipePinnedModel) {
+                        var accumulatedDrag = 0f
+                        detectHorizontalDragGestures(
+                            onDragStart = { accumulatedDrag = 0f },
+                            onHorizontalDrag = { _, dragAmount ->
+                                accumulatedDrag += dragAmount
+                            },
+                            onDragEnd = {
+                                when {
+                                    accumulatedDrag < -56f -> onSwipePinnedModel(true)
+                                    accumulatedDrag > 56f -> onSwipePinnedModel(false)
+                                }
+                                accumulatedDrag = 0f
+                            },
+                            onDragCancel = { accumulatedDrag = 0f }
+                        )
+                    }
+                } else {
+                    Modifier
+                }
+            )
             .clickable(
                 interactionSource = interactionSource,
                 indication = null,

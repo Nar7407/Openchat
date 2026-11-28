@@ -30,6 +30,7 @@ import com.example.domain.model.MindMapNode
 import com.example.domain.model.ModelCapability
 import com.example.domain.model.OutputFormatMode
 import com.example.domain.model.PersonaInfo
+import com.example.domain.model.PinnedReferenceItem
 import com.example.domain.model.QuickContact
 import com.example.domain.model.RequestParamsOverride
 import com.example.domain.model.SelectableModel
@@ -155,6 +156,10 @@ data class ChatUiState(
     val outputFormatMode: OutputFormatMode = OutputFormatMode.AUTO,
     val semanticAutoAttach: Boolean = false,
     val fastUtilityModelId: Long? = null,
+    val smartClipboardPillEnabled: Boolean = false,
+    val pinnedReference: PinnedReferenceItem? = null,
+    val pendingNewChatTakeawayCount: Int? = null,
+    val isExtractingSessionTakeaways: Boolean = false,
     val pinnedModelIds: List<Long> = emptyList(),
     val modelLatencyMs: Map<Long, Long> = emptyMap(),
     val quotedMessage: MessageEntity? = null,
@@ -261,6 +266,9 @@ class ChatViewModel(
     private val memoryInjectionEnabled = MutableStateFlow(true)
     private val memoryUpdatedToast = MutableStateFlow<String?>(null)
     private val outputFormatMode = MutableStateFlow(OutputFormatMode.AUTO)
+    private val pinnedReference = MutableStateFlow<PinnedReferenceItem?>(null)
+    private val pendingNewChatTakeawayCount = MutableStateFlow<Int?>(null)
+    private val isExtractingSessionTakeaways = MutableStateFlow(false)
     private val lastFailedPrompt = MutableStateFlow<String?>(null)
     private val isSavingNote = MutableStateFlow(false)
     private val tokenDietEnabled = MutableStateFlow(false)
@@ -671,6 +679,22 @@ class ChatViewModel(
             semanticAutoAttach = pf.semanticAutoAttach,
             fastUtilityModelId = pf.fastUtilityModelId
         )
+    }.combine(
+        combine(
+            repository.smartClipboardPillEnabledFlow,
+            pinnedReference,
+            pendingNewChatTakeawayCount,
+            isExtractingSessionTakeaways
+        ) { clipEnabled, pinned, takeawayCount, extracting ->
+            WorkspaceUpgradeBundle(clipEnabled, pinned, takeawayCount, extracting)
+        }
+    ) { state, wu ->
+        state.copy(
+            smartClipboardPillEnabled = wu.smartClipboardPillEnabled,
+            pinnedReference = wu.pinnedReference,
+            pendingNewChatTakeawayCount = wu.pendingNewChatTakeawayCount,
+            isExtractingSessionTakeaways = wu.isExtractingSessionTakeaways
+        )
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5000),
@@ -734,8 +758,68 @@ class ChatViewModel(
         }
     }
 
+    fun requestNewChat() {
+        val state = uiState.value
+        if (!state.ghostModeEnabled && state.messages.size >= 8 && state.selectedModel != null) {
+            pendingNewChatTakeawayCount.value = state.messages.size
+        } else {
+            createNewChat()
+        }
+    }
+
+    fun dismissNewChatTakeawayPrompt() {
+        pendingNewChatTakeawayCount.value = null
+    }
+
+    fun extractTakeawaysAndCreateNewChat() {
+        if (isExtractingSessionTakeaways.value) return
+        val state = uiState.value
+        val model = state.selectedModel
+        val transcript = state.messages.map { it.role to it.content }
+        if (model == null || transcript.isEmpty()) {
+            pendingNewChatTakeawayCount.value = null
+            createNewChat()
+            return
+        }
+        viewModelScope.launch {
+            isExtractingSessionTakeaways.value = true
+            try {
+                val saved = repository.extractSessionTakeawaysFast(transcript, model)
+                if (saved > 0) {
+                    memoryUpdatedToast.value = "MEMORY // SAVED +$saved SESSION TAKEAWAYS"
+                } else {
+                    statusNotice.value = "SESSION // No new durable takeaways found; started fresh chat."
+                }
+            } finally {
+                isExtractingSessionTakeaways.value = false
+                pendingNewChatTakeawayCount.value = null
+                createNewChat()
+            }
+        }
+    }
+
+    fun pinReference(
+        title: String,
+        content: String,
+        sourceLabel: String = "AI REPLY",
+        id: String = System.currentTimeMillis().toString()
+    ) {
+        pinnedReference.value = PinnedReferenceItem(
+            id = id,
+            title = title.take(48).ifBlank { "Pinned Card" },
+            content = content,
+            sourceLabel = sourceLabel
+        )
+        statusNotice.value = "PINNED REF // Docked to top split-pane."
+    }
+
+    fun clearPinnedReference() {
+        pinnedReference.value = null
+    }
+
     fun createNewChat() {
         stopGeneration()
+        pendingNewChatTakeawayCount.value = null
         selectedBranchByParent.value = emptyMap()
         followUpSuggestions.value = emptyList()
         viewModelScope.launch {
@@ -962,6 +1046,7 @@ class ChatViewModel(
     }
 
     fun inspectClipboardOnResume(clipboardText: String?) {
+        if (!uiState.value.smartClipboardPillEnabled) return
         val trimmed = clipboardText?.trim().orEmpty()
         if (trimmed.length < 12) return
         val hash = trimmed.hashCode()
@@ -2968,6 +3053,13 @@ class ChatViewModel(
         val outputFormatMode: OutputFormatMode,
         val semanticAutoAttach: Boolean,
         val fastUtilityModelId: Long?
+    )
+
+    private data class WorkspaceUpgradeBundle(
+        val smartClipboardPillEnabled: Boolean,
+        val pinnedReference: PinnedReferenceItem?,
+        val pendingNewChatTakeawayCount: Int?,
+        val isExtractingSessionTakeaways: Boolean
     )
 
     private data class PowerFeaturesBundle(

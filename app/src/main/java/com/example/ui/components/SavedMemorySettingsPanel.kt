@@ -55,10 +55,13 @@ fun SavedMemorySettingsPanel(
     memories: List<UserMemoryInfo>,
     autoExtractEnabled: Boolean,
     onToggleAutoExtract: (Boolean) -> Unit,
-    onAddMemory: (fact: String, category: String) -> Unit,
+    onAddMemory: (fact: String, category: String, temporary7Days: Boolean) -> Unit,
     onUpdateMemory: (UserMemoryInfo) -> Unit,
     onTogglePin: (Long, Boolean) -> Unit,
     onToggleEnabled: (Long, Boolean) -> Unit,
+    onToggleTtl7Days: (Long, Boolean) -> Unit = { _, _ -> },
+    onConsolidateMemories: () -> Unit = {},
+    isConsolidating: Boolean = false,
     onDeleteMemory: (Long) -> Unit,
     onClearAllMemories: () -> Unit,
     modifier: Modifier = Modifier
@@ -66,6 +69,7 @@ fun SavedMemorySettingsPanel(
     var factDraft by remember { mutableStateOf("") }
     var selectedCategory by remember { mutableStateOf("Preference") }
     var selectedProfile by remember { mutableStateOf(MemoryProfile.ALL) }
+    var newFactTemporary7d by remember { mutableStateOf(false) }
     var editingEntry by remember { mutableStateOf<UserMemoryInfo?>(null) }
     var showClearConfirm by remember { mutableStateOf(false) }
     val categories = listOf("Preference", "Tech", "Profile", "Workflow")
@@ -147,21 +151,38 @@ fun SavedMemorySettingsPanel(
                     }
                 }
 
-                // Add / Edit Fact Row
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    categories.forEach { cat ->
-                        val active = selectedCategory == cat
-                        Text(
-                            text = cat.uppercase(),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (active) SwissWhite else SwissInk,
-                            modifier = Modifier
-                                .background(if (active) SwissInk else SwissPaper, RectangleShape)
-                                .border(1.dp, SwissInk, RectangleShape)
-                                .clickable { selectedCategory = cat }
-                                .padding(horizontal = 8.dp, vertical = 5.dp)
-                        )
+                // Add / Edit Fact Row + TTL Selector
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        categories.forEach { cat ->
+                            val active = selectedCategory == cat
+                            Text(
+                                text = cat.uppercase(),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (active) SwissWhite else SwissInk,
+                                modifier = Modifier
+                                    .background(if (active) SwissInk else SwissPaper, RectangleShape)
+                                    .border(1.dp, SwissInk, RectangleShape)
+                                    .clickable { selectedCategory = cat }
+                                    .padding(horizontal = 8.dp, vertical = 5.dp)
+                            )
+                        }
                     }
+                    Text(
+                        text = if (newFactTemporary7d) "7-DAY" else "PERM",
+                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                        color = if (newFactTemporary7d) SwissWhite else SwissInk,
+                        modifier = Modifier
+                            .background(if (newFactTemporary7d) SwissSignalRed else SwissPaper, RectangleShape)
+                            .border(1.dp, SwissInk, RectangleShape)
+                            .clickable { newFactTemporary7d = !newFactTemporary7d }
+                            .padding(horizontal = 8.dp, vertical = 5.dp)
+                            .testTag("settings_memory_new_ttl_toggle")
+                    )
                 }
 
                 Row(
@@ -189,10 +210,19 @@ fun SavedMemorySettingsPanel(
                             if (clean.isNotEmpty()) {
                                 val target = editingEntry
                                 if (target != null) {
-                                    onUpdateMemory(target.copy(fact = clean, category = selectedCategory))
+                                    val updatedExpiry = if (newFactTemporary7d) {
+                                        target.expiresAtMs ?: (System.currentTimeMillis() + 7L * 24L * 60L * 60L * 1000L)
+                                    } else null
+                                    onUpdateMemory(
+                                        target.copy(
+                                            fact = clean,
+                                            category = selectedCategory,
+                                            expiresAtMs = updatedExpiry
+                                        )
+                                    )
                                     editingEntry = null
                                 } else {
-                                    onAddMemory(clean, selectedCategory)
+                                    onAddMemory(clean, selectedCategory, newFactTemporary7d)
                                 }
                                 factDraft = ""
                             }
@@ -267,6 +297,22 @@ fun SavedMemorySettingsPanel(
                                             color = SwissSignalRed
                                         )
                                         Text(
+                                            text = if (mem.isTemporary) {
+                                                val daysLeft = mem.remainingDays() ?: 1
+                                                "7D · ${daysLeft}d"
+                                            } else {
+                                                "PERM"
+                                            },
+                                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                            color = if (mem.isTemporary) SwissWhite else SwissInk,
+                                            modifier = Modifier
+                                                .background(if (mem.isTemporary) SwissInk else SwissSubtleFill, RectangleShape)
+                                                .border(1.dp, SwissInk, RectangleShape)
+                                                .clickable { onToggleTtl7Days(mem.id, !mem.isTemporary) }
+                                                .padding(horizontal = 5.dp, vertical = 1.dp)
+                                                .testTag("settings_memory_ttl_$idx")
+                                        )
+                                        Text(
                                             text = if (mem.isEnabled) mem.source.uppercase() else "MUTED",
                                             style = MaterialTheme.typography.labelSmall,
                                             color = SwissMuted
@@ -298,6 +344,7 @@ fun SavedMemorySettingsPanel(
                                         editingEntry = mem
                                         factDraft = mem.fact
                                         selectedCategory = mem.category
+                                        newFactTemporary7d = mem.isTemporary
                                     },
                                     modifier = Modifier.testTag("settings_memory_edit_$idx")
                                 ) {
@@ -325,15 +372,30 @@ fun SavedMemorySettingsPanel(
                         }
                     }
 
-                    // Clear All Memory Reset Button
-                    Box(modifier = Modifier.fillMaxWidth()) {
+                    // 1-Tap Memory Consolidator ([MERGE & CLEAN]) + Clear All Memory Reset
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        if (memories.size >= 2) {
+                            SwissButton(
+                                text = if (isConsolidating) "Merging…" else "[ Merge & Clean ]",
+                                variant = SwissButtonVariant.INK,
+                                enabled = !isConsolidating,
+                                minHeight = 44.dp,
+                                onClick = onConsolidateMemories,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("settings_memory_merge_clean_btn")
+                            )
+                        }
                         SwissButton(
-                            text = "Clear All Memory (${memories.size})",
+                            text = "Clear All (${memories.size})",
                             variant = SwissButtonVariant.OUTLINE,
                             minHeight = 44.dp,
                             onClick = { showClearConfirm = true },
                             modifier = Modifier
-                                .fillMaxWidth()
+                                .weight(1f)
                                 .testTag("settings_clear_all_memory_btn")
                         )
                     }

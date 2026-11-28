@@ -10,7 +10,9 @@ data class BranchMessageNode(
     val message: MessageEntity,
     val parentKey: Long, // ROOT_PARENT_KEY (-1L) for root messages
     val siblingIds: List<Long>,
-    val siblingIndex: Int // 0-based
+    val siblingIndex: Int, // 0-based
+    val compareSiblingContent: String? = null,
+    val compareSiblingIndex: Int? = null
 ) {
     val siblingCount: Int get() = siblingIds.size
     val hasBranches: Boolean get() = siblingIds.size > 1
@@ -85,11 +87,18 @@ object ConversationTree {
             val chosen = siblings[selectedIndex]
             if (!visited.add(chosen.id)) break
 
+            val compareIdx = when {
+                selectedIndex > 0 -> selectedIndex - 1
+                siblings.size > 1 -> 1
+                else -> null
+            }
             path += BranchMessageNode(
                 message = chosen,
                 parentKey = currentParentKey,
                 siblingIds = siblings.map { it.id },
-                siblingIndex = selectedIndex
+                siblingIndex = selectedIndex,
+                compareSiblingContent = compareIdx?.let { siblings[it].content },
+                compareSiblingIndex = compareIdx
             )
             currentParentKey = chosen.id
         }

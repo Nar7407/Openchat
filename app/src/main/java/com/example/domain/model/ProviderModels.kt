@@ -301,7 +301,8 @@ data class ProviderConfig(
     val createdAt: Long,
     val defaultModelId: String? = null,
     val isEnabled: Boolean = true,
-    val updatedAt: Long = createdAt
+    val updatedAt: Long = createdAt,
+    val onlyFreeModels: Boolean = false
 ) {
     val effectiveBaseUrl: String
         get() {
@@ -339,6 +340,7 @@ sealed interface IncomingSharePayload {
     data class Text(val text: String) : IncomingSharePayload
     data class ImageUri(val uriString: String) : IncomingSharePayload
     data class DocumentUri(val uriString: String) : IncomingSharePayload
+    data class WorkspaceFileLaunch(val uriString: String) : IncomingSharePayload
     data class DeepLinkAsk(val query: String) : IncomingSharePayload
 }
 
@@ -382,8 +384,17 @@ data class UserMemoryInfo(
     val isPinned: Boolean = false,
     val profile: String = "ALL",
     val source: String = "Manual",
-    val createdAt: Long = System.currentTimeMillis()
-)
+    val createdAt: Long = System.currentTimeMillis(),
+    val expiresAtMs: Long? = null
+) {
+    val isTemporary: Boolean get() = expiresAtMs != null
+    fun remainingDays(nowMs: Long = System.currentTimeMillis()): Int? {
+        val exp = expiresAtMs ?: return null
+        val diff = exp - nowMs
+        if (diff <= 0L) return 0
+        return ((diff + 86_399_999L) / 86_400_000L).toInt().coerceAtLeast(1)
+    }
+}
 
 data class StudyCard(
     val front: String,
@@ -757,6 +768,14 @@ data class ThreadCheckpoint(
     val summaryMarkdown: String,
     val createdAt: Long = System.currentTimeMillis()
 )
+
+data class PinnedReferenceItem(
+    val id: String,
+    val title: String,
+    val content: String,
+    val sourceLabel: String = "AI REPLY"
+)
+
 
 
 
